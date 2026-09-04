@@ -9,7 +9,7 @@ first line of request-building code. Nothing here is guessed. Where a detail has
 not yet been checked in this repository, it is marked as carried from the
 specification and must be re-confirmed before use.
 
-Last verification pass: **2026-09-04** (Phase 2).
+Last verification pass: **2026-09-04** (Phase 3).
 
 ---
 
@@ -18,25 +18,64 @@ Last verification pass: **2026-09-04** (Phase 2).
 These were checked against live provider documentation because Phase 1 encodes
 them as configuration defaults.
 
-### DeepSeek — model aliases and pricing
+### DeepSeek — API, models, JSON mode, usage, rate limits, pricing
 
-Source: <https://api-docs.deepseek.com/quick_start/pricing/>
+Sources: <https://api-docs.deepseek.com/>,
+<https://api-docs.deepseek.com/api/create-chat-completion>,
+<https://api-docs.deepseek.com/guides/json_mode/>,
+<https://api-docs.deepseek.com/quick_start/rate_limit>,
+<https://api-docs.deepseek.com/quick_start/pricing/>
 
 | Detail | Status |
 |---|---|
-| `deepseek-v4-flash` is a current model alias | confirmed |
-| `deepseek-v4-pro` is a current model alias | confirmed |
-| 1M context window | confirmed |
-| Peak/off-peak pricing tiers as in the spec | confirmed |
+| Base `https://api.deepseek.com`, endpoint `/chat/completions` | confirmed |
+| `Authorization: Bearer <key>`, OpenAI-compatible shape | confirmed |
+| `deepseek-v4-flash`, `deepseek-v4-pro` are current model ids | confirmed |
+| JSON mode is `response_format: {"type": "json_object"}` | confirmed |
+| Prompt must contain the word "json"; example schema recommended | confirmed |
+| `usage` splits `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` | confirmed |
+| 429 signals the account concurrency limit | confirmed |
+| Peak 01:00–04:00 and 06:00–10:00 UTC Mon–Fri; off-peak is half | confirmed |
+| V4 Flash: $0.014 / $0.44 / $1.32 per 1M (cache hit / miss / output), peak | confirmed |
 
-Additional detail found: a `deepseek-v4-flash-vision-exp` model exists
-(experimental, vision). StockBrain does not use it. Documented max output is
-384K tokens. Peak hours are 01:00–04:00 and 06:00–10:00 UTC, Monday–Friday, with
-off-peak at half the peak rate.
+**Discrepancies against StockBrain's spec, and what was implemented:**
 
-Encoded as the defaults of `DEEPSEEK_FLASH_MODEL` / `DEEPSEEK_PRO_MODEL`.
-Pricing is **not** in application logic; it will be configurable cost rates used
-for telemetry only.
+1. **`thinking` defaults to `{"type": "enabled"}`.** This is the most
+   consequential finding of the phase. The spec says the classifier runs
+   "thinking disabled" but not how, and the parameter is not mentioned at all.
+   Omitting it would silently turn the cheap high-volume triage path into a
+   reasoning call, changing both latency and cost. The client therefore sends
+   `{"type": "disabled"}` explicitly on every non-thinking call, and a test
+   asserts it.
+2. **The usage object is richer than the spec implies.** It reports
+   `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` separately, and
+   those are priced roughly thirty times apart. A cost estimate that merges them
+   is meaningless, so both are stored (`llm_calls.cached_input_tokens` and
+   `cache_miss_input_tokens`) and priced separately. Where a provider does not
+   report the split, everything is charged at the miss rate — over-estimating,
+   which is the safe direction for a budget.
+3. **`finish_reason` can be `insufficient_system_resource`**, a DeepSeek-specific
+   capacity condition that is not a model answer. It is treated exactly like a
+   5xx and retried. `finish_reason: "length"` is reported as truncation by name,
+   because it otherwise surfaces as confusing invalid JSON.
+4. **JSON mode can return empty content**, which the docs acknowledge. That is
+   raised as an error rather than being allowed to become an empty
+   classification.
+5. **The server holds connections open**, emitting blank lines while queued, and
+   gives up only after ten minutes. Read timeouts are set generously (120s
+   default) rather than aggressively.
+6. **`reasoning_content` may be present on the message.** StockBrain records only
+   a boolean that it was present and discards the text at the client boundary,
+   so hidden reasoning exists nowhere to leak from. The structured `rationale`
+   field of the classifier schema is the explanation shown in the UI.
+7. `deepseek-v4-flash-vision-exp` exists; StockBrain does not use it. Documented
+   max output is 384K tokens; concurrency limits are 2,500 for Flash and 500 for
+   Pro.
+
+Model ids are the defaults of `DEEPSEEK_FLASH_MODEL` / `DEEPSEEK_PRO_MODEL`.
+Pricing is **not** in application logic: rates live in
+`stockbrain/llm/pricing.py` as configurable data used for telemetry and budget
+comparison only, and no trading decision reads a price.
 
 ### Trading 212 — base URLs, auth, order semantics
 

@@ -208,9 +208,9 @@ class IngestionService:
             first_seen_at=utcnow(),
             event_time=document.published_at,
             status=EventStatus.NEW,
-            topics={"discovery_query": document.metadata.get("discovery_query")}
-            if document.metadata.get("discovery_query")
-            else {},
+            # Topics are the classifier's output; the discovery query that found
+            # the document is already recorded on the source's metadata.
+            topics=[],
         )
         session.add(event)
         await session.flush()

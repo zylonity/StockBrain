@@ -15,6 +15,8 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.db.base import utcnow
+from stockbrain.db.models.companies import EventCompanyImpact
+from stockbrain.db.models.research import LlmCall
 from stockbrain.db.models.sources import Event, EventSourceLink, Source
 from stockbrain.enums import EventStatus, SourceProvider
 
@@ -112,6 +114,56 @@ class EventRepository:
             best = next((c for c in priority if c in categories), None)
             result[event_id] = (count, sorted(providers), best)
         return result
+
+    async def company_counts(self, event_ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
+        """Impact counts for a page of events, in one query."""
+        if not event_ids:
+            return {}
+        rows = (
+            await self._session.execute(
+                sa.select(EventCompanyImpact.event_id, sa.func.count())
+                .where(EventCompanyImpact.event_id.in_(event_ids))
+                .group_by(EventCompanyImpact.event_id)
+            )
+        ).all()
+        return {event_id: int(count) for event_id, count in rows}
+
+    async def impacts_for_event(self, event_id: uuid.UUID) -> list[EventCompanyImpact]:
+        stmt = (
+            sa.select(EventCompanyImpact)
+            .where(EventCompanyImpact.event_id == event_id)
+            .order_by(EventCompanyImpact.materiality_score.desc())
+        )
+        return list((await self._session.execute(stmt)).scalars())
+
+    async def llm_calls_for_event(self, event_id: uuid.UUID) -> list[LlmCall]:
+        stmt = (
+            sa.select(LlmCall)
+            .where(LlmCall.event_id == event_id)
+            .order_by(LlmCall.created_at.asc())
+            .limit(50)
+        )
+        return list((await self._session.execute(stmt)).scalars())
+
+    async def llm_usage_for_event(self, event_id: uuid.UUID) -> dict[str, Any]:
+        row = (
+            await self._session.execute(
+                sa.select(
+                    sa.func.count(),
+                    sa.func.coalesce(sa.func.sum(LlmCall.input_tokens), 0),
+                    sa.func.coalesce(sa.func.sum(LlmCall.output_tokens), 0),
+                    sa.func.coalesce(sa.func.sum(LlmCall.cached_input_tokens), 0),
+                    sa.func.coalesce(sa.func.sum(LlmCall.estimated_cost_usd), 0),
+                ).where(LlmCall.event_id == event_id)
+            )
+        ).one()
+        return {
+            "calls": int(row[0]),
+            "input_tokens": int(row[1]),
+            "output_tokens": int(row[2]),
+            "cached_input_tokens": int(row[3]),
+            "estimated_cost_usd": row[4],
+        }
 
     async def sources_for_event(self, event_id: uuid.UUID) -> list[tuple[Source, str]]:
         stmt = (

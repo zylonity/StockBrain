@@ -99,6 +99,7 @@ class JobRunner:
                 job_type=job.job_type,
                 payload=dict(job.payload),
                 attempt=job.attempts,
+                max_attempts=job.max_attempts,
                 database=self._database,
                 services=self._services,
             )

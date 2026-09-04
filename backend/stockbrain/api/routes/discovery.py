@@ -16,6 +16,7 @@ from stockbrain.api.schemas import (
     DiscoveryStatusResponse,
     DiscoveryTopicResponse,
     IngestionStatsResponse,
+    LlmBudgetResponse,
 )
 from stockbrain.db.models.system import AppSetting, DiscoveryTopic
 from stockbrain.db.repositories.events import EventRepository
@@ -48,14 +49,35 @@ async def discovery_status(
             for task in services.scheduler.tasks()
         ]
 
+    budget: LlmBudgetResponse | None = None
+    if services is not None and services.budget is not None:
+        state = await services.budget.state()
+        budget = LlmBudgetResponse(
+            status=state.status.value,
+            daily_spend_usd=state.daily_spend,
+            monthly_spend_usd=state.monthly_spend,
+            daily_soft_usd=state.daily_soft,
+            daily_hard_usd=state.daily_hard,
+            monthly_soft_usd=state.monthly_soft,
+            monthly_hard_usd=state.monthly_hard,
+            reason=state.reason,
+        )
+
     return DiscoveryStatusResponse(
         discovery_enabled=settings.discovery_enabled,
         paused=paused,
         subsystem_running=services is not None,
         news_stream_active=services is not None and services.alpaca_news is not None,
+        classifier_active=services is not None and services.classification is not None,
+        classifier_model=(
+            settings.deepseek_flash_model
+            if services is not None and services.classification is not None
+            else None
+        ),
         jobs_pending=pending,
         scheduled_tasks=scheduled,
         stats=IngestionStatsResponse(**stats),
+        budget=budget,
     )
 
 

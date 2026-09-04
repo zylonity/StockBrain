@@ -103,9 +103,18 @@ async def clean_tables(database: Database) -> AsyncIterator[Database]:
         "company_aliases",
         "companies",
         "jobs",
+        "llm_calls",
         "notifications",
         "audit_log",
     )
     async with database.transaction() as session:
         await session.execute(text(f"TRUNCATE {', '.join(tables)} RESTART IDENTITY CASCADE"))
+    yield database
+
+
+@pytest.fixture
+async def clean_llm_calls(database: Database) -> AsyncIterator[Database]:
+    """Empty ``llm_calls`` only, for budget tests that drive spend directly."""
+    async with database.transaction() as session:
+        await session.execute(text("TRUNCATE llm_calls RESTART IDENTITY CASCADE"))
     yield database

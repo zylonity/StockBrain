@@ -90,6 +90,9 @@ ignore = [
 # A CLI entrypoint run by the container before logging is configured; printing
 # to stdout/stderr is its entire purpose.
 "stockbrain/validate_config.py" = ["T201"]
+# The live provider smoke test prints the observed API contract; reporting what
+# the provider actually returned is its entire purpose.
+"tests/integration/test_deepseek_live.py" = ["T201"]
 "alembic/versions/*" = ["E501"]
 
 [tool.ruff.lint.isort]

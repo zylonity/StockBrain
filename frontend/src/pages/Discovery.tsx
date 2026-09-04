@@ -78,7 +78,88 @@ export function Discovery() {
           <div className="metric">{status.data?.jobs_pending ?? "—"}</div>
           <div className="metric-note">PostgreSQL-backed queue. No Redis.</div>
         </div>
+
+        <div className="card">
+          <h2>Classifier</h2>
+          <div className="metric">
+            <StatusPill
+              status={
+                !status.data
+                  ? "UNKNOWN"
+                  : !status.data.classifier_active
+                    ? "DISABLED"
+                    : status.data.budget?.status === "HARD_EXCEEDED"
+                      ? "DOWN"
+                      : status.data.budget?.status === "SOFT_EXCEEDED"
+                        ? "DEGRADED"
+                        : "HEALTHY"
+              }
+            />
+          </div>
+          <div className="metric-note">
+            {status.data?.classifier_active
+              ? status.data.classifier_model
+              : "Not configured — events wait in NEW"}
+          </div>
+        </div>
       </div>
+
+      {status.data?.budget && (
+        <div className="card" style={{ marginBottom: 18 }}>
+          <h2>LLM budget</h2>
+          {status.data.budget.reason && (
+            <div
+              className={
+                status.data.budget.status === "HARD_EXCEEDED" ? "error" : "banner banner-warn"
+              }
+            >
+              {status.data.budget.reason}
+            </div>
+          )}
+          <table>
+            <thead>
+              <tr>
+                <th>Window</th>
+                <th>Spent</th>
+                <th>Soft limit</th>
+                <th>Hard limit</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Today</td>
+                <td className="mono">
+                  ${Number(status.data.budget.daily_spend_usd).toFixed(4)}
+                </td>
+                <td className="mono detail">
+                  ${Number(status.data.budget.daily_soft_usd).toFixed(2)}
+                </td>
+                <td className="mono detail">
+                  ${Number(status.data.budget.daily_hard_usd).toFixed(2)}
+                </td>
+              </tr>
+              <tr>
+                <td>This month</td>
+                <td className="mono">
+                  ${Number(status.data.budget.monthly_spend_usd).toFixed(4)}
+                </td>
+                <td className="mono detail">
+                  ${Number(status.data.budget.monthly_soft_usd).toFixed(2)}
+                </td>
+                <td className="mono detail">
+                  ${Number(status.data.budget.monthly_hard_usd).toFixed(2)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <p className="metric-note">
+            At the soft limit, optional work such as semantic deduplication is
+            suppressed. At the hard limit, no new model analysis starts —
+            ingestion, deterministic deduplication and broker reconciliation
+            continue regardless.
+          </p>
+        </div>
+      )}
 
       <div className="grid">
         <div className="card">

@@ -146,6 +146,8 @@ class LlmCall(UUIDPrimaryKeyMixin, Base):
     created_at: Mapped[dt.datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )
+    started_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    completed_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     purpose: Mapped[str] = mapped_column(sa.Text, nullable=False)
     """CLASSIFY_EVENT | DEDUPE_EVENT | RESEARCH | ..."""
 
@@ -162,8 +164,10 @@ class LlmCall(UUIDPrimaryKeyMixin, Base):
     event_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("events.id", ondelete="SET NULL")
     )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(sa.ForeignKey("jobs.id", ondelete="SET NULL"))
 
     attempt: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="1")
+    retry_count: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
     succeeded: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
     used: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
     """True for the single validated result that downstream logic consumed."""
@@ -171,12 +175,37 @@ class LlmCall(UUIDPrimaryKeyMixin, Base):
     input_tokens: Mapped[int | None] = mapped_column(sa.Integer)
     output_tokens: Mapped[int | None] = mapped_column(sa.Integer)
     cached_input_tokens: Mapped[int | None] = mapped_column(sa.Integer)
+    """Prompt tokens served from the provider's cache.
+
+    Kept separate from cache misses because the two are priced roughly thirty
+    times apart, so a cost estimate that merges them is meaningless."""
+
+    cache_miss_input_tokens: Mapped[int | None] = mapped_column(sa.Integer)
+    reasoning_tokens: Mapped[int | None] = mapped_column(sa.Integer)
+
     estimated_cost_usd: Mapped[Decimal | None] = mapped_column(sa.Numeric(12, 6))
     latency_ms: Mapped[int | None] = mapped_column(sa.Integer)
+
+    provider_request_id: Mapped[str | None] = mapped_column(sa.Text)
+    """The provider's own id for the call, for correlating with their support."""
+
+    finish_reason: Mapped[str | None] = mapped_column(sa.Text)
+    had_reasoning_content: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, server_default=sa.false()
+    )
+    """Whether the provider returned hidden reasoning.
+
+    A flag only. The reasoning text is never stored and never surfaced; the
+    structured `rationale` field of the schema is the explanation shown."""
+
     error: Mapped[str | None] = mapped_column(sa.Text)
+    error_class: Mapped[str | None] = mapped_column(sa.Text)
     response_excerpt: Mapped[str | None] = mapped_column(sa.Text)
+    """Bounded excerpt of model output. Never a prompt, key or header."""
 
     __table_args__ = (
         sa.Index("ix_llm_calls_created_at", "created_at"),
         sa.Index("ix_llm_calls_purpose_model", "purpose", "model"),
+        sa.Index("ix_llm_calls_event_id", "event_id"),
+        sa.Index("ix_llm_calls_job_id", "job_id"),
     )

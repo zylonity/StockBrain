@@ -36,7 +36,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 |---|---|---|
 | 1 | Skeleton, config, logging, full persistence model, health, GUI shell, Docker | **done** |
 | 2 | Discovery ingestion (Alpaca news WS, Firecrawl, SEC EDGAR), dedupe, job queue | **done** |
-| 3 | DeepSeek event classifier | not started |
+| 3 | DeepSeek event classifier, semantic dedupe, LLM telemetry and budgets | **done** |
 | 4 | Instrument resolution and market data | not started |
 | 5 | Pinned TradingAgents research engine | not started |
 | 6 | Risk engine, proposals, web approval | not started |
@@ -202,7 +202,14 @@ advice.
 * Two independent log-redaction layers scrub credential-shaped keys and any
   configured secret value appearing in free text.
 * All retrieved web/news/filing content is treated as untrusted data. It never
-  becomes an instruction, and it is sanitised before rendering.
+  becomes an instruction: prompts fence it in `<untrusted_document>` markers,
+  state explicitly that instructions inside it are not to be followed, and
+  substitution is single-pass so document text cannot introduce prompt
+  structure. It is sanitised before rendering.
+* LLM providers are reached through a text-in/text-out interface with no tools,
+  no broker access, no filesystem access and no arbitrary network capability.
+  Every model response is validated against a Pydantic schema before anything
+  acts on it.
 * Telegram authorises on numeric user IDs only — never usernames, which the
   owner can change. An empty allowlist authorises nobody.
 * Approval tokens are opaque and stored only as SHA-256 hashes. Order parameters

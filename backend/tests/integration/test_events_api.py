@@ -220,3 +220,155 @@ async def test_discovery_topics_are_seeded_and_listed(client: httpx.AsyncClient)
 
     # Conservative defaults: not every theme is enabled on a fresh install.
     assert any(topic["enabled"] is False for topic in topics)
+
+
+# ---------------------------------------------------------------------------
+# Classification surface
+# ---------------------------------------------------------------------------
+
+
+async def test_event_detail_exposes_classification_and_impacts(
+    client: httpx.AsyncClient, clean_tables: Database
+) -> None:
+    from tests.integration.test_classification import (
+        CLASSIFICATION,
+        ScriptedProvider,
+        _service,
+    )
+
+    result = await IngestionService(clean_tables).ingest(
+        _doc(item_id="a", headline="Vertiv wins contract", url="https://benzinga.com/a")
+    )
+    assert result.event_id is not None
+    await _service(clean_tables, ScriptedProvider(CLASSIFICATION)).classify_event(result.event_id)
+
+    body = (await client.get(f"/api/v1/events/{result.event_id}")).json()
+    event = body["event"]
+
+    assert event["status"] == "CANDIDATE"
+    assert event["event_type"] == "CONTRACT_AWARD"
+    assert event["relevant_to_public_equities"] is True
+    assert event["needs_corroboration"] is False
+    assert event["importance_score"] == 0.75
+    assert event["novelty_score"] == 0.8
+    assert event["confidence_score"] == 0.85
+    assert event["candidate_score"] is not None
+    assert event["topics"] == ["ai_infrastructure", "data_centres"]
+    assert event["classifier_model"] == "deepseek-v4-flash"
+    assert event["classifier_prompt_version"] == "event_classifier/v1"
+    assert event["classifier_error"] is None
+    assert event["company_count"] == 2
+
+    assert body["rationale"].startswith("The article names Vertiv")
+
+    companies = {company["company_name_hint"]: company for company in body["companies"]}
+    vertiv = companies["Vertiv Holdings Co."]
+    assert vertiv["ticker_hint"] == "VRT"
+    assert vertiv["direction"] == "POSITIVE"
+    assert vertiv["impact_path"] == "direct"
+    assert vertiv["materiality_score"] == 0.7
+    assert vertiv["resolved_company_id"] is None
+    assert companies["NVIDIA Corporation"]["impact_path"] == "indirect"
+
+    usage = body["llm_usage"]
+    assert usage["calls"] == 1
+    assert usage["input_tokens"] == 1500
+    assert usage["cached_input_tokens"] == 1000
+    assert float(usage["estimated_cost_usd"]) > 0
+
+    call = body["llm_calls"][0]
+    assert call["purpose"] == "CLASSIFY_EVENT"
+    assert call["thinking_enabled"] is False
+    assert call["succeeded"] is True and call["used"] is True
+    assert call["provider_request_id"] == "chatcmpl-1"
+
+
+async def test_hidden_reasoning_text_is_never_exposed(
+    client: httpx.AsyncClient, clean_tables: Database
+) -> None:
+    """Only the structured rationale is surfaced; chain-of-thought never is.
+
+    The provider returns `reasoning_content` alongside the answer. StockBrain
+    records that it was present and discards the text at the client boundary, so
+    there is nowhere for it to leak from afterwards.
+    """
+    import json as _json
+
+    from stockbrain.llm.deepseek import parse_completion
+    from tests.integration.test_classification import (
+        CLASSIFICATION,
+        ScriptedProvider,
+        _service,
+    )
+
+    secret_reasoning = "STEP 1: I should first consider the hidden chain of thought."
+    parsed = parse_completion(
+        {
+            "id": "chatcmpl-x",
+            "model": "deepseek-v4-flash",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": _json.dumps(CLASSIFICATION),
+                        "reasoning_content": secret_reasoning,
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
+        latency_ms=1,
+        attempts=1,
+    )
+    # The client keeps the flag and drops the text.
+    assert parsed.had_reasoning_content is True
+    assert secret_reasoning not in parsed.content
+
+    result = await IngestionService(clean_tables).ingest(
+        _doc(item_id="a", headline="Vertiv wins contract", url="https://benzinga.com/a")
+    )
+    assert result.event_id is not None
+    await _service(clean_tables, ScriptedProvider(CLASSIFICATION)).classify_event(result.event_id)
+
+    response = await client.get(f"/api/v1/events/{result.event_id}")
+    payload = response.json()
+
+    assert secret_reasoning not in response.text
+    assert "chain of thought" not in response.text.lower()
+    # Only the boolean flag is exposed, never the reasoning text.
+    assert isinstance(payload["llm_calls"][0]["had_reasoning_content"], bool)
+    assert payload["rationale"] == CLASSIFICATION["rationale"]
+
+
+async def test_classification_failure_is_visible_in_the_api(
+    client: httpx.AsyncClient, clean_tables: Database
+) -> None:
+    from stockbrain.errors import ProviderResponseError
+    from tests.integration.test_classification import ScriptedProvider, _service
+
+    result = await IngestionService(clean_tables).ingest(
+        _doc(item_id="a", headline="Broken", url="https://benzinga.com/a")
+    )
+    assert result.event_id is not None
+    service = _service(clean_tables, ScriptedProvider(ProviderResponseError("bad schema")))
+    with pytest.raises(ProviderResponseError):
+        await service.classify_event(result.event_id, attempt=3, is_final_attempt=True)
+
+    body = (await client.get(f"/api/v1/events/{result.event_id}")).json()
+    assert body["event"]["status"] == "CLASSIFICATION_FAILED"
+    assert "ProviderResponseError" in body["event"]["classifier_error"]
+
+    failed_call = body["llm_calls"][0]
+    assert failed_call["succeeded"] is False
+    assert failed_call["error_class"] == "ProviderResponseError"
+
+
+async def test_discovery_status_reports_classifier_and_budget(
+    client: httpx.AsyncClient,
+) -> None:
+    """With no DeepSeek key the classifier is reported inactive, not broken."""
+    body = (await client.get("/api/v1/discovery/status")).json()
+    assert body["classifier_active"] is False
+    assert body["classifier_model"] is None
+    assert body["budget"] is None

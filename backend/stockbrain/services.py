@@ -20,20 +20,27 @@ import sqlalchemy as sa
 
 from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
+from stockbrain.db.models.sources import Event
 from stockbrain.db.models.system import AppSetting, DiscoveryQuery, DiscoveryTopic
 from stockbrain.db.session import Database
-from stockbrain.enums import JobType, ProviderStatus
+from stockbrain.enums import EventStatus, JobType, ProviderStatus
 from stockbrain.errors import ProviderAuthError, ProviderEntitlementError
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
 from stockbrain.ingestion.firecrawl import FirecrawlClient
 from stockbrain.ingestion.sec_edgar import SecEdgarClient
 from stockbrain.ingestion.service import IngestionOutcome, IngestionService
 from stockbrain.ingestion.topics import seed_default_topics
+from stockbrain.intelligence.classifier import EventClassifier
+from stockbrain.intelligence.semantic_dedupe import SemanticDeduplicator
+from stockbrain.intelligence.service import ClassificationService
 from stockbrain.jobs.handlers import register_ingestion_handlers
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.jobs.registry import JobRegistry
 from stockbrain.jobs.runner import JobRunner
 from stockbrain.jobs.scheduler import ScheduledTask, Scheduler
+from stockbrain.llm.budget import BudgetGuard, BudgetStatus
+from stockbrain.llm.deepseek import DeepSeekClient
+from stockbrain.llm.telemetry import LlmTelemetry
 from stockbrain.logging import get_logger
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
@@ -73,18 +80,22 @@ class ServiceContainer:
     firecrawl: FirecrawlClient | None = field(default=None, init=False)
     sec: SecEdgarClient | None = field(default=None, init=False)
 
+    deepseek: DeepSeekClient | None = field(default=None, init=False)
+    classification: ClassificationService | None = field(default=None, init=False)
+    budget: BudgetGuard | None = field(default=None, init=False)
+
     _stream_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.queue = JobQueue()
         self.registry = JobRegistry()
+        self._build_providers()
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
-            # No CLASSIFY_EVENT handler exists yet; see register_ingestion_handlers.
-            classification_enabled=False,
+            # Only enqueue classification when something can actually run it.
+            classification_enabled=self.classification is not None,
         )
-        self._build_providers()
 
     # ------------------------------------------------------------------
     # Construction
@@ -107,11 +118,48 @@ class ServiceContainer:
         if settings.sec_enabled and settings.sec_contact_email.strip():
             self.sec = SecEdgarClient(settings)
 
+        if settings.classifier_enabled and settings.deepseek_api_key.get_secret_value():
+            self.deepseek = DeepSeekClient(settings, max_attempts=settings.deepseek_max_attempts)
+            telemetry = LlmTelemetry()
+            self.budget = BudgetGuard(
+                self.database,
+                daily_soft_usd=settings.llm_daily_soft_usd,
+                daily_hard_usd=settings.llm_daily_hard_usd,
+                monthly_soft_usd=settings.llm_monthly_soft_usd,
+                monthly_hard_usd=settings.llm_monthly_hard_usd,
+                telemetry=telemetry,
+            )
+            classifier = EventClassifier(
+                self.deepseek,
+                model=settings.deepseek_flash_model,
+                timeout_seconds=settings.deepseek_timeout_seconds,
+            )
+            deduplicator = (
+                SemanticDeduplicator(
+                    self.deepseek,
+                    model=settings.deepseek_flash_model,
+                    merge_confidence=settings.semantic_dedupe_min_confidence,
+                    timeout_seconds=settings.deepseek_timeout_seconds,
+                )
+                if settings.semantic_dedupe_enabled
+                else None
+            )
+            self.classification = ClassificationService(
+                self.database,
+                settings,
+                classifier=classifier,
+                deduplicator=deduplicator,
+                budget=self.budget,
+                telemetry=telemetry,
+            )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
     async def start(self, *, instance_id: str) -> None:
-        register_ingestion_handlers(self.registry)
+        register_ingestion_handlers(
+            self.registry, classifier_available=self.classification is not None
+        )
 
         async with self.database.transaction() as session:
             await seed_default_topics(session)
@@ -147,7 +195,7 @@ class ServiceContainer:
             await self.scheduler.stop()
         if self.runner is not None:
             await self.runner.stop()
-        for client in (self.alpaca_news, self.firecrawl, self.sec):
+        for client in (self.alpaca_news, self.firecrawl, self.sec, self.deepseek):
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.aclose()
@@ -172,6 +220,31 @@ class ServiceContainer:
                     interval_seconds=300.0,
                     run=self._enqueue_sec_refresh,
                     initial_delay_seconds=30.0,
+                )
+            )
+        if self.classification is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="classify_pending_events",
+                    interval_seconds=60.0,
+                    run=self._enqueue_pending_classifications,
+                    initial_delay_seconds=15.0,
+                )
+            )
+            scheduler.add(
+                ScheduledTask(
+                    name="release_stalled_classifications",
+                    interval_seconds=300.0,
+                    run=self._release_stalled_classifications,
+                    jitter_ratio=0.1,
+                )
+            )
+            scheduler.add(
+                ScheduledTask(
+                    name="llm_budget_check",
+                    interval_seconds=120.0,
+                    run=self._refresh_budget_health,
+                    jitter_ratio=0.05,
                 )
             )
         scheduler.add(
@@ -241,6 +314,55 @@ class ServiceContainer:
 
     async def _persist_health(self) -> None:
         await self.health.persist(self.database)
+
+    async def _enqueue_pending_classifications(self) -> None:
+        """Sweep events still awaiting classification.
+
+        Covers three cases the ingest-time enqueue cannot: events ingested before
+        a key was configured, events whose job was lost, and events left in NEW by
+        a budget pause. The dedupe key means re-enqueuing an event that already
+        has a pending job is a no-op.
+        """
+        async with self.database.transaction() as session:
+            pending = (
+                await session.execute(
+                    sa.select(Event.id)
+                    .where(Event.status == EventStatus.NEW)
+                    .order_by(Event.first_seen_at.asc())
+                    .limit(50)
+                )
+            ).scalars()
+            enqueued = 0
+            for event_id in pending:
+                job_id = await self.queue.enqueue(
+                    session,
+                    JobType.CLASSIFY_EVENT,
+                    payload={"event_id": str(event_id)},
+                    dedupe_key=f"classify:{event_id}",
+                    priority=20,
+                )
+                if job_id is not None:
+                    enqueued += 1
+        if enqueued:
+            log.info("classification_backlog_enqueued", count=enqueued)
+
+    async def _release_stalled_classifications(self) -> None:
+        """Recover events whose classifying worker died."""
+        if self.classification is not None:
+            await self.classification.release_stalled()
+
+    async def _refresh_budget_health(self) -> None:
+        """Reflect LLM budget state in the research subsystem's health.
+
+        A budget stop degrades research only. Ingestion, deduplication and broker
+        reconciliation are untouched, by construction: nothing in those paths
+        consults the budget guard.
+        """
+        if self.budget is None:
+            return
+        state = await self.budget.state(refresh=True)
+        if state.status is BudgetStatus.HARD_EXCEEDED or state.status is BudgetStatus.SOFT_EXCEEDED:
+            self.health.record(ProviderName.DEEPSEEK, ProviderStatus.DEGRADED, detail=state.reason)
 
     # ------------------------------------------------------------------
     # News stream

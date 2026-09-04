@@ -249,10 +249,14 @@ async def test_sources_without_urls_do_not_collide(clean_tables: Database) -> No
     assert await _count(clean_tables, Source) == 3
 
 
-async def test_classification_is_not_enqueued_until_a_handler_exists(
+async def test_classification_is_only_enqueued_when_a_classifier_exists(
     clean_tables: Database,
 ) -> None:
-    """Creating jobs nothing can run would fill the queue with guaranteed failures."""
+    """Creating jobs nothing can run would fill the queue with guaranteed failures.
+
+    With no DeepSeek key configured no CLASSIFY_EVENT handler is registered, so
+    ingestion must not enqueue one; events simply wait in NEW.
+    """
     from stockbrain.db.models.system import Job
 
     service = IngestionService(clean_tables, classification_enabled=False)

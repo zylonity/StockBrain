@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import functools
 import json
+from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
 
@@ -145,6 +146,31 @@ class Settings(BaseSettings):
     deepseek_flash_model: str = "deepseek-v4-flash"
     deepseek_pro_model: str = "deepseek-v4-pro"
     deepseek_timeout_seconds: float = 120.0
+    deepseek_max_attempts: int = 3
+
+    # ------------------------------------------------------------------
+    # Classification thresholds
+    #
+    # Model scores are ranking features, not calibrated probabilities. These
+    # decide only where to spend deeper analysis, never what to trade.
+    # ------------------------------------------------------------------
+    classifier_enabled: bool = True
+    classifier_min_importance: float = 0.60
+    classifier_min_confidence: float = 0.65
+    classifier_min_materiality: float = 0.50
+
+    semantic_dedupe_enabled: bool = True
+    semantic_dedupe_min_confidence: float = 0.70
+    """A merge must clear this bar. Keeping two events apart is recoverable;
+    merging two different events silently is not."""
+
+    # ------------------------------------------------------------------
+    # LLM budgets (USD). Telemetry-driven, never part of a trading decision.
+    # ------------------------------------------------------------------
+    llm_daily_soft_usd: Decimal = Decimal("2.00")
+    llm_daily_hard_usd: Decimal = Decimal("5.00")
+    llm_monthly_soft_usd: Decimal = Decimal("30.00")
+    llm_monthly_hard_usd: Decimal = Decimal("75.00")
 
     # ------------------------------------------------------------------
     # Alpaca (news + market data; never execution)
@@ -267,6 +293,15 @@ class Settings(BaseSettings):
                     "configuration: " + "; ".join(problems) + ". Refusing to start: StockBrain "
                     "never resolves an ambiguous live-execution configuration in favour of live."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_budgets(self) -> Settings:
+        """A hard limit below its soft limit would make the soft limit unreachable."""
+        if self.llm_daily_hard_usd < self.llm_daily_soft_usd:
+            raise ValueError("LLM_DAILY_HARD_USD must be >= LLM_DAILY_SOFT_USD")
+        if self.llm_monthly_hard_usd < self.llm_monthly_soft_usd:
+            raise ValueError("LLM_MONTHLY_HARD_USD must be >= LLM_MONTHLY_SOFT_USD")
         return self
 
     @model_validator(mode="after")

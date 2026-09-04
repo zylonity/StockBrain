@@ -4,7 +4,12 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { EventDetail as EventDetailPayload } from "../api/types";
 import { CategoryBadge, EventStatusBadge, ProviderBadge } from "../components/Badges";
-import { formatScore, formatTimestamp, hostOf } from "../components/formats";
+import {
+  ClassificationPanel,
+  CompanyImpactTable,
+  LlmUsagePanel,
+} from "../components/Classification";
+import { formatTimestamp, hostOf } from "../components/formats";
 import { usePolling } from "../components/usePolling";
 
 export function EventDetail() {
@@ -36,17 +41,48 @@ export function EventDetail() {
               <div className="event-meta">
                 <EventStatusBadge status={data.event.status} />
                 <CategoryBadge category={data.event.top_category} />
+                {data.event.event_type && (
+                  <span className="badge">{data.event.event_type}</span>
+                )}
                 {data.event.providers.map((name) => (
                   <ProviderBadge key={name} provider={name} />
                 ))}
+                {data.event.needs_corroboration && (
+                  <span className="badge badge-cat-UNKNOWN">
+                    needs corroboration
+                  </span>
+                )}
               </div>
+              {data.event.topics.length > 0 && (
+                <div className="topic-chips">
+                  {data.event.topics.map((topic) => (
+                    <span className="badge" key={topic}>
+                      {topic}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
             <button onClick={refresh} disabled={loading}>
               {loading ? "Refreshing…" : "Refresh"}
             </button>
           </div>
 
+          {data.event.merged_into_event_id && (
+            <div className="banner banner-warn">
+              <div className="banner-title">Merged into another event</div>
+              <div className="banner-body">
+                Semantic deduplication folded this event into{" "}
+                <Link to={`/events/${data.event.merged_into_event_id}`}>
+                  the surviving event
+                </Link>
+                . This record is kept so the merge stays auditable.
+              </div>
+            </div>
+          )}
+
           <div className="grid">
+            <ClassificationPanel event={data.event} />
             <div className="card">
               <h2>Timing</h2>
               <dl className="kv">
@@ -54,34 +90,13 @@ export function EventDetail() {
                 <dd>{formatTimestamp(data.event.first_seen_at)}</dd>
                 <dt>Event time</dt>
                 <dd>{formatTimestamp(data.event.event_time)}</dd>
+                <dt>Sources</dt>
+                <dd>{data.sources.length}</dd>
+                <dt>Companies</dt>
+                <dd>{data.event.company_count}</dd>
               </dl>
             </div>
-            <div className="card">
-              <h2>Classification</h2>
-              <dl className="kv">
-                <dt>Type</dt>
-                <dd>{data.event.event_type ?? "—"}</dd>
-                <dt>Importance</dt>
-                <dd>{formatScore(data.event.importance_score)}</dd>
-                <dt>Novelty</dt>
-                <dd>{formatScore(data.event.novelty_score)}</dd>
-              </dl>
-              {data.event.status === "NEW" && (
-                <div className="metric-note">
-                  Awaiting classification. The scoring model lands in the next
-                  phase.
-                </div>
-              )}
-            </div>
-            <div className="card">
-              <h2>Evidence</h2>
-              <div className="metric">{data.sources.length}</div>
-              <div className="metric-note">
-                {data.sources.length === 1
-                  ? "single source"
-                  : "sources describing this event"}
-              </div>
-            </div>
+            <LlmUsagePanel usage={data.llm_usage} calls={data.llm_calls} />
           </div>
 
           {data.event.summary && (
@@ -90,6 +105,18 @@ export function EventDetail() {
               <p style={{ margin: 0 }}>{data.event.summary}</p>
             </div>
           )}
+
+          {data.rationale && (
+            <div className="card" style={{ marginBottom: 18 }}>
+              <h2>Classifier rationale</h2>
+              <p className="rationale">{data.rationale}</p>
+            </div>
+          )}
+
+          <div className="card" style={{ marginBottom: 18 }}>
+            <h2>Affected companies</h2>
+            <CompanyImpactTable companies={data.companies} />
+          </div>
 
           <h2 className="page-title" style={{ fontSize: 15, marginBottom: 10 }}>
             Sources

@@ -143,6 +143,7 @@ export function Events() {
               <th>Event</th>
               <th>Status</th>
               <th>Sources</th>
+              <th>Cos.</th>
               <th>Importance</th>
               <th>First seen</th>
             </tr>
@@ -156,6 +157,9 @@ export function Events() {
                   </Link>
                   <div className="event-meta">
                     <CategoryBadge category={event.top_category} />
+                    {event.event_type && (
+                      <span className="badge">{event.event_type}</span>
+                    )}
                     {event.providers.map((name) => (
                       <ProviderBadge key={name} provider={name} />
                     ))}
@@ -165,6 +169,7 @@ export function Events() {
                   <EventStatusBadge status={event.status} />
                 </td>
                 <td className="mono">{event.source_count}</td>
+                <td className="mono">{event.company_count || "—"}</td>
                 <td className="mono">{formatScore(event.importance_score)}</td>
                 <td className="mono detail" title={formatTimestamp(event.first_seen_at)}>
                   {formatRelative(event.first_seen_at)}
@@ -173,7 +178,7 @@ export function Events() {
             ))}
             {data && data.events.length === 0 && (
               <tr>
-                <td colSpan={5} className="muted">
+                <td colSpan={6} className="muted">
                   {total === 0 && !search && !status && !provider
                     ? "No events ingested yet. Discovery providers need credentials before anything arrives."
                     : "No events match these filters."}
@@ -182,7 +187,7 @@ export function Events() {
             )}
             {!data && (
               <tr>
-                <td colSpan={5} className="muted">
+                <td colSpan={6} className="muted">
                   Loading…
                 </td>
               </tr>

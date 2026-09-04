@@ -30,7 +30,15 @@ log = get_logger(__name__)
 
 
 class JobQueue:
-    """Enqueue, claim and complete durable work items."""
+    """Enqueue, claim and complete durable work items.
+
+    **Scheduling uses the database clock throughout.** ``run_after`` defaults to
+    ``now()`` evaluated by PostgreSQL, and claiming compares against ``now()`` in
+    the claiming transaction. Mixing the application clock with the database
+    clock would let a job enqueued a few milliseconds "in the future" -- by
+    container clock skew, or simply because a transaction timestamp precedes a
+    later Python call -- become unclaimable until the next poll.
+    """
 
     async def enqueue(
         self,
@@ -55,7 +63,9 @@ class JobQueue:
             payload=payload or {},
             status=JobStatus.PENDING,
             priority=priority,
-            run_after=run_after or utcnow(),
+            # Server-side clock, so the row is immediately claimable by any
+            # worker, including one in the very same transaction.
+            run_after=run_after if run_after is not None else sa.func.now(),
             max_attempts=max_attempts,
             dedupe_key=dedupe_key,
         )
@@ -144,7 +154,8 @@ class JobQueue:
         delay = min(retry_max_seconds, retry_base_seconds * (2 ** (job.attempts - 1)))
         jittered = random.uniform(delay / 2, delay)  # noqa: S311 - jitter, not crypto
         job.status = JobStatus.PENDING
-        job.run_after = utcnow() + dt.timedelta(seconds=jittered)
+        # Database clock plus an interval, for the same reason as `enqueue`.
+        job.run_after = sa.func.now() + dt.timedelta(seconds=jittered)
         await session.flush()
         return True
 
@@ -170,7 +181,7 @@ class JobQueue:
                 locked_by=None,
                 locked_at=None,
                 last_error="reclaimed after worker timeout",
-                run_after=utcnow(),
+                run_after=sa.func.now(),
                 updated_at=utcnow(),
             )
             .returning(Job.id)

@@ -29,8 +29,17 @@ class HandlerContext:
     job_type: str
     payload: dict[str, Any]
     attempt: int
+    max_attempts: int
+    """So a handler can distinguish "will be retried" from "this is the last try",
+    and record a permanent failure on the final attempt rather than leaving the
+    entity in a transient state forever."""
+
     database: Database
     services: Any
+
+    @property
+    def is_final_attempt(self) -> bool:
+        return self.attempt >= self.max_attempts
 
 
 JobHandler = Callable[[HandlerContext], Awaitable[None]]

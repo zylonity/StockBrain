@@ -266,3 +266,33 @@ def test_registry_rejects_a_duplicate_registration() -> None:
     registry.register("X", handler)
     with pytest.raises(ValueError, match="already registered"):
         registry.register("X", handler)
+
+
+async def test_a_job_is_claimable_in_the_transaction_that_enqueued_it(
+    clean_tables: Database,
+) -> None:
+    """Regression: scheduling used two clocks.
+
+    ``run_after`` was stamped with the application clock while claiming compared
+    against PostgreSQL's transaction clock, so a job enqueued microseconds "in
+    the future" was skipped until the next poll -- and intermittently was not
+    claimable at all. Both sides now use the database clock.
+    """
+    queue = JobQueue()
+    async with clean_tables.transaction() as session:
+        job_id = await queue.enqueue(session, "IMMEDIATE")
+        claimed = await queue.claim(session, "worker-1")
+
+    assert claimed is not None, "a job enqueued with no delay must be immediately claimable"
+    assert claimed.id == job_id
+
+
+async def test_repeated_enqueue_and_claim_is_stable(clean_tables: Database) -> None:
+    """The same sequence must work every time, not most of the time."""
+    queue = JobQueue()
+    for index in range(10):
+        async with clean_tables.transaction() as session:
+            job_id = await queue.enqueue(session, "LOOP", payload={"i": index})
+            claimed = await queue.claim(session, "w")
+            assert claimed is not None and claimed.id == job_id
+            await queue.complete(session, job_id)

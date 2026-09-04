@@ -149,6 +149,14 @@ class EventCompanyImpact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         sa.ForeignKey("companies.id", ondelete="SET NULL")
     )
     company_name_hint: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    company_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    """Normalised company name, unique per event.
+
+    This is what makes classification idempotent at the database level: running
+    the same CLASSIFY_EVENT job twice cannot create a second impact row for the
+    same company, because `uq_event_company_impacts_event_id_company_key` will
+    not allow it."""
+
     ticker_hint: Mapped[str | None] = mapped_column(sa.Text)
     exchange_hint: Mapped[str | None] = mapped_column(sa.Text)
 
@@ -158,6 +166,12 @@ class EventCompanyImpact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         default=ImpactDirection.UNKNOWN,
     )
     relationship_type: Mapped[str | None] = mapped_column(sa.Text)
+    impact_path: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="unknown")
+    """direct | indirect | unknown.
+
+    Separate from materiality: a large indirect effect and a small direct one are
+    different things, and sizing should be able to tell them apart."""
+
     materiality_score: Mapped[float] = mapped_column(sa.Float, nullable=False)
     confidence: Mapped[float] = mapped_column(sa.Float, nullable=False)
     explanation: Mapped[str | None] = mapped_column(sa.Text)
@@ -170,6 +184,9 @@ class EventCompanyImpact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     company: Mapped[Company | None] = relationship()
 
     __table_args__ = (
+        sa.UniqueConstraint(
+            "event_id", "company_key", name="uq_event_company_impacts_event_id_company_key"
+        ),
         sa.Index("ix_event_company_impacts_event_id", "event_id"),
         sa.Index("ix_event_company_impacts_company_id", "company_id"),
         sa.CheckConstraint(

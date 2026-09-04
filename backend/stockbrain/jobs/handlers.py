@@ -171,6 +171,45 @@ async def handle_sec_refresh(context: HandlerContext) -> None:
     log.info("sec_refresh_complete", companies=len(ciks), created=total_created, failures=failures)
 
 
+async def handle_classify_event(context: HandlerContext) -> None:
+    """Classify one ingested event with the LLM classifier.
+
+    The service is idempotent: an event already past ``NEW``/``CLASSIFYING`` is
+    skipped, and company impacts are upserted, so a redelivered job cannot
+    duplicate anything.
+    """
+    services = context.services
+    classification = services.classification
+    if classification is None:
+        raise RuntimeError("classifier is not configured")
+
+    event_id = uuid.UUID(str(context.payload["event_id"]))
+    result = await classification.classify_event(
+        event_id,
+        job_id=context.job_id,
+        attempt=context.attempt,
+        is_final_attempt=context.is_final_attempt,
+    )
+
+    if result.skipped:
+        log.info(
+            "classify_event_skipped",
+            event_id=str(event_id),
+            reason=result.reason,
+            status=result.status.value,
+        )
+        return
+
+    services.health.record(ProviderName.DEEPSEEK, ProviderStatus.HEALTHY)
+    log.info(
+        "classify_event_complete",
+        event_id=str(event_id),
+        status=result.status.value,
+        merged_into=str(result.merged_into) if result.merged_into else None,
+        companies=result.company_count,
+    )
+
+
 async def handle_alpaca_backfill(context: HandlerContext) -> None:
     """Close a news gap after a WebSocket disconnect."""
     services = context.services
@@ -200,15 +239,17 @@ async def handle_alpaca_backfill(context: HandlerContext) -> None:
     )
 
 
-def register_ingestion_handlers(registry: JobRegistry) -> None:
-    """Register every handler this phase provides.
+def register_ingestion_handlers(registry: JobRegistry, *, classifier_available: bool) -> None:
+    """Register the handlers this deployment can actually run.
 
-    ``CLASSIFY_EVENT`` is deliberately **not** registered: the DeepSeek
-    classifier lands in the next phase. The ingestion service therefore does not
-    enqueue it yet, so no job is created that nothing can run. Ingested events
-    wait in ``NEW`` status, which is exactly where the classifier will pick them
-    up.
+    ``CLASSIFY_EVENT`` is registered only when a classifier is configured.
+    Registering a handler that would always fail would fill the queue with jobs
+    guaranteed to exhaust their retry budget; leaving it unregistered means
+    ingestion simply does not enqueue classification, and events wait in ``NEW``
+    until a key is supplied.
     """
     registry.register(JobType.FIRECRAWL_TOPIC_SEARCH.value, handle_firecrawl_topic_search)
     registry.register(JobType.SEC_REFRESH.value, handle_sec_refresh)
     registry.register("ALPACA_NEWS_BACKFILL", handle_alpaca_backfill)
+    if classifier_available:
+        registry.register(JobType.CLASSIFY_EVENT.value, handle_classify_event)

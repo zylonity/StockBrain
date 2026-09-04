@@ -16,6 +16,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql as pg
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from stockbrain.db.base import Base, JSONDict, TimestampMixin, UUIDPrimaryKeyMixin
@@ -129,7 +130,28 @@ class Event(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     classifier_model: Mapped[str | None] = mapped_column(sa.Text)
     classifier_prompt_version: Mapped[str | None] = mapped_column(sa.Text)
     classifier_output: Mapped[JSONDict | None] = mapped_column()
-    topics: Mapped[JSONDict] = mapped_column(nullable=False, server_default=sa.text("'{}'::jsonb"))
+    """The full validated classifier result, for audit and re-inspection."""
+
+    classified_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    classifier_error: Mapped[str | None] = mapped_column(sa.Text)
+    """Why classification failed, when it did. Kept so a CLASSIFICATION_FAILED
+    event is a visible, explainable state rather than a silent dead end."""
+
+    merged_into_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("events.id", ondelete="SET NULL")
+    )
+    """Set when semantic deduplication folded this event into another.
+
+    The row is kept and ARCHIVED rather than deleted, so the merge itself stays
+    auditable and no evidence is erased."""
+
+    relevant_to_public_equities: Mapped[bool | None] = mapped_column(sa.Boolean)
+    needs_corroboration: Mapped[bool | None] = mapped_column(sa.Boolean)
+    event_type_confidence: Mapped[float | None] = mapped_column(sa.Float)
+
+    topics: Mapped[list[str]] = mapped_column(
+        pg.JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
 
     sources: Mapped[list[EventSourceLink]] = relationship(
         back_populates="event", cascade="all, delete-orphan"

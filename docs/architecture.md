@@ -58,7 +58,8 @@ stockbrain/
   ingestion/         providers, normalisation, dedupe, the ingest entry point
   jobs/              PostgreSQL queue, worker pool, scheduler, handlers
 
-  intelligence/      (phase 3, 5)
+  llm/               provider interface, DeepSeek client, pricing, budget, telemetry
+  intelligence/      classifier, semantic dedupe, prompts, classification service
   market_data/       (phase 4)
   risk/              (phase 6)
   telegram/          (phase 7)
@@ -206,6 +207,62 @@ independent of execution concurrency, so a slow provider delays one job rather
 than the whole schedule, and it means per-topic intervals survive a restart
 because they are derived from `discovery_queries.last_run_at` rather than from an
 in-memory timer.
+
+### Why the LLM interface is text-in, text-out
+
+`stockbrain.llm.base.LlmProvider` exposes exactly one capability: send messages,
+receive a string plus token usage. No tools, no function calling, no callbacks.
+A model reached through it cannot touch the broker, the filesystem or the
+network, so a successful prompt injection has nothing to reach for. Everything a
+model returns is validated against a Pydantic schema before any code acts on it —
+JSON that parses is not JSON that is correct.
+
+`thinking` is sent explicitly on every call because DeepSeek's API default is
+*enabled*; the classifier is the cheap high-volume path and must not silently
+become a reasoning call.
+
+### Why classification is idempotent in three places
+
+At-least-once delivery means a `CLASSIFY_EVENT` job will eventually run twice.
+
+| Layer | Mechanism |
+|---|---|
+| Queue | `uq_jobs_dedupe_key_active` — one pending classify job per event |
+| Service | Compare-and-swap `NEW → CLASSIFYING`, so exactly one worker proceeds |
+| Database | `uq_event_company_impacts_event_id_company_key` + upsert |
+
+The middle layer matters for cost, not correctness: a check-then-act status read
+let two workers each spend a model call on the same event. A conditional UPDATE
+lets one win. A stall reaper returns events abandoned in `CLASSIFYING` to `NEW`
+after a timeout, mirroring the job queue's own reaper.
+
+### Why semantic deduplication is biased against merging
+
+Layer 4 is the only deduplication layer that costs money, so it runs last, only
+against candidates a deterministic token-overlap filter already considers
+plausible, and only above a configured confidence threshold.
+
+The asymmetry is deliberate: a duplicate event is visible and correctable, while
+a wrong merge silently destroys the distinction between two real occurrences and
+nobody notices. So an unrecognised relation falls back to `UNRELATED`, a
+hallucinated candidate id is discarded, and documents flagged
+`is_distinct_event` (regulatory filings) never reach the layer at all.
+
+A merge archives the folded event with a `merged_into_event_id` pointer rather
+than deleting it, moves its source links to the survivor, and records the prior
+values in the audit log. Nothing is erased.
+
+### Why budgets stop analysis but never monitoring
+
+The budget guard is consulted only by LLM callers. Nothing in ingestion,
+deduplication or broker reconciliation asks it anything, so a hard limit
+structurally cannot stop them. At the soft limit optional work (semantic
+deduplication) is suppressed; at the hard limit no new model analysis starts and
+events simply wait in `NEW` — no data is lost, and classification resumes when
+the budget rolls over.
+
+Spend is summed from `llm_calls` rather than a running counter, so it always
+matches the recorded history and needs no reconciliation after a restart.
 
 ## Untrusted content
 

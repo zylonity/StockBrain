@@ -15,11 +15,16 @@ from fastapi import APIRouter, HTTPException, Query, status
 
 from stockbrain.api.dependencies import DbSession
 from stockbrain.api.schemas import (
+    CompanyImpactResponse,
     EventDetailResponse,
     EventListResponse,
     EventSummaryResponse,
+    LlmCallResponse,
+    LlmUsageResponse,
     SourceResponse,
 )
+from stockbrain.db.models.companies import EventCompanyImpact
+from stockbrain.db.models.research import LlmCall
 from stockbrain.db.models.sources import Event, Source
 from stockbrain.db.repositories.events import EventFilters, EventRepository
 from stockbrain.enums import EventStatus, SourceProvider
@@ -32,7 +37,11 @@ EXCERPT_CHARS = 1200
 
 
 def _to_summary(
-    event: Event, source_count: int, providers: list[str], category: str | None
+    event: Event,
+    source_count: int,
+    providers: list[str],
+    category: str | None,
+    company_count: int = 0,
 ) -> EventSummaryResponse:
     return EventSummaryResponse(
         id=event.id,
@@ -44,9 +53,64 @@ def _to_summary(
         event_time=event.event_time,
         importance_score=event.importance_score,
         novelty_score=event.novelty_score,
+        confidence_score=event.confidence_score,
+        candidate_score=event.candidate_score,
+        relevant_to_public_equities=event.relevant_to_public_equities,
+        needs_corroboration=event.needs_corroboration,
+        topics=list(event.topics or []),
+        classified_at=event.classified_at,
+        classifier_model=event.classifier_model,
+        classifier_prompt_version=event.classifier_prompt_version,
+        classifier_error=event.classifier_error,
+        merged_into_event_id=event.merged_into_event_id,
         source_count=source_count,
+        company_count=company_count,
         providers=providers,
         top_category=category,
+    )
+
+
+def _to_impact(impact: EventCompanyImpact) -> CompanyImpactResponse:
+    return CompanyImpactResponse(
+        id=impact.id,
+        company_name_hint=impact.company_name_hint,
+        ticker_hint=impact.ticker_hint,
+        exchange_hint=impact.exchange_hint,
+        direction=impact.direction.value,
+        impact_path=impact.impact_path,
+        relationship_type=impact.relationship_type,
+        materiality_score=impact.materiality_score,
+        confidence=impact.confidence,
+        explanation=impact.explanation,
+        resolved_company_id=impact.company_id,
+        resolution_confidence=impact.resolution_confidence,
+    )
+
+
+def _to_llm_call(call: LlmCall) -> LlmCallResponse:
+    """Expose the call record, never the provider's hidden reasoning."""
+    return LlmCallResponse(
+        id=call.id,
+        purpose=call.purpose,
+        provider=call.provider,
+        model=call.model,
+        prompt_version=call.prompt_version,
+        thinking_enabled=call.thinking_enabled,
+        succeeded=call.succeeded,
+        used=call.used,
+        attempt=call.attempt,
+        retry_count=call.retry_count,
+        input_tokens=call.input_tokens,
+        output_tokens=call.output_tokens,
+        cached_input_tokens=call.cached_input_tokens,
+        estimated_cost_usd=call.estimated_cost_usd,
+        latency_ms=call.latency_ms,
+        finish_reason=call.finish_reason,
+        provider_request_id=call.provider_request_id,
+        had_reasoning_content=call.had_reasoning_content,
+        error_class=call.error_class,
+        error=call.error,
+        created_at=call.created_at,
     )
 
 
@@ -118,7 +182,24 @@ async def get_event(event_id: uuid.UUID, session: DbSession) -> EventDetailRespo
 
     sources = await repository.sources_for_event(event_id)
     summary = await repository.source_summary([event_id])
+    companies = await repository.impacts_for_event(event_id)
+    usage = await repository.llm_usage_for_event(event_id)
+    calls = await repository.llm_calls_for_event(event_id)
+
+    # The structured rationale is part of the requested schema and is safe to
+    # show. Any provider-side reasoning content is never stored or returned.
+    rationale = None
+    if isinstance(event.classifier_output, dict):
+        raw_rationale = event.classifier_output.get("rationale")
+        rationale = str(raw_rationale) if raw_rationale else None
+
     return EventDetailResponse(
-        event=_to_summary(event, *summary.get(event_id, (0, [], None))),
+        event=_to_summary(
+            event, *summary.get(event_id, (0, [], None)), company_count=len(companies)
+        ),
         sources=[_to_source(source, relationship) for source, relationship in sources],
+        companies=[_to_impact(impact) for impact in companies],
+        rationale=rationale,
+        llm_usage=LlmUsageResponse(**usage),
+        llm_calls=[_to_llm_call(call) for call in calls],
     )
