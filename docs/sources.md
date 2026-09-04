@@ -9,7 +9,7 @@ first line of request-building code. Nothing here is guessed. Where a detail has
 not yet been checked in this repository, it is marked as carried from the
 specification and must be re-confirmed before use.
 
-Last verification pass: **2026-09-04** (Phase 1).
+Last verification pass: **2026-09-04** (Phase 2).
 
 ---
 
@@ -67,42 +67,116 @@ API-key-only header scheme exists alongside key+secret Basic. The broker adapter
 must target the current key+secret scheme and must not silently fall back to the
 legacy one. To be re-confirmed when the adapter is built.
 
+### Alpaca news — stream and REST
+
+Sources: <https://docs.alpaca.markets/docs/streaming-real-time-news>,
+<https://docs.alpaca.markets/docs/streaming-market-data>,
+<https://docs.alpaca.markets/reference/news-3>
+
+| Detail | Status |
+|---|---|
+| Stream `wss://stream.data.alpaca.markets/v1beta1/news` | confirmed |
+| Auth by JSON message `{"action":"auth","key":…,"secret":…}` | confirmed |
+| Auth by `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` headers | confirmed (alternative) |
+| Subscribe `{"action":"subscribe","news":["*"]}` | confirmed |
+| Control frames `{"T":"success","msg":"connected"/"authenticated"}` | confirmed |
+| REST `GET https://data.alpaca.markets/v1beta1/news` | confirmed |
+| Pagination via `next_page_token` | confirmed |
+
+**Discrepancies against StockBrain's spec, and what was implemented:**
+
+1. **The news payload has more fields than the spec lists.** The spec's field
+   set omits `symbols` (array of related tickers) and `source` (the originating
+   outlet). Both are captured: `symbols` feeds company resolution as a *hint*,
+   and `source` feeds the trust category. The REST shape additionally returns an
+   `images` array, which is counted but not stored.
+2. **`limit` is capped at 50 per page** on the historical endpoint. The spec does
+   not mention a cap. The backfill client pages with `next_page_token` and
+   bounds the *total* documents rather than the page size.
+3. **Documented WebSocket error codes** are handled explicitly, because the
+   correct response differs per code: 402 (auth failed) and 404 (auth timeout)
+   are credential failures that must not be retried; 409/410 (insufficient
+   subscription) are entitlement failures that degrade discovery rather than
+   crash it; everything else is transient and reconnects with backoff.
+4. Sandbox `wss://stream.data.sandbox.alpaca.markets/v1beta1/news` exists but is
+   intended for Broker API users; the production URL stays the default for an
+   individual account, per the spec.
+
+Rate-limit headers on the REST endpoint are `X-RateLimit-Limit` (100/min),
+`-Remaining` and `-Reset`; the client parses these case-insensitively and keeps a
+client-side token bucket below the ceiling.
+
+### Firecrawl v2 search
+
+Source: <https://docs.firecrawl.dev/api-reference/endpoint/search>
+
+| Detail | Status |
+|---|---|
+| `POST https://api.firecrawl.dev/v2/search`, `Authorization: Bearer` | confirmed |
+| `limit` 1–100 | confirmed |
+| `tbs` freshness, `includeDomains`, `excludeDomains`, `country` | confirmed |
+| `scrapeOptions.formats: [{"type":"markdown"}]` returns page content | confirmed |
+| Response `{success, data:{web,news,images}, creditsUsed, id, warning}` | confirmed |
+
+**Discrepancies against StockBrain's spec, and what was implemented:**
+
+1. **`sources` is an array of objects, not strings.** The spec shows
+   `"sources": ["web", "news"]`. The current API documents
+   `[{"type": "web"}, {"type": "news"}]`, and that is what the client sends. This
+   is the most consequential difference found in this phase: the spec's form
+   would have been rejected or silently defaulted.
+2. **Web and news results have different shapes.** Web results carry
+   `description` (plus `markdown` when scraping is on); news results carry
+   `snippet`, `date` and `imageUrl`. The parser handles both explicitly rather
+   than assuming one shape.
+3. **`query` is capped at 500 characters**, which the spec does not mention.
+   Queries are truncated client-side.
+4. New parameters exist that StockBrain does not use: `categories`,
+   `highlights`, `enterprise`, `threatProtection`.
+
+`creditsUsed` is recorded per query for cost control, as the spec requires.
+
+### SEC EDGAR
+
+Sources: <https://www.sec.gov/search-filings/edgar-application-programming-interfaces>,
+<https://www.sec.gov/about/developer-resources>,
+<https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data>
+
+| Detail | Status |
+|---|---|
+| No API key for `data.sec.gov` | confirmed |
+| Descriptive `User-Agent` with contact required, else 403 | confirmed |
+| `https://data.sec.gov/submissions/CIK##########.json` | confirmed |
+| CIK zero-padded to 10 digits | confirmed |
+| Ticker map `https://www.sec.gov/files/company_tickers.json` | confirmed |
+| Daily index under `/Archives/edgar/daily-index` | confirmed |
+
+**Discrepancies against StockBrain's spec, and what was implemented:**
+
+1. **The rate limit is 10 requests/second per IP across all EDGAR domains**, and
+   exceeding it returns 403 and blocks the IP for roughly ten minutes. The spec
+   does not state this at all, and it is the single most important operational
+   fact about this provider — the penalty is a block, not a 429 that could be
+   backed off from. The client therefore runs a shared token bucket at **5 req/s**
+   across both the `data.sec.gov` and `www.sec.gov` clients, since the limit is
+   per IP rather than per host.
+2. **`filings.recent` is columnar, not a list of objects.** It returns parallel
+   arrays where `form[i]` and `accessionNumber[i]` describe the same filing. The
+   parser flattens them and stops at the shortest required column, so a truncated
+   column can never produce a filing with fields taken from two different rows.
+3. A 403 aborts the whole watchlist sweep rather than continuing, so a
+   User-Agent mistake or an existing block is not deepened by walking every
+   company.
+
 ---
 
 ## Carried from the specification — verify before implementing
 
-### Alpaca (Phase 2, Phase 4)
+### Alpaca market data (Phase 4)
 
-Used for real-time news, historical news backfill, and US reference prices.
-Never for execution.
-
-To confirm before use: the news WebSocket URL
-(`wss://stream.data.alpaca.markets/v1beta1/news`), the auth/subscribe message
-shapes, the news message field set, the REST `/v1beta1/news` parameters, and the
-`iex` / `sip` / `delayed_sip` stock feed endpoints.
-
-Entitlement is subscription-dependent, so a startup capability check is
-mandatory: authenticating to a feed the account does not hold returns an
-insufficient-subscription error. Losing real-time news must move discovery into
-a degraded mode, not crash the application.
-
-### Firecrawl v2 (Phase 2)
-
-Broad thematic web discovery. To confirm: `POST /v2/search`, the `sources`,
-`limit`, `tbs`, `includeDomains` / `excludeDomains` and `scrapeOptions`
-parameters, and the credits-used field in responses.
-
-Search results are frequently syndicated duplicates of the same story, so the
-normalizer must deduplicate rather than trusting the URL.
-
-### SEC EDGAR (Phase 2)
-
-No API key. A descriptive `User-Agent` including a contact address is required,
-which is why `SEC_CONTACT_EMAIL` gates the provider as `DISABLED` when unset.
-
-To confirm: the submissions and XBRL endpoint shapes, and the daily/recent index
-resources used for global filing discovery. The accession number is the unique
-source identifier.
+The `iex` / `sip` / `delayed_sip` stock feeds are not yet used. Entitlement is
+subscription-dependent, so a startup capability check is required before relying
+on any of them for pre-trade pricing.
 
 ### FRED (Phase 5)
 

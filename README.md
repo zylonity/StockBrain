@@ -35,7 +35,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Skeleton, config, logging, full persistence model, health, GUI shell, Docker | **done** |
-| 2 | Discovery ingestion (Alpaca news WS, Firecrawl, SEC EDGAR), dedupe | not started |
+| 2 | Discovery ingestion (Alpaca news WS, Firecrawl, SEC EDGAR), dedupe, job queue | **done** |
 | 3 | DeepSeek event classifier | not started |
 | 4 | Instrument resolution and market data | not started |
 | 5 | Pinned TradingAgents research engine | not started |

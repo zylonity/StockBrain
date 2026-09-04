@@ -7,8 +7,9 @@ import { NavLink, Outlet } from "react-router-dom";
  */
 const NAV = [
   { to: "/", label: "Dashboard", enabled: true },
+  { to: "/events", label: "Events", enabled: true },
+  { to: "/discovery", label: "Discovery", enabled: true },
   { to: "/health", label: "System health", enabled: true },
-  { to: "/events", label: "Events", enabled: false },
   { to: "/research", label: "Research", enabled: false },
   { to: "/proposals", label: "Proposals", enabled: false },
   { to: "/portfolio", label: "Portfolio", enabled: false },
@@ -50,7 +51,7 @@ export function Layout() {
           Every broker order requires explicit two-stage human approval. No
           automatic retries on broker mutations.
         </span>
-        <span className="mono">phase 1 · skeleton &amp; state model</span>
+        <span className="mono">phase 2 · discovery ingestion</span>
       </footer>
     </div>
   );

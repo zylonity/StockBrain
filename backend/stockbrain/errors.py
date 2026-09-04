@@ -17,7 +17,12 @@ __all__ = [
     "InvalidProposalTransition",
     "ProposalAlreadyConsumed",
     "ProposalExpired",
+    "ProviderAuthError",
+    "ProviderEntitlementError",
     "ProviderError",
+    "ProviderRateLimited",
+    "ProviderResponseError",
+    "ProviderUnavailable",
     "StockBrainError",
 ]
 
@@ -32,6 +37,42 @@ class ConfigurationError(StockBrainError):
 
 class ProviderError(StockBrainError):
     """An external provider failed in a way the caller should handle."""
+
+
+class ProviderAuthError(ProviderError):
+    """The provider rejected our credentials (HTTP 401/403, WS auth failure).
+
+    Never retried: retrying a bad credential only burns rate limit and, for
+    SEC EDGAR, earns an IP block.
+    """
+
+
+class ProviderEntitlementError(ProviderError):
+    """Credentials are valid but the account lacks the required subscription.
+
+    Alpaca returns this for a feed outside the account's plan.  The subsystem
+    degrades; the application does not crash.
+    """
+
+
+class ProviderRateLimited(ProviderError):
+    """The provider rate-limited us.  Carries the retry hint when one is given."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ProviderUnavailable(ProviderError):
+    """A transient provider failure (5xx, connect error, timeout).  Retryable."""
+
+
+class ProviderResponseError(ProviderError):
+    """The provider answered, but the payload did not match its documented schema.
+
+    Raised rather than coerced: silently accepting an unexpected shape is how
+    wrong data reaches the research pipeline.
+    """
 
 
 class InstrumentResolutionError(StockBrainError):

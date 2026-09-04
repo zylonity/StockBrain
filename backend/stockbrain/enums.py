@@ -32,6 +32,7 @@ __all__ = [
     "ProposalStatus",
     "ProviderStatus",
     "ResearchStatus",
+    "SourceCategory",
     "SourceProvider",
     "ThesisAction",
     "TimeHorizon",
@@ -43,6 +44,23 @@ class SourceProvider(StrEnum):
     FIRECRAWL = "FIRECRAWL"
     SEC = "SEC"
     MANUAL = "MANUAL"
+
+
+class SourceCategory(StrEnum):
+    """Transparent trust category for a source.
+
+    Kept as data on the row rather than as editorial scoring inside an LLM
+    prompt, so the ranking is inspectable and adjustable (spec section 37).
+    ``UNKNOWN`` sources must not independently trigger a high-confidence
+    proposal without corroboration.
+    """
+
+    REGULATOR = "REGULATOR"
+    ISSUER = "ISSUER"
+    GOVERNMENT = "GOVERNMENT"
+    NEWSWIRE = "NEWSWIRE"
+    PRESS = "PRESS"
+    UNKNOWN = "UNKNOWN"
 
 
 class EventStatus(StrEnum):

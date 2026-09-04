@@ -22,6 +22,9 @@ dependencies = [
     "pydantic-settings>=2.7,<3.0",
     "httpx>=0.28,<0.29",
     "structlog>=25.1,<26.0",
+    # Imported directly by the Alpaca news stream. Also pulled in by
+    # uvicorn[standard], but an explicit import deserves an explicit dependency.
+    "websockets>=14.0,<18.0",
     "python-dateutil>=2.9,<3.0",
 ]
 

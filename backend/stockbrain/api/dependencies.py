@@ -8,7 +8,7 @@ monkeypatching.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,10 +17,14 @@ from stockbrain.config import Settings
 from stockbrain.db.session import Database
 from stockbrain.observability.health import ProviderHealthRegistry
 
+if TYPE_CHECKING:
+    from stockbrain.services import ServiceContainer
+
 __all__ = [
     "DatabaseDep",
     "DbSession",
     "HealthRegistry",
+    "ServicesDep",
     "SettingsDep",
     "get_database",
     "get_health_registry",
@@ -39,6 +43,16 @@ def get_health_registry(request: Request) -> ProviderHealthRegistry:
     return registry
 
 
+def get_services(request: Request) -> ServiceContainer | None:
+    """The discovery subsystem, or ``None`` when it could not start.
+
+    Routes must handle ``None`` rather than assuming it is present: the API
+    stays up when discovery does not.
+    """
+    services: ServiceContainer | None = request.app.state.services
+    return services
+
+
 def get_settings_dep(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
@@ -52,6 +66,7 @@ async def get_session(
 
 
 DatabaseDep = Annotated[Database, Depends(get_database)]
+ServicesDep = Annotated["ServiceContainer | None", Depends(get_services)]
 DbSession = Annotated[AsyncSession, Depends(get_session)]
 HealthRegistry = Annotated[ProviderHealthRegistry, Depends(get_health_registry)]
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]

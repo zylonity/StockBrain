@@ -21,6 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from stockbrain.api.routes import discovery as discovery_routes
+from stockbrain.api.routes import events as events_routes
 from stockbrain.api.routes import health as health_routes
 from stockbrain.api.routes import system as system_routes
 from stockbrain.config import Settings, get_settings
@@ -29,6 +31,7 @@ from stockbrain.errors import ProposalAlreadyConsumed, ProposalExpired, StockBra
 from stockbrain.logging import configure_logging, get_logger
 from stockbrain.observability.health import ProviderHealthRegistry
 from stockbrain.observability.metrics import METRICS
+from stockbrain.services import ServiceContainer
 from stockbrain.startup import (
     check_database,
     check_schema_current,
@@ -78,11 +81,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             blockers=settings.execution_blockers,
         )
 
-    log.info("startup_complete", database_ok=database_ok)
+    services: ServiceContainer | None = None
+    if database_ok:
+        # Discovery, the job workers and the scheduler all need the database.
+        # Without it they cannot start, but the API still serves /api/health so
+        # an operator can see precisely why.
+        services = ServiceContainer(settings=settings, database=database, health=registry)
+        try:
+            await services.start(instance_id=instance_identity())
+        except Exception as exc:
+            log.exception("discovery_subsystem_start_failed", error=str(exc))
+            await services.stop()
+            services = None
+    app.state.services = services
+
+    log.info(
+        "startup_complete",
+        database_ok=database_ok,
+        discovery_started=services is not None,
+    )
     try:
         yield
     finally:
         log.info("shutdown_begin")
+        if services is not None:
+            await services.stop()
         await database.dispose()
         log.info("shutdown_complete")
 
@@ -195,8 +218,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     _register_middleware(app, settings)
     _register_exception_handlers(app)
 
+    app.state.services = None
+
     app.include_router(health_routes.router)
     app.include_router(system_routes.router)
+    app.include_router(events_routes.router)
+    app.include_router(discovery_routes.router)
 
     _mount_frontend(app)
     return app

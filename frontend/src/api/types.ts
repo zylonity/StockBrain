@@ -59,3 +59,134 @@ export interface ExecutionStatusResponse {
   blockers: string[];
   notice: string;
 }
+
+// ---------------------------------------------------------------------------
+// Discovery and events
+// ---------------------------------------------------------------------------
+
+export type SourceProvider = "ALPACA" | "FIRECRAWL" | "SEC" | "MANUAL";
+
+export type EventStatus =
+  | "NEW"
+  | "CLASSIFYING"
+  | "CLASSIFIED"
+  | "CLASSIFICATION_FAILED"
+  | "IRRELEVANT"
+  | "CANDIDATE"
+  | "RESEARCHING"
+  | "RESEARCHED"
+  | "ARCHIVED";
+
+export type SourceCategory =
+  | "REGULATOR"
+  | "ISSUER"
+  | "GOVERNMENT"
+  | "NEWSWIRE"
+  | "PRESS"
+  | "UNKNOWN";
+
+export interface EventSummary {
+  id: string;
+  title: string;
+  summary: string | null;
+  status: EventStatus;
+  event_type: string | null;
+  first_seen_at: string;
+  event_time: string | null;
+  importance_score: number | null;
+  novelty_score: number | null;
+  source_count: number;
+  providers: string[];
+  top_category: SourceCategory | null;
+}
+
+export interface EventListResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  events: EventSummary[];
+}
+
+export interface SourceRecord {
+  id: string;
+  provider: string;
+  source_name: string | null;
+  source_category: string | null;
+  headline: string | null;
+  author: string | null;
+  canonical_url: string | null;
+  original_url: string | null;
+  published_at: string | null;
+  received_at: string;
+  relationship: string | null;
+  /** Plain text extracted server-side. Never raw provider HTML. */
+  excerpt: string | null;
+  symbols: string[];
+}
+
+export interface EventDetail {
+  event: EventSummary;
+  sources: SourceRecord[];
+}
+
+export interface IngestionStats {
+  sources_total: number;
+  events_total: number;
+  sources_last_24h: number;
+  events_last_24h: number;
+  events_by_status: Record<string, number>;
+  sources_by_provider: Record<string, number>;
+  latest_source_at: string | null;
+}
+
+export interface ScheduledTask {
+  name: string;
+  interval_seconds: number;
+  enabled: boolean;
+  last_run_at: string | null;
+  last_error: string | null;
+}
+
+export interface DiscoveryStatus {
+  discovery_enabled: boolean;
+  paused: boolean;
+  subsystem_running: boolean;
+  news_stream_active: boolean;
+  jobs_pending: number;
+  scheduled_tasks: ScheduledTask[];
+  stats: IngestionStats;
+}
+
+export interface DiscoveryQueryRecord {
+  id: string;
+  query: string;
+  enabled: boolean;
+  last_run_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  consecutive_failures: number;
+  results_seen: number;
+  credits_used: number;
+}
+
+export interface DiscoveryTopic {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  interval_minutes: number;
+  result_limit: number;
+  freshness: string;
+  last_run_at: string | null;
+  queries: DiscoveryQueryRecord[];
+}
+
+export interface EventFilters {
+  status?: EventStatus;
+  provider?: SourceProvider;
+  search?: string;
+  limit?: number;
+  offset?: number;
+  sinceHours?: number;
+}

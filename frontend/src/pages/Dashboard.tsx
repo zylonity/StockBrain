@@ -1,22 +1,30 @@
+import { Link } from "react-router-dom";
+
 import { api } from "../api/client";
+import { EventStatusBadge, ProviderBadge } from "../components/Badges";
 import { ExecutionBanner } from "../components/ExecutionBanner";
 import { StatusPill } from "../components/StatusPill";
+import { formatRelative } from "../components/formats";
 import { usePolling } from "../components/usePolling";
 
 const REFRESH_MS = 15_000;
+
+/** Stable reference so usePolling does not refetch on every render. */
+const recentEvents = () => api.events({ limit: 8 });
 
 export function Dashboard() {
   const health = usePolling(api.health, REFRESH_MS);
   const readiness = usePolling(api.readiness, REFRESH_MS);
   const execution = usePolling(api.executionStatus, 60_000);
+  const discovery = usePolling(api.discoveryStatus, REFRESH_MS);
+  const latest = usePolling(recentEvents, REFRESH_MS);
 
   return (
     <>
       <h1 className="page-title">Dashboard</h1>
       <p className="page-subtitle">
-        Discovery, research and proposal pipelines land here as later phases
-        ship. What is shown below is read from the API, never computed in the
-        browser.
+        Everything below is read from the API and never recomputed in the
+        browser. Research and proposal panels fill in as later phases ship.
       </p>
 
       {execution.error && (
@@ -97,9 +105,86 @@ export function Dashboard() {
 
       <div className="grid" style={{ marginTop: 18 }}>
         <div className="card">
-          <h2>Latest events</h2>
-          <div className="placeholder">Ingestion lands in phase 2.</div>
+          <h2>Sources (24h)</h2>
+          <div className="metric">{discovery.data?.stats.sources_last_24h ?? "—"}</div>
+          <div className="metric-note">
+            {discovery.data
+              ? `${discovery.data.stats.sources_total} total · last ${formatRelative(
+                  discovery.data.stats.latest_source_at,
+                )}`
+              : "loading"}
+          </div>
         </div>
+        <div className="card">
+          <h2>Events (24h)</h2>
+          <div className="metric">{discovery.data?.stats.events_last_24h ?? "—"}</div>
+          <div className="metric-note">
+            {discovery.data
+              ? `${discovery.data.stats.events_total} total · ${discovery.data.jobs_pending} jobs pending`
+              : "loading"}
+          </div>
+        </div>
+        <div className="card">
+          <h2>Discovery</h2>
+          <div className="metric">
+            <StatusPill
+              status={
+                !discovery.data?.subsystem_running
+                  ? "DOWN"
+                  : discovery.data.paused || !discovery.data.discovery_enabled
+                    ? "DISABLED"
+                    : "HEALTHY"
+              }
+            />
+          </div>
+          <div className="metric-note">
+            <Link to="/discovery">Topics and schedules</Link>
+          </div>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: 18 }}>
+        <h2>Latest events</h2>
+        <table>
+          <tbody>
+            {(latest.data?.events ?? []).map((event) => (
+              <tr key={event.id}>
+                <td>
+                  <Link className="event-title" to={`/events/${event.id}`}>
+                    {event.title}
+                  </Link>
+                  <div className="event-meta">
+                    {event.providers.map((name) => (
+                      <ProviderBadge key={name} provider={name} />
+                    ))}
+                  </div>
+                </td>
+                <td style={{ width: 1 }}>
+                  <EventStatusBadge status={event.status} />
+                </td>
+                <td className="mono detail" style={{ width: 1, whiteSpace: "nowrap" }}>
+                  {formatRelative(event.first_seen_at)}
+                </td>
+              </tr>
+            ))}
+            {latest.data && latest.data.events.length === 0 && (
+              <tr>
+                <td className="muted">
+                  Nothing ingested yet. Discovery providers need credentials
+                  before news, filings or searches arrive.
+                </td>
+              </tr>
+            )}
+            {!latest.data && (
+              <tr>
+                <td className="muted">Loading…</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="grid">
         <div className="card">
           <h2>Pending proposals</h2>
           <div className="placeholder">Proposals land in phase 6.</div>

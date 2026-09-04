@@ -52,7 +52,12 @@ stockbrain/
   proposals/         proposal state machine (approval and execution to follow)
   observability/     provider health registry, metrics registry
 
-  ingestion/         (phase 2)
+  httpclient.py      shared provider HTTP: classified errors, opt-in retries
+  services.py        runtime container; owns workers, scheduler, news stream
+
+  ingestion/         providers, normalisation, dedupe, the ingest entry point
+  jobs/              PostgreSQL queue, worker pool, scheduler, handlers
+
   intelligence/      (phase 3, 5)
   market_data/       (phase 4)
   risk/              (phase 6)
@@ -152,13 +157,73 @@ migration should stop the container rather than leave a half-configured process
 serving traffic. `check_schema_current` compares the applied revision against
 the code's head and makes `/api/health/ready` return 503 on a mismatch.
 
+### Why deduplication is layered, and why the last layer is missing
+
+Deduplication runs cheapest-first because the expensive answer is rarely needed:
+
+| Layer | Catches | Cost |
+|---|---|---|
+| 1 — provider id | The same article re-delivered | index lookup |
+| 2 — canonical URL | Same document, different tracking parameters | index lookup |
+| 3 — content hash | Verbatim syndication across outlets | index lookup |
+| 3.5 — normalised headline in a window | Different bodies, same story → one event | index lookup |
+| 4 — semantic | Rewritten headlines, story updates | **an LLM call** |
+
+Layer 4 is deliberately absent until the classifier phase. Running a model before
+four free checks would be the wrong order, and layer 3.5 is exact-match only on
+purpose: a fuzzy match that wrongly merges two different events is far harder to
+notice than a duplicated one.
+
+The event-match window (36h by default) exists so that a headline recurring
+months later — "Fed holds rates" — starts a new event instead of reviving a
+stale one.
+
+### Why the ingest path relies on unique indexes, not locks
+
+`find_duplicate_source` is a `SELECT`, so two workers ingesting the same article
+concurrently can both pass it. The loser then violates
+`uq_sources_provider_item` and is reported as a duplicate. Check-then-insert is a
+race; a unique index is not. The same pattern protects job scheduling via
+`uq_jobs_dedupe_key_active`.
+
+### Why retries are opt-in per request
+
+`ProviderHttpClient.request_json` defaults `retry_safe=False`. A GET opts in
+because it has no side effect; Firecrawl's search opts in explicitly because its
+only side effect is credit consumption. Nothing else does. There is deliberately
+no middleware that could decide on its own to repeat a request — that is the
+mechanism which, applied to a Trading 212 order POST, creates a duplicate order.
+
+Errors are classified rather than lumped together because the correct response
+differs: an auth failure must never be retried (for SEC it earns an IP block), an
+entitlement failure must degrade a subsystem instead of crashing it, and only
+transient failures earn a retry.
+
+### Why the scheduler only enqueues
+
+Scheduled tasks never do work; they insert jobs. That keeps the recurring cadence
+independent of execution concurrency, so a slow provider delays one job rather
+than the whole schedule, and it means per-topic intervals survive a restart
+because they are derived from `discovery_queries.last_run_at` rather than from an
+in-memory timer.
+
 ## Untrusted content
 
 Everything retrieved from the web, a news feed or a filing is data, never
-instruction. Evidence is wrapped in explicit document markers, the system prompt
-states that instructions inside documents are not to be followed, and rendered
-content is sanitised. LLM agents are never given credentials or a broker tool,
-so a successful prompt injection has no execution path to reach.
+instruction. Evidence will be wrapped in explicit document markers, the system
+prompt will state that instructions inside documents are not to be followed, and
+LLM agents are never given credentials or a broker tool, so a successful prompt
+injection has no execution path to reach.
+
+Concretely, as of the ingestion phase:
+
+* `html_to_text` strips `<script>`, `<style>` and `<noscript>` blocks entirely
+  before anything is hashed, stored as `normalized_text`, or shown;
+* the API returns only that extracted plain text, never `raw_content`, so the
+  provider's original markup does not cross the HTTP boundary;
+* the frontend renders source excerpts as text nodes — there is no
+  `dangerouslySetInnerHTML` anywhere in the codebase — and external links carry
+  `rel="noopener noreferrer nofollow"`.
 
 ## Deferred by design
 

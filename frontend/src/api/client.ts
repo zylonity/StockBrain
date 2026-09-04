@@ -8,6 +8,11 @@
  */
 
 import type {
+  DiscoveryStatus,
+  DiscoveryTopic,
+  EventDetail,
+  EventFilters,
+  EventListResponse,
   ExecutionStatusResponse,
   HealthResponse,
   ProvidersResponse,
@@ -50,10 +55,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+function eventQuery(filters: EventFilters): string {
+  const params = new URLSearchParams();
+  if (filters.status) params.set("status", filters.status);
+  if (filters.provider) params.set("provider", filters.provider);
+  if (filters.search?.trim()) params.set("search", filters.search.trim());
+  if (filters.sinceHours) params.set("since_hours", String(filters.sinceHours));
+  params.set("limit", String(filters.limit ?? 50));
+  params.set("offset", String(filters.offset ?? 0));
+  return params.toString();
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
   readiness: () => request<ReadinessResponse>("/api/health/ready"),
   providers: () => request<ProvidersResponse>("/api/health/providers"),
   executionStatus: () =>
     request<ExecutionStatusResponse>("/api/v1/system/execution-status"),
+  events: (filters: EventFilters = {}) =>
+    request<EventListResponse>(`/api/v1/events?${eventQuery(filters)}`),
+  event: (id: string) =>
+    request<EventDetail>(`/api/v1/events/${encodeURIComponent(id)}`),
+  discoveryStatus: () =>
+    request<DiscoveryStatus>("/api/v1/discovery/status"),
+  discoveryTopics: () =>
+    request<DiscoveryTopic[]>("/api/v1/discovery/topics"),
 };

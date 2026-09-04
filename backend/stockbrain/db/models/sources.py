@@ -98,6 +98,13 @@ class Event(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     event_type: Mapped[str | None] = mapped_column(sa.Text)
     title: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    title_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    """SHA-256 of the normalised title, for deterministic event grouping.
+
+    Lets a story syndicated across outlets attach to one event with an indexed
+    lookup instead of a scan. Not unique: the same headline recurring outside the
+    match window is a genuinely new event."""
+
     summary: Mapped[str | None] = mapped_column(sa.Text)
 
     first_seen_at: Mapped[dt.datetime] = mapped_column(
@@ -134,6 +141,7 @@ class Event(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __table_args__ = (
         sa.Index("ix_events_status_first_seen", "status", "first_seen_at"),
+        sa.Index("ix_events_title_hash_first_seen", "title_hash", "first_seen_at"),
         sa.Index("ix_events_importance", "importance_score"),
         sa.CheckConstraint(
             "importance_score IS NULL OR (importance_score >= 0 AND importance_score <= 1)",
