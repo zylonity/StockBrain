@@ -1,0 +1,15 @@
+# Development overlay:
+#   docker compose -f compose.yaml -f compose.dev.yaml up
+#
+# Publishes PostgreSQL on localhost so tests and psql can reach it from macOS.
+# Never use this overlay on TrueNAS.
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  stockbrain:
+    environment:
+      LOG_FORMAT: console
+      LOG_LEVEL: DEBUG

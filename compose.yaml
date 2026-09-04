@@ -1,0 +1,60 @@
+# StockBrain runtime: exactly two containers.
+#
+# No Redis, no message broker, no search cluster. Background work runs on a
+# PostgreSQL-backed job queue inside the application process.
+#
+# PostgreSQL is deliberately NOT published to the host network. On TrueNAS,
+# replace the named volumes with dataset bind mounts so snapshots cover them.
+
+name: stockbrain
+
+services:
+  stockbrain:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: stockbrain:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override the .env host: inside the compose network the database is
+      # reachable by service name.
+      DATABASE_URL: postgresql+asyncpg://stockbrain:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/stockbrain
+    ports:
+      # Bind to loopback by default. Expose on the LAN (or via Tailscale) only
+      # deliberately; never publish this to the public internet.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - stockbrain_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health/live', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stockbrain
+      POSTGRES_USER: stockbrain
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # Deterministic collation avoids index-ordering surprises across upgrades.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockbrain -d stockbrain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  stockbrain_data:
+  postgres_data:

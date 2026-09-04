@@ -1,0 +1,109 @@
+# =============================================================================
+# Secrets and credentials -- nothing in this section may ever be committed.
+# =============================================================================
+.env
+.env.*
+!.env.example
+secrets/
+credentials
+credentials.*
+.netrc
+.htpasswd
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ecdsa*
+id_ed25519*
+
+# Service-account / token files
+*service-account*.json
+*.token
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.python-version
+
+# Test and coverage output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+report.html
+
+# =============================================================================
+# Node / frontend
+# =============================================================================
+node_modules/
+.vite/
+frontend/dist/
+frontend/*.tsbuildinfo
+.eslintcache
+npm-debug.log*
+yarn-error.log*
+
+# Frontend bundle copied into the backend image at build time.
+backend/static/
+
+# =============================================================================
+# Logs
+# =============================================================================
+*.log
+logs/
+
+# =============================================================================
+# Local data: PostgreSQL volumes, dumps, application working data
+# =============================================================================
+data/
+pgdata/
+postgres_data/
+postgres-data/
+stockbrain_data/
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+
+# =============================================================================
+# Editors and OS
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
+
+# VS Code: share only the settings the team is meant to share.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
