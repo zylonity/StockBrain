@@ -71,6 +71,31 @@ Sources: <https://api-docs.deepseek.com/>,
 7. `deepseek-v4-flash-vision-exp` exists; StockBrain does not use it. Documented
    max output is 384K tokens; concurrency limits are 2,500 for Flash and 500 for
    Pro.
+8. **The response echoes the alias, not a dated model name.** The spec states
+   that `deepseek-v4-flash` "resolves to" `DeepSeek-V4-Flash-0731`. A live call
+   confirmed the `model` field comes back as the alias `deepseek-v4-flash`
+   verbatim. `PricingTable.rates_for` matches on prefix, so a future dated
+   variant would still price correctly, but nothing should assume a dated name
+   appears in the response.
+
+**Live smoke test observed 2026-09-04** (`pytest -m live
+tests/integration/test_deepseek_live.py`, one request, 46 tokens total):
+
+```
+model reported:      deepseek-v4-flash
+finish_reason:       stop
+provider request id: present
+prompt tokens:       41  (cache hit 0 / miss 41)
+completion tokens:   5
+reasoning tokens:    0        <- confirms thinking:{"type":"disabled"} is honoured
+had reasoning text:  False
+latency:             934ms
+estimated cost:      $0.000012
+```
+
+The zero reasoning-token count is the important line: it confirms the explicit
+`thinking` parameter works and the classifier is genuinely running the cheap
+non-thinking path.
 
 Model ids are the defaults of `DEEPSEEK_FLASH_MODEL` / `DEEPSEEK_PRO_MODEL`.
 Pricing is **not** in application logic: rates live in
