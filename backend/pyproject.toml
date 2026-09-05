@@ -103,6 +103,7 @@ ignore = [
 # contracts it observed, which is the entire point of running it.
 "tests/integration/test_phase4_live.py" = ["T201"]
 "tests/integration/test_research_live.py" = ["T201"]
+"tests/integration/test_phase6_live.py" = ["T201"]
 "alembic/versions/*" = ["E501"]
 
 [tool.ruff.lint.isort]

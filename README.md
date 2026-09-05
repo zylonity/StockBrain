@@ -5,8 +5,9 @@ Self-hosted, event-driven equity research and trade-proposal system.
 StockBrain ingests financial news, SEC filings and thematic web search results,
 deduplicates them into canonical events, classifies them with a cheap LLM,
 researches shortlisted candidates with a multi-agent pipeline, applies a
-**deterministic** risk engine, and produces a persistent trade proposal that a
-human must explicitly approve — twice — before any broker order is submitted.
+**deterministic** risk engine, and produces a persistent trade proposal that
+must be explicitly authorized — by a person, or by the system under an
+explicitly permitted automatic policy — before any broker order is submitted.
 
 The authoritative design document is
 [`STOCKBRAIN_TECHNICAL_SPEC.md`](STOCKBRAIN_TECHNICAL_SPEC.md).
@@ -22,8 +23,18 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 * An LLM never receives broker credentials and never has a broker tool.
 * The research layer recommends an action; the deterministic risk engine decides
   the quantity.
-* Every broker order requires a two-stage human confirmation, in the web GUI or
-  Telegram — both drive the same state machine and the same execution path.
+* Authorizing a proposal is **not** executing it. `APPROVED` records that the
+  deterministic risk engine allowed the trade and which authority signed it off;
+  no order-submission path exists yet.
+* Authorization provenance is always recorded: `HUMAN_WEB`, `HUMAN_TELEGRAM` or
+  `SYSTEM_AUTOMATIC`. Manual and automatic deployments converge on the same
+  authorized representation and differ only in who signed.
+* Automatic authorization is a **broker capability**, not a preference. Trading
+  212's API Terms prohibit Algorithmic Trading, so live automatic mode requires
+  a flag recording that the required written consent was actually obtained, and
+  the process refuses to start without it. Demo (paper) is the supported path.
+* Every broker order will require a two-stage human confirmation, in the web GUI
+  or Telegram — both drive the same state machine and the same execution path.
 * Trading 212's order POST is **non-idempotent**. StockBrain never retries a
   broker mutation. An ambiguous submission becomes `EXECUTION_AMBIGUOUS` and is
   resolved by reconciliation, never by resending.
@@ -224,10 +235,42 @@ advice.
 * Approval tokens are opaque and stored only as SHA-256 hashes. Order parameters
   are never accepted from a callback; they are re-read from the database under
   lock.
-* There are still **zero state-changing HTTP routes**, and no broker mutation
-  endpoint is implemented anywhere. The Trading 212 client that exists reads
-  instrument and exchange metadata and has no order method at all. A test
-  enumerates the route table and the OpenAPI schema to keep this true.
+* There are **zero broker order or execution routes**. The three state-changing
+  HTTP routes that exist (approve, reject, cancel a proposal) mutate
+  StockBrain's own state and nothing else. No API path can reach a Trading 212
+  mutation, and no order, amend or cancel method exists anywhere in the process
+  to be reached: the two Trading 212 clients read instrument metadata and
+  account state. Tests enumerate the route table, the OpenAPI schema and every
+  module under `stockbrain/` to keep all three statements true.
+* A mutating request body carries a free-text reason and nothing else. The
+  ticker, side, quantity, price and account are re-read from the proposal row
+  under lock — a client that could name a quantity would be a client that could
+  size a trade.
+
+### Phase 6 risk and proposals
+
+A published thesis becomes a proposal only when the deterministic engine allows
+it against a revalidated listing, fresh broker account state and a fresh
+execution-grade quote. The Proposals page shows the company and listing, the
+side, quantity, notional and currency, the reference price with the bid, ask,
+spread in basis points, quote age and session, the thesis and its confidence,
+and every risk rule with the value observed beside the threshold it was compared
+against. Refusals are recorded in `risk_evaluations` and stay inspectable even
+though they produce no proposal.
+
+Limits live in one versioned object (`RISK_*` in `.env.example`); the version is
+persisted with each proposal, so a decision stays auditable after the limits
+change and a proposal generated under superseded limits is invalidated rather
+than authorized against numbers nobody chose for it. The hard bid/ask ceiling
+(`RISK_MAX_SPREAD_BPS`, default 50 bps) exists because a live overnight IEX book
+showed a $33 spread on a $321 AAPL mid — the age check caught that one, but a
+book that wide during regular hours would be fresh and still ruinous.
+
+`EXECUTION_POLICY=manual` (default) requires a person to authorize each
+proposal. `EXECUTION_POLICY=automatic` lets the system authorize proposals that
+clear every rule, recording `SYSTEM_AUTOMATIC` provenance. Authorization sends
+no broker order under either setting. See
+[`docs/architecture.md`](docs/architecture.md) for the full contract.
 
 ## Licence
 

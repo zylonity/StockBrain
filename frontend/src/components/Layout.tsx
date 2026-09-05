@@ -12,7 +12,7 @@ const NAV = [
   { to: "/instruments", label: "Instruments", enabled: true },
   { to: "/health", label: "System health", enabled: true },
   { to: "/research", label: "Research", enabled: true },
-  { to: "/proposals", label: "Proposals", enabled: false },
+  { to: "/proposals", label: "Proposals", enabled: true },
   { to: "/portfolio", label: "Portfolio", enabled: false },
   { to: "/settings", label: "Settings", enabled: false },
 ] as const;
@@ -49,10 +49,11 @@ export function Layout() {
       </main>
       <footer className="footer">
         <span>
-          Every broker order requires explicit two-stage human approval. No
-          automatic retries on broker mutations.
+          Authorizing a proposal does not send a broker order: there is no
+          order-submission path in this phase. No automatic retries on broker
+          mutations.
         </span>
-        <span className="mono">phase 5 · advisory research</span>
+        <span className="mono">phase 6 · risk and proposals</span>
       </footer>
     </div>
   );

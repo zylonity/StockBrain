@@ -31,10 +31,22 @@ class PortfolioSnapshot(UUIDPrimaryKeyMixin, Base):
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )
     currency: Mapped[str | None] = mapped_column(sa.String(3))
+    """The account's *primary* currency. Trading 212 reports every value in it
+    and does not support multi-currency accounts through the API."""
+
     cash_available: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
+    cash_reserved: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
+    """Cash the broker has already committed to pending orders. Spending it
+    twice is exactly the failure the risk engine's cash rule exists to prevent."""
+
+    cash_in_pies: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
     invested_value: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
     result_value: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
     total_value: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
+    broker_environment: Mapped[str | None] = mapped_column(sa.Text)
+    """Which broker environment produced this snapshot. A demo balance must
+    never size a live order, or the other way round."""
+
     raw: Mapped[JSONDict] = mapped_column(nullable=False, server_default=sa.text("'{}'::jsonb"))
 
     __table_args__ = (sa.Index("ix_portfolio_snapshots_broker_captured", "broker", "captured_at"),)

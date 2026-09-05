@@ -25,6 +25,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql as pg
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from stockbrain.db.base import Base, JSONDict, TimestampMixin, UUIDPrimaryKeyMixin
@@ -32,29 +33,26 @@ from stockbrain.db.models._types import pg_enum
 from stockbrain.enums import (
     ApprovalChannel,
     ApprovalStage,
+    AuthorizationSource,
     Broker,
     ExecutionOutcome,
+    ExecutionPolicy,
     OrderSide,
     OrderType,
     PriceSource,
     ProposalStatus,
+    RiskOutcome,
 )
+from stockbrain.proposals.state_machine import ACTIVE_STATUSES
 
 if TYPE_CHECKING:
     from stockbrain.db.models.research import Thesis
 
-__all__ = ["ApprovalAction", "ExecutionAttempt", "TradeProposal"]
+__all__ = ["ApprovalAction", "ExecutionAttempt", "RiskEvaluation", "TradeProposal"]
 
-#: Statuses in which a proposal still occupies its instrument.
-ACTIVE_PROPOSAL_STATUSES: tuple[ProposalStatus, ...] = (
-    ProposalStatus.DRAFT,
-    ProposalStatus.READY,
-    ProposalStatus.NOTIFIED,
-    ProposalStatus.APPROVAL_PENDING,
-    ProposalStatus.APPROVED,
-    ProposalStatus.EXECUTING,
-    ProposalStatus.EXECUTION_AMBIGUOUS,
-)
+#: Statuses in which a proposal still occupies its instrument.  Defined by the
+#: state machine so the index predicate and the transition table cannot drift.
+ACTIVE_PROPOSAL_STATUSES: tuple[ProposalStatus, ...] = ACTIVE_STATUSES
 
 _ACTIVE_STATUS_SQL = ", ".join(f"'{status.value}'" for status in ACTIVE_PROPOSAL_STATUSES)
 
@@ -104,6 +102,71 @@ class TradeProposal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     risk_snapshot_hash: Mapped[str | None] = mapped_column(sa.String(64))
 
+    # ------------------------------------------------------------------
+    # Phase 6: the exact values the decision was made on
+    # ------------------------------------------------------------------
+    risk_outcome: Mapped[RiskOutcome | None] = mapped_column(pg_enum(RiskOutcome, "risk_outcome"))
+    risk_policy_version: Mapped[str | None] = mapped_column(sa.String(64))
+    """Content hash of every threshold in force when this was evaluated. A
+    proposal generated under superseded limits is invalidated rather than
+    quietly authorized against numbers nobody chose."""
+
+    risk_rules: Mapped[list[JSONDict]] = mapped_column(
+        pg.JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    """One structured entry per rule: id, version, outcome, observed value,
+    threshold and reason. A refusal recorded as free text is one nobody can
+    audit or aggregate."""
+
+    quote_provider: Mapped[str | None] = mapped_column(sa.Text)
+    quote_feed: Mapped[str | None] = mapped_column(sa.Text)
+    quote_bid: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 8))
+    quote_ask: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 8))
+    quote_mid: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 8))
+    quote_spread: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 8))
+    quote_spread_bps: Mapped[Decimal | None] = mapped_column(sa.Numeric(18, 4))
+    quote_spread_status: Mapped[str | None] = mapped_column(sa.Text)
+    market_session: Mapped[str | None] = mapped_column(sa.Text)
+    market_session_source: Mapped[str | None] = mapped_column(sa.Text)
+
+    research_confidence: Mapped[float | None] = mapped_column(sa.Float)
+    research_action: Mapped[str | None] = mapped_column(sa.Text)
+    research_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("research_runs.id", ondelete="SET NULL")
+    )
+
+    execution_policy: Mapped[ExecutionPolicy] = mapped_column(
+        pg_enum(ExecutionPolicy, "execution_policy"),
+        nullable=False,
+        default=ExecutionPolicy.MANUAL,
+        server_default=ExecutionPolicy.MANUAL.value,
+    )
+    """Recorded at creation. Flipping the deployment's policy therefore cannot
+    retroactively authorize proposals generated under the other one."""
+
+    authorization_source: Mapped[AuthorizationSource | None] = mapped_column(
+        pg_enum(AuthorizationSource, "authorization_source")
+    )
+    authorization_policy_snapshot: Mapped[JSONDict] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    """The execution policy and broker automation capability as they stood at
+    authorization, so a later configuration change cannot rewrite the record of
+    what was permitted at the time."""
+
+    dedupe_key: Mapped[str | None] = mapped_column(sa.String(64), unique=True)
+    """One proposal per thesis/listing/policy. At-least-once job delivery means
+    the generator will eventually run twice; this makes the second run a no-op
+    at the database rather than at a hopeful check."""
+
+    invalidated_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    invalidation_reason: Mapped[str | None] = mapped_column(sa.Text)
+    sizing_reasons: Mapped[list[JSONDict]] = mapped_column(
+        pg.JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    max_quantity: Mapped[Decimal | None] = mapped_column(sa.Numeric(28, 10))
+    max_notional: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
+
     status: Mapped[ProposalStatus] = mapped_column(
         pg_enum(ProposalStatus, "proposal_status"),
         nullable=False,
@@ -140,6 +203,7 @@ class TradeProposal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         sa.Index("ix_trade_proposals_status_expires", "status", "expires_at"),
         sa.Index("ix_trade_proposals_created_at", "created_at"),
+        sa.Index("ix_trade_proposals_thesis_id", "thesis_id"),
         sa.Index(
             "uq_trade_proposals_active_instrument",
             "broker",
@@ -148,15 +212,103 @@ class TradeProposal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             unique=True,
             postgresql_where=sa.text(f"status IN ({_ACTIVE_STATUS_SQL})"),
         ),
+        # One live proposal per thesis. `dedupe_key` already makes a redelivered
+        # generation job a no-op, but it is scoped to the risk-policy version;
+        # this covers the case where the policy changed between two attempts on
+        # the same conclusion, which should still produce one proposal.
+        sa.Index(
+            "uq_trade_proposals_active_thesis",
+            "thesis_id",
+            unique=True,
+            postgresql_where=sa.text(f"thesis_id IS NOT NULL AND status IN ({_ACTIVE_STATUS_SQL})"),
+        ),
         sa.CheckConstraint("proposed_quantity > 0", name="quantity_positive"),
         sa.CheckConstraint("reference_price > 0", name="reference_price_positive"),
         sa.CheckConstraint("quote_age_ms >= 0", name="quote_age_non_negative"),
+        # An APPROVED proposal must say what authorized it and when. Without
+        # this, a bug that set the status without the provenance would produce
+        # an authorized trade nobody can attribute -- and attribution is the
+        # entire point of recording an authorization.
+        sa.CheckConstraint(
+            "status <> 'APPROVED' "
+            "OR (authorization_source IS NOT NULL AND approved_at IS NOT NULL "
+            "AND approved_by IS NOT NULL)",
+            name="approved_requires_authorization_provenance",
+        ),
+        # A system authorization is only legal on a proposal that was generated
+        # under the AUTOMATIC policy. This is what makes "changing the policy
+        # cannot retroactively authorize existing proposals" a database
+        # guarantee rather than a service-layer intention.
+        sa.CheckConstraint(
+            "authorization_source <> 'SYSTEM_AUTOMATIC' OR execution_policy = 'AUTOMATIC'",
+            name="system_auth_requires_automatic_policy",
+        ),
+        sa.CheckConstraint(
+            "invalidated_at IS NULL OR status = 'INVALIDATED'",
+            name="invalidated_requires_status",
+        ),
     )
 
     def is_expired(self, now: dt.datetime | None = None) -> bool:
         from stockbrain.db.base import utcnow
 
         return self.expires_at <= (now or utcnow())
+
+
+class RiskEvaluation(UUIDPrimaryKeyMixin, Base):
+    """One run of the deterministic risk engine, allowed or blocked.
+
+    Blocked evaluations are the reason this table exists.  A refusal that leaves
+    no row is a refusal an operator can only find in logs, and "why did nothing
+    get proposed for this thesis?" is exactly the question a risk engine must be
+    able to answer about itself.  A proposal row cannot serve the purpose: its
+    quantity, side and reference price are ``NOT NULL`` and positive, and a
+    blocked evaluation has none of them -- inventing values to satisfy the schema
+    would be recording a trade that was never contemplated.
+
+    Rows are also written at *authorization* time, so the record shows what was
+    true when the trade was signed off, not only when it was drafted.
+    """
+
+    __tablename__ = "risk_evaluations"
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+    stage: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    """GENERATION | AUTHORIZATION | REVALIDATION."""
+
+    thesis_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("theses.id", ondelete="SET NULL")
+    )
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("trade_proposals.id", ondelete="SET NULL")
+    )
+    broker_instrument_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("broker_instruments.id", ondelete="SET NULL")
+    )
+    broker: Mapped[Broker] = mapped_column(pg_enum(Broker, "broker"), nullable=False)
+    broker_ticker: Mapped[str | None] = mapped_column(sa.Text)
+
+    outcome: Mapped[RiskOutcome] = mapped_column(
+        pg_enum(RiskOutcome, "risk_outcome"), nullable=False
+    )
+    policy_version: Mapped[str | None] = mapped_column(sa.String(64))
+    rules: Mapped[list[JSONDict]] = mapped_column(
+        pg.JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    snapshot: Mapped[JSONDict] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    snapshot_hash: Mapped[str | None] = mapped_column(sa.String(64))
+    actor: Mapped[str | None] = mapped_column(sa.Text)
+    detail: Mapped[str | None] = mapped_column(sa.Text)
+
+    __table_args__ = (
+        sa.Index("ix_risk_evaluations_thesis_id", "thesis_id"),
+        sa.Index("ix_risk_evaluations_proposal_id", "proposal_id"),
+        sa.Index("ix_risk_evaluations_created_at", "created_at"),
+    )
 
 
 class ApprovalAction(UUIDPrimaryKeyMixin, Base):

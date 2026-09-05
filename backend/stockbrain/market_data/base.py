@@ -211,18 +211,25 @@ def quote_blockers(
     capability: ProviderCapability | None,
     *,
     max_age_seconds: float,
+    max_spread_bps: Decimal | None = None,
 ) -> list[str]:
     """Every reason this quote may not be used to size a real order.
 
-    An empty list is the *only* thing that permits sizing.  Phase 4 does not
-    size anything; this function exists so that when Phase 6 does, the decision
-    is one already-tested predicate rather than a condition rewritten at the
-    call site.
+    An empty list is the *only* thing that permits sizing.  This is the single
+    predicate every sizing path consults, so a new condition is added *here*
+    rather than rewritten at each call site.
 
     Trading 212's own price data can never clear this bar: its API Terms do not
     guarantee it is real-time, so ``PriceSource.BROKER_T212`` is not in
     ``EXECUTION_GRADE_PRICE_SOURCES`` and never becomes execution pricing by
     being the only number available.
+
+    ``max_spread_bps`` adds the Phase 6 relative-width ceiling.  It is optional
+    only so that inspection endpoints can ask "is this quote fresh and
+    execution-grade?" without also asserting a sizing policy; every path that
+    actually sizes something passes it.  Age and width are independent: the
+    live overnight AAPL book was both stale *and* 1024 bps wide, and a book that
+    wide during regular hours would be fresh and still unusable.
     """
     blockers: list[str] = []
     if capability is None:
@@ -244,6 +251,15 @@ def quote_blockers(
         blockers.append("quote carries no positive price")
     if quote.age_ms > max_age_seconds * 1000:
         blockers.append(f"quote is {quote.age_ms}ms old, older than the {max_age_seconds:g}s limit")
+    if max_spread_bps is not None:
+        # Imported here rather than at module scope: `risk` depends on
+        # `market_data`, and the DTO layer must not acquire a dependency on the
+        # policy layer that reads it.
+        from stockbrain.risk.spread import assess_spread
+
+        assessment = assess_spread(quote.bid, quote.ask, max_spread_bps=max_spread_bps)
+        if not assessment.is_ok:
+            blockers.append(assessment.detail)
     return blockers
 
 

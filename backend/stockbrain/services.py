@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 
 import sqlalchemy as sa
 
+from stockbrain.broker.account_state import AccountStateService
 from stockbrain.broker.instrument_sync import InstrumentSyncService
+from stockbrain.broker.trading212_account import Trading212AccountClient
 from stockbrain.broker.trading212_metadata import Trading212MetadataClient
 from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
@@ -61,6 +63,8 @@ from stockbrain.market_data.alpaca import AlpacaMarketDataClient
 from stockbrain.market_data.base import ProviderCapability
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
+from stockbrain.proposals.service import ProposalService
+from stockbrain.risk.config import RiskConfig, risk_config_from_settings
 
 __all__ = ["DISCOVERY_PAUSED_KEY", "ServiceContainer"]
 
@@ -102,7 +106,11 @@ class ServiceContainer:
     budget: BudgetGuard | None = field(default=None, init=False)
 
     t212_metadata: Trading212MetadataClient | None = field(default=None, init=False)
+    t212_account: Trading212AccountClient | None = field(default=None, init=False)
+    account_state: AccountStateService = field(init=False)
     instrument_sync: InstrumentSyncService | None = field(default=None, init=False)
+    proposals: ProposalService | None = field(default=None, init=False)
+    risk_config: RiskConfig = field(init=False)
     resolution: ResolutionService | None = field(default=None, init=False)
     market_data: AlpacaMarketDataClient | None = field(default=None, init=False)
     research: ResearchService | None = field(default=None, init=False)
@@ -114,7 +122,29 @@ class ServiceContainer:
     def __post_init__(self) -> None:
         self.queue = JobQueue()
         self.registry = JobRegistry()
+        self.risk_config = risk_config_from_settings(self.settings)
         self._build_providers()
+        if self.settings.proposals_enabled:
+            self.proposals = ProposalService(
+                self.database,
+                self.settings,
+                risk_config=self.risk_config,
+                account_state=self.account_state,
+                market_data=self.market_data,
+                broker=Broker.TRADING212,
+            )
+            log.info(
+                "proposal_service_ready",
+                execution_policy=self.settings.execution_policy.value,
+                risk_policy_version=self.risk_config.version,
+                # Named without "authorization": the log scrubber redacts any
+                # key containing it (to catch `Authorization:` headers), which
+                # would turn this boolean into ***REDACTED*** and hide the
+                # posture the line exists to report.
+                automatic_mode_permitted=self.settings.automatic_authorization_permitted,
+                automation_blockers=self.settings.automation_blockers,
+                broker_order_transmission="not implemented until phase 8",
+            )
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
@@ -146,11 +176,25 @@ class ServiceContainer:
         if alpaca_configured and settings.alpaca_market_data_enabled:
             self.market_data = AlpacaMarketDataClient(settings)
 
-        # Read-only metadata access. This client has no order method at all --
-        # broker mutations arrive in Phase 8, behind the four-gate live check.
+        # Read-only metadata and account access. Neither client has an order
+        # method at all -- broker mutations arrive in Phase 8, behind the
+        # four-gate live check.
         if settings.t212_metadata_enabled and settings.broker_credentials_present:
             self.t212_metadata = Trading212MetadataClient(settings)
             self.instrument_sync = InstrumentSyncService(self.database, self.t212_metadata)
+        if settings.broker_credentials_present:
+            self.t212_account = Trading212AccountClient(settings)
+
+        # Constructed unconditionally: without credentials it reports "never
+        # synced", which is the honest answer the risk engine needs in order to
+        # fail closed, rather than a missing attribute at the point a proposal
+        # needs a balance.
+        self.account_state = AccountStateService(
+            self.database,
+            self.t212_account,
+            broker=Broker.TRADING212,
+            broker_environment=settings.t212_env.value,
+        )
 
         # Resolution reads metadata already in the database, so it exists even
         # with no broker credentials; it then honestly reports NOT_FOUND.
@@ -251,6 +295,8 @@ class ServiceContainer:
             classifier_available=self.classification is not None,
             instrument_sync_available=self.instrument_sync is not None,
             research_available=self.research is not None,
+            proposals_available=self.proposals is not None,
+            account_sync_available=self.t212_account is not None,
         )
 
         async with self.database.transaction() as session:
@@ -300,6 +346,7 @@ class ServiceContainer:
             self.sec,
             self.deepseek,
             self.t212_metadata,
+            self.t212_account,
             self.market_data,
             self.research_transport,
             self.fred,
@@ -380,6 +427,30 @@ class ServiceContainer:
                     interval_seconds=900.0,
                     run=self._refresh_market_data_capability,
                     jitter_ratio=0.1,
+                )
+            )
+        if self.t212_account is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="broker_account_refresh",
+                    interval_seconds=float(self.settings.t212_account_refresh_interval_seconds),
+                    run=self._enqueue_account_refresh,
+                    initial_delay_seconds=10.0,
+                    jitter_ratio=0.1,
+                )
+            )
+        if self.proposals is not None:
+            # Spec section 22's "stale proposal sweep: every minute". The sweep
+            # expires, invalidates and re-prices; the backlog enqueue is what
+            # turns a published thesis into a proposal job. Both only ever
+            # *enqueue* or mutate StockBrain state -- neither reaches a broker.
+            scheduler.add(
+                ScheduledTask(
+                    name="proposal_sweep",
+                    interval_seconds=60.0,
+                    run=self._proposal_sweep,
+                    initial_delay_seconds=45.0,
+                    jitter_ratio=0.05,
                 )
             )
         scheduler.add(
@@ -495,6 +566,31 @@ class ServiceContainer:
             return
         await self._enqueue_instrument_refresh()
         log.info("instrument_refresh_enqueued_at_startup", reason="stale or never synced")
+
+    async def _enqueue_account_refresh(self) -> None:
+        """Queue a read-only broker cash and position refresh.
+
+        The scheduler only enqueues; the handler does the two GETs. One
+        outstanding refresh at a time, because a backlog of identical account
+        reads would only ever wait on the same 1-req/5s bucket.
+        """
+        if self.t212_account is None:
+            return
+        async with self.database.transaction() as session:
+            await self.queue.enqueue(
+                session,
+                JobType.BROKER_RECONCILE,
+                payload={"broker": Broker.TRADING212.value},
+                dedupe_key=f"account:{Broker.TRADING212.value}",
+                priority=20,
+            )
+
+    async def _proposal_sweep(self) -> None:
+        """Expire, invalidate and re-price proposals, then queue new ones."""
+        if self.proposals is None:
+            return
+        await self.proposals.sweep()
+        await self.proposals.enqueue_pending()
 
     async def _enqueue_pending_resolutions(self) -> None:
         """Sweep impacts whose resolution never ran.

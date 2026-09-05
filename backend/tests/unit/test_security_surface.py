@@ -1,13 +1,17 @@
-"""Security properties of the Phase 4 surface.
+"""Security properties of the HTTP and LLM surface.
 
-Three invariants, each stated as a test so a later refactor has to argue with
-one rather than quietly step past it:
+Phase 6 deliberately breaks the old "zero state-changing routes" property: the
+approve, reject and cancel endpoints mutate StockBrain's own state. What must
+*not* change is the invariant that actually protects money, so the assertions
+are narrowed rather than deleted:
 
-1. **There are still zero state-changing HTTP routes**, and in particular no
-   route that could place, amend or cancal a broker order.
+1. **Zero broker order/execution routes.** Every state-changing route mutates
+   StockBrain state only; no API path reaches a Trading 212 mutation, and no
+   order/cancel/modify method exists anywhere to be reached.
 2. **No LLM path acquires broker capability.** The provider interface is
-   text-in / text-out, and the classifier hint reaches instrument resolution as
-   data, not as an identity.
+   text-in / text-out, the classifier hint reaches instrument resolution as
+   data rather than as an identity, and no model-supplied number can enter
+   sizing or lift a deterministic block.
 3. **Secrets stay redacted** in logs, in exception messages and in API output.
 """
 
@@ -20,6 +24,7 @@ from pathlib import Path
 from fastapi.routing import APIRoute
 from starlette.routing import BaseRoute
 
+from stockbrain.api.routes import instruments as instrument_routes
 from stockbrain.broker import instrument_sync, trading212_metadata
 from stockbrain.config import Settings
 from stockbrain.instruments import resolver
@@ -29,10 +34,30 @@ from stockbrain.logging import REDACTED, SecretScrubber
 from stockbrain.main import create_app
 from stockbrain.market_data import alpaca
 
-#: Anything that would mutate broker state. A route matching one of these
-#: verbs, or a path containing one of these words, must not exist yet.
 _MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-_ORDER_WORDS = ("order", "execute", "submit", "cancel", "approve", "confirm")
+
+#: Words that would name a *broker* action rather than an internal one. An
+#: approval endpoint is legitimate in this phase; an order endpoint is not, and
+#: will not be until Phase 8 deliberately adds one behind the four live gates.
+_BROKER_ACTION_WORDS = ("order", "execute", "submit", "broker-order", "trade212", "t212")
+
+#: The complete set of state-changing routes this phase is allowed to have.
+#: New entries here are a decision, not an accident.
+_EXPECTED_MUTATIONS = {
+    "POST /api/v1/proposals/{proposal_id}/approve",
+    "POST /api/v1/proposals/{proposal_id}/reject",
+    "POST /api/v1/proposals/{proposal_id}/cancel",
+}
+
+#: Every Trading 212 path that would change broker state.
+_T212_MUTATION_PATHS = (
+    "/equity/orders",
+    "/equity/orders/market",
+    "/equity/orders/limit",
+    "/equity/orders/stop",
+    "/equity/orders/stop_limit",
+    "/equity/pies",
+)
 
 
 def _settings() -> Settings:
@@ -67,47 +92,106 @@ def _api_routes() -> list[APIRoute]:
     return collected
 
 
-def test_every_documented_api_operation_is_a_read() -> None:
-    """Cross-check against the OpenAPI schema.
+def test_the_only_state_changing_routes_are_the_expected_internal_ones() -> None:
+    """Cross-checked against the OpenAPI schema.
 
-    The route walk and the schema are independent views of the same surface; a
-    mutation would have to hide from both.
+    The route walk and the schema are independent views of the same surface, so
+    a fourth mutating route would have to hide from both.
     """
     schema = create_app(_settings()).openapi()
-    offenders = [
+    documented = {
         f"{method.upper()} {path}"
         for path, operations in schema["paths"].items()
         for method in operations
         if method.upper() in _MUTATION_METHODS
-    ]
-    assert offenders == []
+    }
+    assert documented == _EXPECTED_MUTATIONS
 
-
-def test_there_are_still_zero_state_changing_api_routes() -> None:
-    """Phase 4 adds inspection, not action.
-
-    The handoff records this as an intentional property to re-verify whenever
-    routes are added; the first state-changing route in this system will be an
-    approval endpoint, behind a two-stage human confirmation.
-    """
-    offenders = [
-        f"{sorted(route.methods or set())} {route.path}"
+    walked = {
+        f"{method} {route.path}"
         for route in _api_routes()
-        if (route.methods or set()) & _MUTATION_METHODS
-    ]
-    assert offenders == []
+        for method in (route.methods or set())
+        if method in _MUTATION_METHODS
+    }
+    assert walked == _EXPECTED_MUTATIONS
 
 
-def test_no_route_path_mentions_an_order_or_an_execution() -> None:
+def test_no_route_path_names_a_broker_order_or_execution() -> None:
+    """Approving is an internal act; ordering is not, and has no route."""
     offenders = [
         route.path
         for route in _api_routes()
-        if any(word in route.path.lower() for word in _ORDER_WORDS)
+        if any(word in route.path.lower() for word in _BROKER_ACTION_WORDS)
     ]
     assert offenders == []
 
 
-def test_the_new_phase_four_routes_are_all_reads() -> None:
+def test_no_api_path_can_reach_a_trading212_mutation() -> None:
+    """Structural: the route modules must not name a broker mutation path.
+
+    An approval endpoint is only safe while approving cannot reach an order, so
+    this asserts the absence of the path string rather than trusting that no
+    call site happens to use it today.
+    """
+    import stockbrain.api.routes.proposals as proposal_routes
+
+    for module in (proposal_routes, instrument_routes):
+        source = inspect.getsource(module)
+        for path in _T212_MUTATION_PATHS:
+            assert path not in source
+        assert "place_order" not in source
+        assert "place_market_order" not in source
+
+
+def test_no_trading212_order_cancel_or_modify_method_exists_anywhere() -> None:
+    """The capability audit: a method that does not exist cannot be called.
+
+    Every module under ``stockbrain`` is scanned, not only the broker package,
+    because the guarantee is about the process rather than about one file.
+    """
+    root = Path(inspect.getfile(create_app)).resolve().parent
+    forbidden = (
+        "place_order",
+        "place_market_order",
+        "place_limit_order",
+        "cancel_order",
+        "modify_order",
+        "amend_order",
+        '"/equity/orders',
+        "'/equity/orders",
+    )
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{path.relative_to(root)}: {needle}")
+    assert offenders == []
+
+
+def test_the_broker_clients_expose_no_mutation_method() -> None:
+    """Both Trading 212 clients are read-only by their public surface."""
+    from stockbrain.broker.trading212_account import Trading212AccountClient
+
+    for client in (trading212_metadata.Trading212MetadataClient, Trading212AccountClient):
+        methods = {name for name, _ in inspect.getmembers(client) if not name.startswith("_")}
+        assert not methods & {
+            "place_order",
+            "place_market_order",
+            "cancel_order",
+            "modify_order",
+            "post",
+            "delete",
+        }
+        assert {name for name in methods if name.startswith("fetch_")} <= {
+            "fetch_instruments",
+            "fetch_exchanges",
+            "fetch_account_summary",
+            "fetch_positions",
+        }
+
+
+def test_the_phase_four_inspection_routes_are_still_reads() -> None:
     paths = {route.path for route in _api_routes()}
     for path in (
         "/api/v1/instruments",
@@ -118,7 +202,23 @@ def test_the_new_phase_four_routes_are_all_reads() -> None:
     ):
         assert path in paths, f"{path} should be exposed for inspection"
     for route in _api_routes():
-        assert (route.methods or set()) <= {"GET", "HEAD", "OPTIONS"}
+        if route.path.startswith("/api/v1/instruments") or route.path in {
+            "/api/v1/aliases",
+            "/api/v1/market-data/health",
+        }:
+            assert (route.methods or set()) <= {"GET", "HEAD", "OPTIONS"}
+
+
+def test_the_new_proposal_routes_are_exposed_for_inspection() -> None:
+    paths = {route.path for route in _api_routes()}
+    for path in (
+        "/api/v1/proposals",
+        "/api/v1/proposals/policy",
+        "/api/v1/proposals/{proposal_id}",
+        "/api/v1/proposals/{proposal_id}/risk",
+        "/api/v1/risk/evaluations",
+    ):
+        assert path in paths, f"{path} should be exposed"
 
 
 # ---------------------------------------------------------------------------

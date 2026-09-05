@@ -25,16 +25,20 @@ Firecrawl ──────┘                              │
                                                │
                                         trade proposal
                                           ╱         ╲
-                                     Web GUI     Telegram
+                            MANUAL (web/Telegram)   AUTOMATIC (system)
                                           ╲         ╱
-                                     two-stage human approval
+                                   authorization + provenance
                                                │
                                       fresh revalidation
                                                │
-                                  ONE non-retried broker POST
+                                  ONE non-retried broker POST   ← phase 8
                                                │
                                   reconciliation + audit log
 ```
+
+Everything above the phase 8 line exists today. Authorization is *not*
+execution: an `APPROVED` proposal records that deterministic risk allowed the
+trade and which authority signed it off. No order-submission path exists yet.
 
 ## Module map
 
@@ -62,8 +66,9 @@ stockbrain/
   intelligence/      classifier, semantic dedupe, prompts, classification service
   instruments/       resolution ladder, curated aliases, resolve service
   market_data/       provider protocol, Alpaca adapter, sessions, price reaction
-  broker/            read-only T212 metadata + instrument sync (phase 4)
-  risk/              (phase 6)
+  broker/            read-only T212 metadata, account state, automation policy
+  risk/              deterministic engine, rules, sizing, spread, versioned config
+  proposals/         state machine, generation, authorization, expiry, quotes
   telegram/          (phase 7)
   jobs/              (phase 2+)
 ```
@@ -99,6 +104,12 @@ schema therefore enforces:
 | `uq_broker_exchanges_broker_provider_exchange_id` | Nor an exchange. |
 | `uq_company_aliases_authoritative_scope` — partial unique over `(alias, type, exchange, currency) WHERE is_authoritative` | Two authoritative aliases cannot silently contradict each other. |
 | `uq_companies_isin` | A company auto-created from broker metadata is created once, whatever the concurrency. |
+| `uq_trade_proposals_dedupe_key` | A redelivered generation job cannot create a second proposal. |
+| `uq_trade_proposals_active_thesis` — partial unique over non-terminal statuses | One live proposal per published thesis. |
+| `ck_trade_proposals_approved_requires_authorization_provenance` | An `APPROVED` proposal always says what authorized it, when, and as whom. |
+| `ck_trade_proposals_system_auth_requires_automatic_policy` | A `SYSTEM_AUTOMATIC` authorization is only legal on a proposal generated under the AUTOMATIC policy — so changing the policy cannot retroactively authorize existing work. |
+| `ck_trade_proposals_invalidated_requires_status` | An invalidation timestamp and the `INVALIDATED` status cannot disagree. |
+| `pg_advisory_xact_lock(broker, account)` | Exposure accounting is serialised across tasks, processes and restarts — which an in-memory lock is not. |
 
 `sent_to_broker` is set in the transaction *before* the HTTP request, not after
 the response. That ordering is what makes the index meaningful: it records
@@ -449,6 +460,269 @@ Alpaca remains the market-data source; historical research snapshots never
 clear execution-grade quote checks. FRED uses only DFF/DGS10 with a prior-day
 Chicago vintage. Missing providers and classified errors appear as degradation.
 No optional upstream Yahoo/social/prediction-market network path is enabled.
-Phase 6 must add deterministic sizing, portfolio checks and the hard bid/ask
-spread ceiling alongside quote age. Research confidence is a ranking feature,
-not a calibrated probability or authoritative risk score.
+Research confidence is a ranking feature, not a calibrated probability or
+authoritative risk score; Phase 6 below is what consumes it, and it may only
+ever shrink a size inside limits the model never sees.
+
+## Phase 6 deterministic risk and proposals
+
+### Where the boundary actually is
+
+`RiskEngine.evaluate` is a pure function from `RiskInputs` to `RiskDecision`:
+no database, no HTTP, no clock of its own. Everything it reads is in the input
+object, and the research layer contributes exactly two scalars to it — an
+`action` and a `confidence`. There is no field on `RiskInputs` for a thesis, a
+rationale, a report or a quantity, so "an LLM cannot authorise a trade" is a
+property of a type rather than of a code path somebody remembered to call.
+
+Evaluation runs in a fixed order:
+
+1. **Gates** — identity, instrument type, account availability and freshness,
+   quote availability, price-source provenance, quote age, two-sidedness,
+   spread ceiling, market session, currency alignment, current position,
+   duplicate/conflicting proposals, active-proposal count, confidence floor.
+2. **Caps** — per-trade notional, per-trade percentage, position concentration,
+   aggregate exposure, exposure reserved by other live proposals, cash reserve,
+   broker `maxOpenQuantity`. The engine takes the minimum; a cap with no
+   headroom becomes a block.
+3. **Reductions** — research confidence, and (only under an explicit policy) a
+   wide spread. Multiplicative, always in `(0, 1]`, never upward.
+4. **Sizing** — side, quantity, reference price.
+
+A `BLOCK` is absolute: the final outcome is computed from the rule list, and no
+later stage can remove a rule from it. A blocked decision carries **no size at
+all** — not a size that is ignored — so a future refactor cannot start reading
+one. Confidence may only ever shrink a size inside the hard caps.
+
+Every rule records `rule_id`, `rule_version`, outcome, the value observed, the
+threshold it was compared against and a sentence, and all of that is persisted
+on the proposal. A rule that could not run is recorded `WARN`, not `PASS`: a
+rule that did not run has not passed.
+
+### Why the spread ceiling is a hard rule
+
+A live Alpaca IEX quote for AAPL at 03:40 UTC was the 16:00 ET closing print
+with a **$33 spread on a $321.80 mid** — 1,024 bps, a 10% round trip. The age
+check caught that particular quote. A book that wide *during regular hours*
+would be fresh and still ruinous, so width is checked independently of age.
+
+Every abnormal book shape gets its own name — `MISSING`, `NON_POSITIVE`,
+`ONE_SIDED`, `CROSSED`, `LOCKED`, `EXCESSIVE` — because the causes differ and an
+operator reading a refusal needs to know which one happened. Only `EXCESSIVE` (a
+well-formed book that is merely too wide) is eligible for the optional `reduce`
+policy; the others have no usable mid and block under every policy. A locked
+market is refused rather than treated as free liquidity: a zero-width two-sided
+equity quote is an artefact of a halt or a feed update.
+
+The threshold comparison is exact. `spread / mid` is frequently non-terminating,
+so comparing a rounded ratio would make the boundary depend on the rounding;
+the test is `spread * 10000 <= ceiling_bps * mid`, which is pure multiplication.
+The boundary is inclusive.
+
+### The sizing contract
+
+| Input | Output |
+|---|---|
+| research action, bounded confidence factor, current position, fresh quote, account state, risk limits, active-proposal reservations, broker constraints | side, quantity, target notional, reference price, max quantity, max notional, sizing reasons |
+
+Three choices carry their reasons:
+
+* **The reference price is the marketable side, not the mid.** A market buy
+  lifts the ask; sizing it against the mid over-commits by half the spread every
+  time.
+* **Quantities round *down*, to whole shares by default.** Trading 212 supports
+  fractional shares but documents no minimum quantity and no step size — Phase 4
+  measured `minTradeQuantity` populated on 0 of 17,452 live instruments — so
+  nothing here invents one. Rounding down can never breach a cap. Fractional
+  sizing exists behind a flag.
+* **A size that rounds to nothing is not a trade.** It is reported
+  non-executable with the reason rather than as a zero-quantity order.
+
+Action semantics: `BUY` opens or increases a long; `SELL` closes the whole
+*available* quantity (shares held inside a pie are owned but not individually
+tradable); `REDUCE` takes a configured fraction as a deterministic partial exit
+and refuses to become a full exit on a single share; `HOLD` and `NO_ACTION`
+produce no executable proposal at all. Short selling is not enabled, so a sell
+without a position blocks.
+
+Exposure caps deliberately do **not** apply to `SELL`/`REDUCE`. Limits bound
+risk taken, not risk removed, and a cap that can stop a position from being
+closed is a hazard rather than a control.
+
+### Currency
+
+Trading 212 documents that orders execute only in the primary account currency
+and that multi-currency accounts are not supported through the API, and it
+reports every account and position value in that currency. StockBrain has no
+verified FX source, so **v1 is same-currency only**, enforced by the
+`currency_alignment` rule: an instrument, quote or account currency that
+disagrees blocks, and the refusal says that no FX rate source is configured. A
+size computed from an invented rate is a wrong size.
+
+### ExecutionPolicy and authorization provenance
+
+Two permissions on deliberately different axes:
+
+| Axis | Setting | Gates |
+|---|---|---|
+| Authorization | `EXECUTION_POLICY` = `manual` \| `automatic` | whether a proposal may be authorized without a human |
+| Transmission | `EXECUTION_MODE` + the four T212 live gates | whether an order may ever reach the broker (phase 8) |
+
+Conflating them would let one be granted by satisfying the other, so the Phase 4
+live-execution truth table is untouched and `T212_AUTOMATED_TRADING_CONSENT_CONFIRMED`
+is deliberately *not* one of its gates.
+
+`AuthorizationSource` is `HUMAN_WEB | HUMAN_TELEGRAM | SYSTEM_AUTOMATIC`. Human
+approval is one source among several rather than the definition of
+authorization, so manual and automatic deployments converge on the same
+`APPROVED` representation and differ only in recorded provenance. Every
+authorization persists the source, the actor, the timestamp and a snapshot of
+the policy and broker capability that permitted it — so a later configuration
+change cannot rewrite the record of what was relied on.
+
+`execution_policy` is recorded on the proposal **at creation**. A
+`SYSTEM_AUTOMATIC` authorization is only legal on a proposal generated under the
+AUTOMATIC policy, enforced by a check constraint, so flipping the deployment's
+policy can never retroactively authorize existing work.
+
+### The automatic-mode broker capability gate
+
+Automation is a *broker* capability, not a StockBrain preference, so each broker
+advertises its own answer in `broker/automation.py`. A broker with no declared
+policy is treated as forbidding it.
+
+Trading 212's answer follows its API Terms (verified 2026-09-04): clause 4.2(a)
+expressly prohibits *Algorithmic Trading* — a computer determining order
+parameters with limited or no human intervention — and clauses 6.6/6.7 require
+prior written consent for an automated customised interface. So:
+
+* **Demo (paper)** — permitted with credentials, and the supported path for
+  exercising automatic authorization end to end.
+* **Live** — requires `T212_AUTOMATED_TRADING_CONSENT_CONFIRMED=true`, and the
+  process *refuses to start* on `EXECUTION_POLICY=automatic` with
+  `T212_ENV=live` without it. A deployment that asked for automatic and quietly
+  got manual is a deployment nobody is watching.
+
+The flag records a fact about the operator's relationship with their broker. It
+is not a bypass, and there is deliberately no general "ignore broker rules"
+switch anywhere in the codebase.
+
+Automatic mode fails closed: it never lifts a rule because confidence is high,
+never uses a TradingAgents quantity, never authorizes a stale or ambiguous
+proposal, and sends no order.
+
+### Proposal state machine
+
+```
+DRAFT ─→ READY ─→ NOTIFIED ─→ APPROVAL_PENDING ─→ APPROVED ─→ EXECUTING ─→ EXECUTED
+           └────────────┴──────────────┬─────────────┘              ├→ FAILED
+                                       │                            └→ EXECUTION_AMBIGUOUS
+        REJECTED · EXPIRED · CANCELLED · INVALIDATED  (all terminal)
+```
+
+`READY`, `NOTIFIED` and `APPROVAL_PENDING` all reach `APPROVED` directly:
+authorization is one act with one full revalidation, whoever performs it.
+`APPROVAL_PENDING` remains for the two-stage confirmation that will guard
+*execution* in phase 8, which is a different question from "is this authorized".
+`APPROVED` is not itself authorizable, which is what makes the double-click case
+a refusal rather than a second record.
+
+`INVALIDATED` is new and distinct from the other terminals: the proposal was
+still within its TTL and nobody acted on it, but the listing, the position, the
+account or the market moved out from under the numbers it carries.
+
+### Authorization-time revalidation
+
+Nothing is trusted from generation time. Approving re-reads the listing under
+lock, re-reads broker account state, fetches a **fresh** execution-grade quote,
+recomputes the exposure other live proposals have reserved, and re-runs every
+deterministic rule plus four that only exist because a proposal exists:
+`proposal_ttl`, `reference_price_drift`, `risk_policy_version` and
+`authorization_envelope`.
+
+The quantity the operator saw is **not** silently re-sized. If the fresh
+envelope no longer permits it, the proposal is invalidated and a new analysis is
+required — re-pricing under someone's finger is how a person approves a trade
+they did not read. A refusal is *committed and then raised*: raising from inside
+the transaction would roll back the invalidation and the evaluation row, and a
+refusal nobody can read afterwards is not a durable refusal.
+
+### Why blocked evaluations get their own table
+
+`risk_evaluations` records every run of the engine, allowed or blocked, at
+generation and again at authorization. A proposal row cannot serve the purpose:
+its quantity, side and reference price are `NOT NULL` and positive, and a
+blocked evaluation has none of them — inventing values to satisfy the schema
+would be recording a trade that was never contemplated. "Why was nothing
+proposed for this thesis?" is a first-class query, for the same reason Phase 4
+exposed its `AMBIGUOUS` resolutions.
+
+### Exposure reservation and concurrency
+
+Every non-terminal proposal reserves its notional; only exposure-*increasing*
+sides count, because a pending sell frees cash rather than committing it.
+Reserving only from `APPROVED` would let a queue of unapproved proposals each be
+sized against the same cash, so approving them in sequence would breach every
+cap that each individually respected.
+
+Concurrency is handled in PostgreSQL, never in memory:
+
+* a **transaction-scoped advisory lock** on `(broker, account)` serialises every
+  exposure calculation — two proposals generated a millisecond apart cannot each
+  believe the whole cash buffer is theirs;
+* `SELECT ... FOR UPDATE` plus a check of the optimistic `version` column
+  serialises authorization, so two browser tabs, or an approve racing a reject,
+  produce exactly one winner and one `409`;
+* `uq_trade_proposals_active_instrument` and `uq_trade_proposals_active_thesis`
+  make "one live proposal per listing" and "per thesis" database guarantees;
+* `trade_proposals.dedupe_key` makes a redelivered generation job a no-op at the
+  database rather than at a hopeful check.
+
+The expiry sweep deliberately skips `APPROVED`: an authorized proposal belongs
+to the execution phase, and a background sweep quietly retracting an
+authorization would make "approve then expire" a race whose winner depends on
+scheduler timing. Authorization itself still refuses an expired proposal under
+lock, which is the property that matters.
+
+### Expiry and invalidation
+
+TTL is configurable (`RISK_PROPOSAL_TTL_MINUTES`, default 30) and an expired
+proposal can never be authorized. The once-a-minute sweep also invalidates on
+durable precondition failures — the listing retired or changed identity, the
+risk policy version changed, a newer thesis superseded this one, or the position
+backing a reduction fell below the proposed quantity — and re-prices a bounded
+batch of live proposals to catch a market that widened or drifted. A *missing*
+quote does not invalidate: providers go down, and retiring every open proposal
+because one request failed would make an outage destructive rather than merely
+degrading.
+
+### Broker account state
+
+`GET /equity/account/summary` (1 req/5s) and `GET /equity/positions` (1 req/1s),
+read-only, mirrored into `portfolio_snapshots` and `positions`. Neither client
+in this process has an order, amend or cancel method, and a test scans every
+module to keep it that way.
+
+`AccountStateService.load` **fails closed**: no snapshot, a snapshot older than
+`RISK_MAX_ACCOUNT_STATE_AGE_SECONDS`, one from the other broker environment, or
+one missing a currency or total value all return `None` with a reason, and the
+`account_state_available` rule blocks. It never falls back to the last known
+balance. `quantityAvailableForTrading` is kept separate from `quantity` all the
+way to the engine, because shares inside a pie are owned but not individually
+tradable.
+
+### The Phase 8 execution boundary
+
+Phase 6 stops at authorization. What phase 8 must preserve when it adds
+transmission:
+
+* `uq_execution_attempts_sent_once`, and setting `sent_to_broker` *before* the
+  HTTP request;
+* re-running the full authorization-time revalidation immediately before the
+  POST, against a snapshot no older than the freshness limits;
+* the `broker_environment` recorded on the proposal, so a demo proposal cannot
+  execute against live;
+* `EXECUTION_AMBIGUOUS` and no blind retry;
+* `execution_policy` and `authorization_source` as the record of *who* permitted
+  the trade, and the four live-execution gates as the separate record of whether
+  transmission is permitted at all.

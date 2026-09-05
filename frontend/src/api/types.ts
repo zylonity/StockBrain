@@ -519,3 +519,165 @@ export interface ResearchRun {
     error_class: string | null; thinking_enabled: boolean;
   }[];
 }
+
+/* --- Proposals and deterministic risk (phase 6) --------------------------
+   Authorization is not execution: an APPROVED proposal means the risk engine
+   allowed the trade and a recorded authority signed it off. No broker order
+   is sent in this phase. */
+
+export type ProposalStatus =
+  | "DRAFT" | "READY" | "NOTIFIED" | "APPROVAL_PENDING" | "APPROVED"
+  | "REJECTED" | "EXPIRED" | "EXECUTING" | "EXECUTED"
+  | "EXECUTION_AMBIGUOUS" | "FAILED" | "CANCELLED" | "INVALIDATED";
+
+export type RiskOutcome = "ALLOW" | "REDUCE_SIZE" | "BLOCK";
+export type RuleOutcome = "PASS" | "WARN" | "REDUCE" | "BLOCK";
+export type ExecutionPolicy = "MANUAL" | "AUTOMATIC";
+export type AuthorizationSource = "HUMAN_WEB" | "HUMAN_TELEGRAM" | "SYSTEM_AUTOMATIC";
+
+export interface RiskRule {
+  rule_id: string;
+  rule_version: number;
+  outcome: RuleOutcome;
+  reason: string;
+  observed: string | null;
+  threshold: string | null;
+  max_notional: string | null;
+  size_factor: string | null;
+}
+
+export interface Proposal {
+  id: string;
+  status: ProposalStatus;
+  status_reason: string | null;
+
+  thesis_id: string | null;
+  event_id: string | null;
+  company_id: string | null;
+  company_name: string | null;
+  research_run_id: string | null;
+
+  broker: string;
+  broker_ticker: string;
+  market_symbol: string | null;
+  instrument_name: string | null;
+  exchange: string | null;
+  instrument_currency: string | null;
+  isin: string | null;
+  account_id: string;
+  broker_environment: string;
+
+  side: string;
+  order_type: string;
+  proposed_quantity: string;
+  max_quantity: string | null;
+  estimated_notional: string;
+  max_notional: string | null;
+  reference_price: string;
+  reference_currency: string;
+  account_currency: string;
+
+  price_source: string;
+  quote_provider: string | null;
+  quote_feed: string | null;
+  quote_bid: string | null;
+  quote_ask: string | null;
+  quote_mid: string | null;
+  quote_spread: string | null;
+  quote_spread_bps: string | null;
+  quote_spread_status: string | null;
+  quote_timestamp: string;
+  quote_age_ms: number;
+  market_session: string | null;
+  market_session_source: string | null;
+
+  research_action: string | null;
+  research_confidence: number | null;
+  thesis_summary: string | null;
+  time_horizon: string | null;
+
+  risk_outcome: RiskOutcome | null;
+  risk_policy_version: string | null;
+  risk_rules: RiskRule[];
+  blockers: string[];
+  warnings: string[];
+  reductions: string[];
+  sizing_reasons: string[];
+
+  execution_policy: ExecutionPolicy;
+  authorization_source: AuthorizationSource | null;
+  approved_at: string | null;
+  approved_by: string | null;
+  rejected_at: string | null;
+  rejected_by: string | null;
+  invalidated_at: string | null;
+  invalidation_reason: string | null;
+
+  created_at: string;
+  expires_at: string;
+  version: number;
+
+  can_approve: boolean;
+  can_reject: boolean;
+  can_cancel: boolean;
+  broker_order_transmitted: boolean;
+  notice: string;
+}
+
+export interface ProposalListResponse {
+  items: Proposal[];
+  total: number;
+  limit: number;
+  offset: number;
+  counts_by_status: Record<string, number>;
+}
+
+export interface RiskEvaluation {
+  id: string;
+  stage: string;
+  outcome: RiskOutcome;
+  policy_version: string | null;
+  broker_ticker: string | null;
+  thesis_id: string | null;
+  proposal_id: string | null;
+  actor: string | null;
+  detail: string | null;
+  created_at: string;
+  rules: RiskRule[];
+}
+
+export interface ProposalRiskDetail {
+  proposal_id: string;
+  risk_outcome: RiskOutcome | null;
+  risk_policy_version: string | null;
+  risk_snapshot_hash: string | null;
+  rules: RiskRule[];
+  blockers: string[];
+  warnings: string[];
+  reductions: string[];
+  sizing_reasons: string[];
+  snapshot: Record<string, unknown>;
+  evaluations: RiskEvaluation[];
+}
+
+export interface ExecutionPolicyResponse {
+  execution_policy: ExecutionPolicy;
+  proposals_enabled: boolean;
+  broker: string;
+  broker_environment: string;
+  automatic_authorization_permitted: boolean;
+  automation_blockers: string[];
+  broker_automation: {
+    broker: string;
+    environment: string;
+    automation_supported: boolean;
+    permitted: boolean;
+    blockers: string[];
+    detail: string;
+  };
+  risk_policy_version: string;
+  risk_config: Record<string, string | string[] | boolean | number>;
+  proposal_ttl_minutes: number;
+  broker_order_routes: string[];
+  notice: string;
+}

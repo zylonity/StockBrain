@@ -8,7 +8,9 @@ decides whether an order may be retried.  See
 from __future__ import annotations
 
 __all__ = [
+    "AccountStateUnavailable",
     "AmbiguousTransportFailure",
+    "AuthorizationNotPermitted",
     "BrokerError",
     "ConfigurationError",
     "DefinitePreSendFailure",
@@ -17,12 +19,14 @@ __all__ = [
     "InvalidProposalTransition",
     "ProposalAlreadyConsumed",
     "ProposalExpired",
+    "ProposalInvalidated",
     "ProviderAuthError",
     "ProviderEntitlementError",
     "ProviderError",
     "ProviderRateLimited",
     "ProviderResponseError",
     "ProviderUnavailable",
+    "RiskBlocked",
     "StockBrainError",
 ]
 
@@ -102,6 +106,47 @@ class ProposalAlreadyConsumed(StockBrainError):
 
 class ProposalExpired(StockBrainError):
     """The proposal's TTL elapsed before confirmation."""
+
+
+class ProposalInvalidated(StockBrainError):
+    """A precondition the proposal was built on stopped being true.
+
+    Raised when authorization is attempted against a proposal whose listing,
+    account state, position or market has moved since it was generated.  The
+    proposal is durably marked ``INVALIDATED`` rather than silently re-priced:
+    re-pricing under the user's finger is how a person approves a trade they
+    did not read.
+    """
+
+
+class RiskBlocked(StockBrainError):
+    """The deterministic risk engine refused.
+
+    Carries the blocking rule ids so the refusal is legible without re-reading
+    the whole snapshot.  Nothing -- not research confidence, not an operator
+    flag, not an automatic policy -- converts this into permission.
+    """
+
+    def __init__(self, message: str, *, rule_ids: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.rule_ids = rule_ids
+
+
+class AccountStateUnavailable(StockBrainError):
+    """Required broker account state is missing or stale.
+
+    Sizing without a current cash and position picture is guessing, so this
+    fails closed rather than falling back to the last known snapshot.
+    """
+
+
+class AuthorizationNotPermitted(StockBrainError):
+    """Authorization was attempted through a route this deployment forbids.
+
+    The automatic path raises this when the broker/environment does not
+    advertise automation capability, which is a policy answer rather than a
+    risk answer -- and there is deliberately no flag that bypasses it.
+    """
 
 
 class ExecutionNotPermitted(StockBrainError):

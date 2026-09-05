@@ -18,6 +18,7 @@ from stockbrain.db.models.proposals import (
     ACTIVE_PROPOSAL_STATUSES,
     ApprovalAction,
     ExecutionAttempt,
+    RiskEvaluation,
     TradeProposal,
 )
 from stockbrain.db.models.research import LlmCall, ResearchRun, Thesis
@@ -58,6 +59,7 @@ __all__ = [
     "Position",
     "ProviderHealthRecord",
     "ResearchRun",
+    "RiskEvaluation",
     "Source",
     "Thesis",
     "TradeProposal",

@@ -651,3 +651,144 @@ no broker environment or execution gate was changed. Alpaca IEX access remained
 healthy, while the out-of-hours quote was explicitly stale and blocked for sizing.
 Research model/FRED health in the application remains UNKNOWN until an application
 run uses them; isolated opt-in smoke calls do not fabricate production telemetry.
+
+## Phase 6 verified Trading 212 account surface — 2026-09-05
+
+Re-read from the current published documentation, which is now served as one
+Markdown document at <https://docs.trading212.com/api.md> (linked from
+`llms.txt`; the per-operation pages are at
+`https://docs.trading212.com/api/<tag>/<operation>.md`).
+
+| Detail | Status |
+|---|---|
+| `GET /api/v0/equity/account/summary`, rate limit **1 req / 5s** | confirmed |
+| Summary fields: `cash.availableToTrade`, `cash.inPies`, `cash.reservedForOrders`, `currency`, `id`, `investments.currentValue`, `.realizedProfitLoss`, `.totalCost`, `.unrealizedProfitLoss`, `totalValue` | confirmed |
+| `GET /api/v0/equity/positions`, rate limit **1 req / 1s**, optional `ticker` query parameter | confirmed |
+| Position fields: `averagePricePaid`, `createdAt`, `currentPrice`, `instrument.{currency,isin,name,ticker}`, `quantity`, `quantityAvailableForTrading`, `quantityInPies`, `walletImpact.{currency,currentValue,fxImpact,totalCost,unrealizedProfitLoss}` | confirmed |
+| Documented failure statuses for both: 401, 403, 408, 429 | confirmed |
+| Orders execute **only in the primary account currency**; multi-currency accounts are not supported through the API, so account, position and result values are all returned in that currency | confirmed |
+| Functional limit: maximum **50 pending orders** per ticker per account | confirmed |
+| Rate limits are per *account*, regardless of key or IP | confirmed |
+| API keys may optionally be IP-restricted from the Trading 212 account settings | confirmed |
+
+**Discrepancies against the shape assumed before this phase, and what was
+implemented:**
+
+1. **Open positions are at `/equity/positions`, not `/equity/portfolio`.** The
+   spec's endpoint list is already correct here, but any client written from the
+   older public shape would look for a flat payload with top-level `ticker` and
+   `ppl` and find neither: the current response nests the instrument under
+   `instrument` and the money under `walletImpact`. Both are parsed by name.
+2. **`quantityAvailableForTrading` is not `quantity`.** Shares held inside a pie
+   are owned but not individually tradable, so `quantityInPies` is recorded and
+   the *available* quantity is the only number a reduction is sized against.
+   Sizing a sell against the total would produce an order the broker refuses.
+3. **`walletImpact` is already in the account currency and already accounts for
+   FX** (`fxImpact` is stated to apply only when the instrument currency differs
+   from the account's). StockBrain therefore uses `walletImpact.currentValue`
+   as a position's account-currency value rather than multiplying quantity by
+   price, and falls back to the product only when the broker supplies no value.
+4. **`currency` and `totalValue` are treated as required** on the summary. A
+   snapshot missing either cannot size anything, and defaulting one would
+   produce a plausible-looking account state built on a field that was never
+   sent.
+5. **The account-summary limit (1 req/5s) is five times the positions limit
+   (1 req/1s).** Each endpoint gets its own token bucket, inside the retry loop,
+   for the same reason the metadata endpoints do.
+6. **`currentPrice` on a position is broker data.** The API Terms state
+   API-supplied market data is not real-time, so `PriceSource.BROKER_T212`
+   remains absent from `EXECUTION_GRADE_PRICE_SOURCES` and this field is display
+   and reconciliation only. It can never clear `quote_blockers`.
+
+**API Terms constraints that shape the automatic execution policy** (unchanged
+text, re-read 2026-09-05; recorded here because Phase 6 is the first phase to
+act on them):
+
+- clause **4.2(a)** expressly prohibits using the API for *Algorithmic Trading*,
+  defined as a computer automatically determining order parameters — whether to
+  initiate, timing, price, quantity or subsequent management — with limited or
+  no human intervention;
+- clause **6.6** requires prior written consent for high-speed or automated mass
+  data-entry use;
+- clause **6.7** requires a customised interface to be tested before live
+  deployment and makes its use subject to prior written consent.
+
+`EXECUTION_POLICY=automatic` against `T212_ENV=live` is precisely the activity
+clause 4.2(a) names, so it requires
+`T212_AUTOMATED_TRADING_CONSENT_CONFIRMED=true` and the process refuses to start
+without it. Demo (paper) trading risks no real funds and is the supported path
+for exercising automatic authorization. The flag records a fact about the
+operator's relationship with their broker; it is not a bypass, and no general
+override exists.
+
+### Live read-only verification — 2026-09-05
+
+Three GETs total, read-only, with explicit operator consent and behind two
+independent switches (`T212_ACCOUNT_ENV=live` and
+`T212_ALLOW_LIVE_ACCOUNT_READ=yes`). No balance, position size, ticker or
+account identifier was printed; only derived facts about the contract.
+Reproduce with `pytest -m live -s tests/integration/test_phase6_live.py`.
+
+```
+GET /equity/account/summary   -> 200
+GET /equity/positions         -> 200
+```
+
+| Observation | Result |
+|---|---|
+| Account currency (ISO 4217) | **GBP** |
+| `id` type | integer |
+| Every money value arrived as `Decimal` (no binary float) | **yes** |
+| Open positions | 14 |
+| Positions whose instrument currency differs from the account's | **14 of 14** |
+| Positions with shares inside a pie (`quantityInPies > 0`) | **13 of 14** |
+| Positions where `quantityAvailableForTrading != quantity` | **13 of 14** |
+| `walletImpact.currency` values observed | `GBP` only — matches the account |
+| Rate-limit headers on both endpoints | all five (`limit`, `period`, `remaining`, `reset`, `used`) |
+
+**Three things this measurement settles, none of which the documentation
+could have:**
+
+1. **Same-currency-only is the *actual* operating state, not a hypothetical
+   limitation.** This account is denominated in GBP and every one of its 14
+   positions is in another currency. Under the `currency_alignment` rule, a US
+   listing priced by Alpaca in USD against a GBP account blocks — so on this
+   account, sizing is currently blocked for the whole universe StockBrain can
+   price. That is the rule working, not failing: without a verified FX source, a
+   size computed for a GBP account from a USD price is a wrong size. Supporting
+   it needs a real FX rate source, which is a deliberate future decision rather
+   than something to infer at sizing time.
+2. **`quantityAvailableForTrading` is not a defensive nicety.** It differs from
+   `quantity` on 13 of 14 live positions, because pie holdings are owned but not
+   individually tradable. Sizing a reduction against `quantity` would produce an
+   order the broker refuses on almost every position in this account.
+3. **`walletImpact` really is in the primary account currency** (GBP on all 14
+   rows, against USD instruments), confirming the documented claim. This is why
+   a position's account-currency value is read from
+   `walletImpact.currentValue` rather than computed as quantity × price, which
+   would silently produce a USD number and compare it against a GBP portfolio.
+
+The **demo** environment returned HTTP 401 to the same two calls, consistent
+with the Phase 4 finding that Trading 212 issues API keys per environment and
+the configured pair is a live key.
+
+### Alpaca quote against the Phase 6 gates — 2026-09-05
+
+One read-only GET, `AAPL`, outside market hours. Capability `HEALTHY`, feed
+`iex`, `price_source` `ALPACA_IEX`.
+
+```
+bid / ask        305.33 / 338.27
+mid              321.80
+spread           32.94
+spread           1023.6172 bps   (ceiling 50 bps)  -> EXCESSIVE
+quote age        37,493,991 ms   (limit 15s)
+sizing blockers  ["quote is 37493991ms old, older than the 15s limit",
+                  "spread 1023.6172 bps exceeds the 50 bps ceiling (bid 305.33 / ask 338.27)"]
+```
+
+This is the same overnight book that motivated the ceiling, now measured
+against the rule built for it: **both** gates fire independently. The age check
+alone caught it in Phase 4; the spread check is what would catch the same width
+during regular hours, when the age check would not. `Decimal` arithmetic
+throughout — 338.27 − 305.33 is exactly 32.94, and the mid is exactly 321.80.

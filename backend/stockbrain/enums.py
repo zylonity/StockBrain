@@ -19,12 +19,14 @@ __all__ = [
     "AliasType",
     "ApprovalChannel",
     "ApprovalStage",
+    "AuthorizationSource",
     "BarTimeframe",
     "Broker",
     "CapabilityState",
     "EventSourceRelationship",
     "EventStatus",
     "ExecutionOutcome",
+    "ExecutionPolicy",
     "ImpactDirection",
     "InstrumentSupport",
     "JobStatus",
@@ -41,8 +43,11 @@ __all__ = [
     "ResearchStatus",
     "ResolutionMethod",
     "ResolutionStatus",
+    "RiskOutcome",
+    "RuleOutcome",
     "SourceCategory",
     "SourceProvider",
+    "SpreadStatus",
     "ThesisAction",
     "TimeHorizon",
 ]
@@ -155,6 +160,106 @@ class ProposalStatus(StrEnum):
     EXECUTION_AMBIGUOUS = "EXECUTION_AMBIGUOUS"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    INVALIDATED = "INVALIDATED"
+    """A precondition the proposal was built on stopped being true.
+
+    Distinct from ``EXPIRED`` (the clock ran out), ``REJECTED`` (a human said
+    no) and ``CANCELLED`` (someone withdrew it): the proposal was still within
+    its TTL and nobody acted on it, but the listing, the position, the account
+    or the market moved out from under the numbers it carries."""
+
+
+class ExecutionPolicy(StrEnum):
+    """Who is expected to authorize a proposal.
+
+    Recorded on the proposal row at creation, so flipping the deployment's
+    policy can never retroactively authorize work that was generated under the
+    other one.  This is orthogonal to :class:`~stockbrain.config.ExecutionMode`,
+    which gates *transmission* to the broker and is unchanged by this phase.
+    """
+
+    MANUAL = "MANUAL"
+    AUTOMATIC = "AUTOMATIC"
+
+
+class AuthorizationSource(StrEnum):
+    """What authorized a proposal.
+
+    Human approval is one source among several rather than the definition of
+    authorization, so an automatic deployment and a manual one converge on the
+    same ``APPROVED`` representation and differ only in provenance.
+    """
+
+    HUMAN_WEB = "HUMAN_WEB"
+    HUMAN_TELEGRAM = "HUMAN_TELEGRAM"
+    SYSTEM_AUTOMATIC = "SYSTEM_AUTOMATIC"
+
+    @property
+    def is_human(self) -> bool:
+        return self in {AuthorizationSource.HUMAN_WEB, AuthorizationSource.HUMAN_TELEGRAM}
+
+    @property
+    def channel(self) -> ApprovalChannel | None:
+        """The legacy human channel, or ``None`` for a system authorization."""
+        if self is AuthorizationSource.HUMAN_WEB:
+            return ApprovalChannel.WEB
+        if self is AuthorizationSource.HUMAN_TELEGRAM:
+            return ApprovalChannel.TELEGRAM
+        return None
+
+
+class RiskOutcome(StrEnum):
+    """The deterministic risk engine's verdict for a whole evaluation."""
+
+    ALLOW = "ALLOW"
+    REDUCE_SIZE = "REDUCE_SIZE"
+    BLOCK = "BLOCK"
+
+
+class RuleOutcome(StrEnum):
+    """One rule's verdict.
+
+    ``WARN`` is visible and recorded but changes nothing; ``REDUCE`` lowers the
+    permitted size; ``BLOCK`` is absolute and no other signal can lift it.
+    """
+
+    PASS = "PASS"  # noqa: S105 - a rule verdict, not a credential
+    WARN = "WARN"
+    REDUCE = "REDUCE"
+    BLOCK = "BLOCK"
+
+
+class SpreadStatus(StrEnum):
+    """Why a bid/ask pair is or is not usable as an execution reference.
+
+    Every abnormal book shape gets its own name rather than collapsing into
+    "no spread", because they have different causes and an operator reading a
+    blocked proposal needs to know which one happened.
+    """
+
+    OK = "OK"
+    MISSING = "MISSING"
+    """One or both sides absent from the quote entirely."""
+
+    NON_POSITIVE = "NON_POSITIVE"
+    """A side was present but zero or negative.  Alpaca documents ``0`` as
+    "no active bid/ask" rather than a price of zero."""
+
+    ONE_SIDED = "ONE_SIDED"
+    """Exactly one side is live.  There is no mid, so there is no reference."""
+
+    CROSSED = "CROSSED"
+    """``ask < bid``.  A book in this state is mid-update or mid-halt."""
+
+    LOCKED = "LOCKED"
+    """``ask == bid``.  A zero-width two-sided quote in an equity is an
+    anomaly, not free liquidity, so it is refused rather than celebrated."""
+
+    EXCESSIVE = "EXCESSIVE"
+    """A well-formed book whose relative spread exceeds the configured ceiling.
+    A live overnight IEX quote showed a $33 spread on a $321 AAPL mid -- a 10%
+    round trip -- which the age check happened to catch.  A book that wide
+    *during* regular hours would pass an age check and still be ruinous."""
 
 
 class ApprovalChannel(StrEnum):

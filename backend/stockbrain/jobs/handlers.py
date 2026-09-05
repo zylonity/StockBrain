@@ -326,12 +326,72 @@ async def handle_resolve_candidates(context: HandlerContext) -> None:
     )
 
 
+async def handle_broker_account_refresh(context: HandlerContext) -> None:
+    """Re-read broker cash and open positions.
+
+    Two documented GETs and nothing else. The client this reaches has no order,
+    amend or cancel method to call, and the handler receives no credentials of
+    its own -- it reaches the already-constructed read-only client through the
+    service container.
+    """
+    services = context.services
+    state = services.account_state
+    if not state.configured:
+        raise RuntimeError("trading212 account client is not configured")
+
+    try:
+        result = await state.sync()
+    except ProviderAuthError as exc:
+        services.health.record(ProviderName.TRADING212, ProviderStatus.DOWN, detail=str(exc)[:300])
+        raise
+    except ProviderError as exc:
+        services.health.record(
+            ProviderName.TRADING212, ProviderStatus.DEGRADED, detail=str(exc)[:300]
+        )
+        raise
+
+    log.info("broker_account_refresh_complete", **result.as_dict())
+
+
+async def handle_generate_proposal(context: HandlerContext) -> None:
+    """Turn one published thesis into a durable proposal, or a durable refusal.
+
+    Idempotent at three layers, because at-least-once delivery guarantees this
+    job runs twice eventually: ``uq_jobs_dedupe_key_active`` allows one pending
+    generation per thesis, ``uq_trade_proposals_dedupe_key`` and
+    ``uq_trade_proposals_active_thesis`` make a second insert a no-op, and a
+    blocked evaluation is recorded rather than retried into existence.
+
+    A risk block is an *answer*, not a job failure: the job succeeds and the
+    refusal is visible in ``risk_evaluations`` and in the GUI. Only an
+    infrastructure failure raises.
+    """
+    services = context.services
+    proposals = services.proposals
+    if proposals is None:
+        raise RuntimeError("proposal service is not configured")
+
+    thesis_id = uuid.UUID(str(context.payload["thesis_id"]))
+    result = await proposals.generate(thesis_id)
+    log.info(
+        "generate_proposal_job_complete",
+        thesis_id=str(thesis_id),
+        created=result.created,
+        proposal_id=str(result.proposal_id) if result.proposal_id else None,
+        outcome=result.outcome.value,
+        authorized=result.authorized,
+        reason=result.reason[:300],
+    )
+
+
 def register_ingestion_handlers(
     registry: JobRegistry,
     *,
     classifier_available: bool,
     instrument_sync_available: bool = False,
     research_available: bool = False,
+    proposals_available: bool = False,
+    account_sync_available: bool = False,
 ) -> None:
     """Register the handlers this deployment can actually run.
 
@@ -354,11 +414,22 @@ def register_ingestion_handlers(
     registry.register(JobType.RESOLVE_CANDIDATES.value, handle_resolve_candidates)
     if research_available:
         registry.register(JobType.RUN_RESEARCH.value, handle_run_research)
+    if account_sync_available:
+        registry.register(JobType.BROKER_RECONCILE.value, handle_broker_account_refresh)
+    if proposals_available:
+        registry.register(JobType.GENERATE_PROPOSAL.value, handle_generate_proposal)
 
 
 async def handle_run_research(context: HandlerContext) -> None:
     if context.services.research is None:
         raise RuntimeError("research is not configured")
-    await context.services.research.run(
-        uuid.UUID(str(context.payload["run_id"])), job_id=context.job_id
-    )
+    run_id = uuid.UUID(str(context.payload["run_id"]))
+    await context.services.research.run(run_id, job_id=context.job_id)
+
+    # The pipeline continues: a published thesis becomes a proposal candidate.
+    # The dedupe key means a redelivered research job cannot queue a second
+    # generation, and the scheduler's backlog sweep covers a job lost to a
+    # dying worker.
+    proposals = getattr(context.services, "proposals", None)
+    if proposals is not None:
+        await proposals.enqueue_for_run(run_id)

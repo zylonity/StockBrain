@@ -34,10 +34,13 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from stockbrain.enums import ExecutionPolicy
+
 __all__ = [
     "AppEnv",
     "BrokerEnvironment",
     "ExecutionMode",
+    "ExecutionPolicy",
     "LogFormat",
     "Settings",
     "get_settings",
@@ -72,6 +75,10 @@ class ExecutionMode(StrEnum):
     ``manual_approval`` is the only mode that permits any broker mutation, and
     even then only after two explicit human confirmations.  ``research_only``
     generates proposals but refuses every execution path.
+
+    Deliberately **not** the same axis as :class:`ExecutionPolicy`.  This gates
+    *transmission* to the broker (Phase 8) and its four-gate live truth table is
+    unchanged by Phase 6; ``ExecutionPolicy`` gates *authorization*.
     """
 
     RESEARCH_ONLY = "research_only"
@@ -228,6 +235,24 @@ class Settings(BaseSettings):
     t212_timeout_seconds: float = 20.0
     execution_mode: ExecutionMode = ExecutionMode.MANUAL_APPROVAL
 
+    t212_automated_trading_consent_confirmed: bool = False
+    """Records that Trading 212's prior written consent for automated order
+    determination has actually been obtained.
+
+    Their API Terms clause 4.2(a) prohibits Algorithmic Trading -- a computer
+    determining order parameters with limited or no human intervention -- and
+    clauses 6.6/6.7 require prior written consent for an automated customised
+    interface.  ``EXECUTION_POLICY=automatic`` against the **live** environment
+    is exactly that activity, so it requires this flag.  The flag states a fact
+    about the operator's relationship with their broker; it is not a bypass, and
+    there is no general "ignore broker rules" switch."""
+
+    t212_account_refresh_interval_seconds: int = 60
+    """How often broker cash and positions are re-read. The summary endpoint
+    allows one request per 5 seconds and positions one per second, so a minute
+    is comfortable; the risk engine independently refuses a snapshot older than
+    ``RISK_MAX_ACCOUNT_STATE_AGE_SECONDS``."""
+
     t212_metadata_enabled: bool = True
     instrument_refresh_interval_minutes: int = 360
     """Trading 212 refreshes instrument metadata every 10 minutes and rate-limits
@@ -237,6 +262,57 @@ class Settings(BaseSettings):
     instrument_staleness_hours: int = 24
     """Older than this and the startup sequence enqueues a refresh (spec section
     23 step 12)."""
+
+    # ------------------------------------------------------------------
+    # Execution policy and deterministic risk (spec section 14/20)
+    #
+    # Every value below is a *limit*, not a recommendation. They are
+    # deliberately conservative defaults and are user-editable; nothing here is
+    # investment advice. See `stockbrain.risk.config` for the versioned object
+    # these feed, which is what a proposal actually records.
+    # ------------------------------------------------------------------
+    execution_policy: ExecutionPolicy = ExecutionPolicy.MANUAL
+    """Who authorizes a proposal. Recorded on each proposal at creation, so
+    flipping this can never retroactively authorize existing work."""
+
+    proposals_enabled: bool = True
+
+    risk_allowed_instrument_types: CommaSeparatedStrs
+    risk_allowed_sessions: CommaSeparatedStrs
+    risk_require_known_session: bool = True
+
+    risk_max_spread_bps: Decimal = Decimal("50")
+    """0.50% of mid. A live overnight IEX book showed a $33 spread on a $321
+    AAPL mid -- 1024 bps, a 10% round trip. Age alone caught that one; a book
+    that wide during regular hours would be fresh and still ruinous."""
+
+    risk_spread_policy: Literal["block", "reduce"] = "block"
+    risk_wide_spread_size_factor: Decimal = Decimal("0.5")
+
+    risk_max_account_state_age_seconds: float = 300.0
+    risk_require_same_currency: bool = True
+
+    risk_max_notional_per_trade: Decimal = Decimal("500")
+    risk_max_trade_pct: Decimal = Decimal("0.02")
+    risk_max_position_pct: Decimal = Decimal("0.03")
+    risk_max_aggregate_exposure_pct: Decimal = Decimal("0.60")
+    risk_min_cash_reserve_pct: Decimal = Decimal("0.10")
+    risk_min_trade_notional: Decimal = Decimal("20")
+    risk_allow_fractional_quantity: bool = False
+
+    risk_max_active_proposals: int = 5
+    risk_max_active_proposal_exposure_pct: Decimal = Decimal("0.10")
+    risk_proposal_ttl_minutes: int = 30
+    risk_max_reference_price_drift_pct: Decimal = Decimal("0.01")
+
+    risk_min_research_confidence: Decimal = Decimal("0.70")
+    risk_confidence_modulates_size: bool = True
+    risk_min_confidence_size_factor: Decimal = Decimal("0.5")
+    risk_reduce_fraction: Decimal = Decimal("0.5")
+
+    proposal_revalidation_batch: int = 5
+    """How many active proposals the invalidation sweep re-prices per tick.
+    Bounded so the sweep cannot turn into an unmetered market-data spend."""
 
     # ------------------------------------------------------------------
     # Telegram
@@ -272,6 +348,8 @@ class Settings(BaseSettings):
         "telegram_allowed_user_ids",
         "telegram_allowed_chat_ids",
         "cors_allow_origins",
+        "risk_allowed_instrument_types",
+        "risk_allowed_sessions",
         mode="before",
     )
     @classmethod
@@ -289,6 +367,18 @@ class Settings(BaseSettings):
                 return json.loads(stripped)
             return [part.strip() for part in stripped.split(",") if part.strip()]
         return value
+
+    @field_validator("execution_policy", mode="before")
+    @classmethod
+    def _normalise_execution_policy(cls, value: object) -> object:
+        """Accept ``automatic`` as well as ``AUTOMATIC``.
+
+        The enum's values are upper case because they are a persisted
+        PostgreSQL type, but ``EXECUTION_POLICY=automatic`` is what an operator
+        naturally writes beside ``EXECUTION_MODE=manual_approval``.  Refusing it
+        over capitalisation would be a configuration error that teaches nothing.
+        """
+        return value.strip().upper() if isinstance(value, str) else value
 
     @field_validator("log_level", mode="after")
     @classmethod
@@ -320,6 +410,76 @@ class Settings(BaseSettings):
                     "configuration: " + "; ".join(problems) + ". Refusing to start: StockBrain "
                     "never resolves an ambiguous live-execution configuration in favour of live."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_automation_gate(self) -> Settings:
+        """Refuse live automatic authorization without recorded broker consent.
+
+        Trading 212's API Terms clause 4.2(a) prohibits Algorithmic Trading, and
+        6.6/6.7 require prior written consent for an automated customised
+        interface.  ``EXECUTION_POLICY=automatic`` against ``T212_ENV=live`` is
+        exactly that, so the process refuses to start rather than silently
+        degrading to manual -- a deployment that asked for automatic and quietly
+        got manual is a deployment nobody is watching.
+        """
+        if (
+            self.execution_policy is ExecutionPolicy.AUTOMATIC
+            and self.t212_env is BrokerEnvironment.LIVE
+            and not self.t212_automated_trading_consent_confirmed
+        ):
+            raise ValueError(
+                "EXECUTION_POLICY=automatic with T212_ENV=live requires "
+                "T212_AUTOMATED_TRADING_CONSENT_CONFIRMED=true: Trading 212's API Terms "
+                "clause 4.2(a) prohibits Algorithmic Trading and clauses 6.6/6.7 require prior "
+                "written consent before a customised interface determines order parameters "
+                "automatically. Refusing to start: StockBrain never resolves an ambiguous "
+                "automation configuration in favour of automation. Use T212_ENV=demo to "
+                "exercise automatic authorization against paper trading."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_risk_limits(self) -> Settings:
+        """Reject a risk configuration that cannot mean anything.
+
+        A negative or above-one percentage, an inverted confidence band or a
+        non-positive TTL are configuration errors, not values to clamp: silently
+        correcting a limit is how a limit stops being the one that was chosen.
+        """
+        fractions = {
+            "RISK_MAX_TRADE_PCT": self.risk_max_trade_pct,
+            "RISK_MAX_POSITION_PCT": self.risk_max_position_pct,
+            "RISK_MAX_AGGREGATE_EXPOSURE_PCT": self.risk_max_aggregate_exposure_pct,
+            "RISK_MIN_CASH_RESERVE_PCT": self.risk_min_cash_reserve_pct,
+            "RISK_MAX_ACTIVE_PROPOSAL_EXPOSURE_PCT": self.risk_max_active_proposal_exposure_pct,
+            "RISK_MAX_REFERENCE_PRICE_DRIFT_PCT": self.risk_max_reference_price_drift_pct,
+            "RISK_MIN_RESEARCH_CONFIDENCE": self.risk_min_research_confidence,
+            "RISK_MIN_CONFIDENCE_SIZE_FACTOR": self.risk_min_confidence_size_factor,
+            "RISK_WIDE_SPREAD_SIZE_FACTOR": self.risk_wide_spread_size_factor,
+            "RISK_REDUCE_FRACTION": self.risk_reduce_fraction,
+        }
+        problems = [
+            f"{name} must be between 0 and 1 (got {value})"
+            for name, value in fractions.items()
+            if value < 0 or value > 1
+        ]
+        if self.risk_reduce_fraction <= 0:
+            problems.append("RISK_REDUCE_FRACTION must be greater than 0")
+        if self.risk_max_spread_bps <= 0:
+            problems.append("RISK_MAX_SPREAD_BPS must be greater than 0")
+        if self.risk_max_notional_per_trade <= 0:
+            problems.append("RISK_MAX_NOTIONAL_PER_TRADE must be greater than 0")
+        if self.risk_min_trade_notional < 0:
+            problems.append("RISK_MIN_TRADE_NOTIONAL must not be negative")
+        if self.risk_proposal_ttl_minutes <= 0:
+            problems.append("RISK_PROPOSAL_TTL_MINUTES must be greater than 0")
+        if self.risk_max_active_proposals <= 0:
+            problems.append("RISK_MAX_ACTIVE_PROPOSALS must be greater than 0")
+        if self.risk_max_account_state_age_seconds <= 0:
+            problems.append("RISK_MAX_ACCOUNT_STATE_AGE_SECONDS must be greater than 0")
+        if problems:
+            raise ValueError("Invalid risk configuration: " + "; ".join(problems))
         return self
 
     @model_validator(mode="after")
@@ -398,6 +558,36 @@ class Settings(BaseSettings):
         if not self.broker_credentials_present:
             blockers.append("Trading 212 API credentials are not configured")
         return blockers
+
+    @property
+    def automation_blockers(self) -> list[str]:
+        """Every reason automatic authorization is unavailable, GUI-ready.
+
+        Deliberately a *different* list from :attr:`execution_blockers`.
+        Authorizing a proposal without a human and transmitting an order to a
+        broker are separate permissions with separate gates; conflating them
+        would let one be granted by satisfying the other.
+        """
+        from stockbrain.broker.automation import automation_capability
+
+        blockers: list[str] = []
+        if self.execution_policy is not ExecutionPolicy.AUTOMATIC:
+            blockers.append(f"EXECUTION_POLICY is '{self.execution_policy.value}'")
+        if not self.proposals_enabled:
+            blockers.append("PROPOSALS_ENABLED is false")
+        blockers.extend(automation_capability(self).blockers)
+        return blockers
+
+    @property
+    def automatic_authorization_permitted(self) -> bool:
+        """The single authoritative predicate for authorizing without a human.
+
+        Defined as "no blockers remain", so this and :attr:`automation_blockers`
+        can never disagree.  It permits *authorization* only: Phase 6 sends no
+        broker order under any policy, and Phase 8's transmission gate is
+        :attr:`live_execution_permitted`, which this does not touch.
+        """
+        return not self.automation_blockers
 
 
 @functools.lru_cache(maxsize=1)

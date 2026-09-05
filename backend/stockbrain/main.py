@@ -25,11 +25,18 @@ from stockbrain.api.routes import discovery as discovery_routes
 from stockbrain.api.routes import events as events_routes
 from stockbrain.api.routes import health as health_routes
 from stockbrain.api.routes import instruments as instrument_routes
+from stockbrain.api.routes import proposals as proposal_routes
 from stockbrain.api.routes import research as research_routes
 from stockbrain.api.routes import system as system_routes
 from stockbrain.config import Settings, get_settings
 from stockbrain.db.session import Database
-from stockbrain.errors import ProposalAlreadyConsumed, ProposalExpired, StockBrainError
+from stockbrain.errors import (
+    ProposalAlreadyConsumed,
+    ProposalExpired,
+    ProposalInvalidated,
+    RiskBlocked,
+    StockBrainError,
+)
 from stockbrain.logging import configure_logging, get_logger
 from stockbrain.observability.health import ProviderHealthRegistry
 from stockbrain.observability.metrics import METRICS
@@ -161,6 +168,21 @@ def _register_exception_handlers(app: FastAPI) -> None:
     async def _expired(_: Request, exc: ProposalExpired) -> JSONResponse:
         return JSONResponse(status_code=410, content={"detail": str(exc) or "proposal expired"})
 
+    @app.exception_handler(ProposalInvalidated)
+    async def _invalidated(_: Request, exc: ProposalInvalidated) -> JSONResponse:
+        # 409 for the same reason as ProposalAlreadyConsumed: the client is
+        # acting on a proposal whose world moved on.
+        return JSONResponse(status_code=409, content={"detail": str(exc) or "proposal invalidated"})
+
+    @app.exception_handler(RiskBlocked)
+    async def _risk_blocked(_: Request, exc: RiskBlocked) -> JSONResponse:
+        # 422: the request was well formed and the entity is real; the
+        # deterministic risk engine simply refused, and that refusal is final.
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "blocked_rules": list(exc.rule_ids)},
+        )
+
     @app.exception_handler(StockBrainError)
     async def _domain_error(_: Request, exc: StockBrainError) -> JSONResponse:
         log.warning("domain_error", error_type=type(exc).__name__, error=str(exc))
@@ -228,6 +250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(discovery_routes.router)
     app.include_router(instrument_routes.router)
     app.include_router(research_routes.router)
+    app.include_router(proposal_routes.router)
 
     _mount_frontend(app)
     return app

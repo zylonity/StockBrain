@@ -8,6 +8,11 @@
  */
 
 import type {
+  ExecutionPolicyResponse,
+  Proposal,
+  ProposalListResponse,
+  ProposalRiskDetail,
+  ProposalStatus,
   ResearchRun,
   BrokerInstrumentRecord,
   CompanyAliasRecord,
@@ -36,6 +41,22 @@ export class ApiError extends Error {
     this.name = "ApiError";
     this.status = status;
   }
+}
+
+/**
+ * POST a JSON body.
+ *
+ * The body deliberately never carries order parameters. The ticker, side,
+ * quantity, price and account are read from the proposal row on the server,
+ * under lock: a client that could name a quantity would be a client that could
+ * size a trade.
+ */
+async function post<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+  return request<T>(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -112,6 +133,28 @@ export const api = {
   aliases: () => request<CompanyAliasRecord[]>("/api/v1/aliases"),
   marketDataHealth: () =>
     request<MarketDataHealth>("/api/v1/market-data/health"),
+  proposals: (status?: ProposalStatus, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (status) params.set("proposal_status", status);
+    return request<ProposalListResponse>(`/api/v1/proposals?${params.toString()}`);
+  },
+  proposal: (id: string) =>
+    request<Proposal>(`/api/v1/proposals/${encodeURIComponent(id)}`),
+  proposalRisk: (id: string) =>
+    request<ProposalRiskDetail>(
+      `/api/v1/proposals/${encodeURIComponent(id)}/risk`,
+    ),
+  proposalPolicy: () =>
+    request<ExecutionPolicyResponse>("/api/v1/proposals/policy"),
+  approveProposal: (id: string) =>
+    post<Proposal>(`/api/v1/proposals/${encodeURIComponent(id)}/approve`),
+  rejectProposal: (id: string, reason?: string) =>
+    post<Proposal>(`/api/v1/proposals/${encodeURIComponent(id)}/reject`,
+      reason ? { reason } : {}),
+  cancelProposal: (id: string, reason?: string) =>
+    post<Proposal>(`/api/v1/proposals/${encodeURIComponent(id)}/cancel`,
+      reason ? { reason } : {}),
+
   priceReaction: (eventId: string) =>
     request<PriceReaction[]>(
       `/api/v1/events/${encodeURIComponent(eventId)}/price-reaction`,
