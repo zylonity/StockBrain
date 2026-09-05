@@ -52,7 +52,13 @@ COPY backend/alembic ./alembic
 COPY backend/stockbrain ./stockbrain
 COPY third_party/TradingAgents/tradingagents ./third_party/TradingAgents/tradingagents
 COPY third_party/TradingAgents/LICENSE ./third_party/TradingAgents/LICENSE
-RUN python -c "from stockbrain.intelligence.tradingagents_runtime import upstream_root; upstream_root()"
+# Prompt templates are runtime data read by `stockbrain.intelligence.prompts`,
+# not documentation. Without them every CLASSIFY_EVENT job raises
+# FileNotFoundError after claiming its event, and the retry then finds the event
+# already CLASSIFYING and reports success -- so classification fails invisibly.
+COPY prompts ./prompts
+RUN python -c "from stockbrain.intelligence.tradingagents_runtime import upstream_root; upstream_root()" \
+ && python -c "from stockbrain.intelligence.prompts import load_prompt; load_prompt('event_classifier'); load_prompt('event_dedupe')"
 
 # The SPA is served from stockbrain/../static (see stockbrain.main.FRONTEND_DIST).
 COPY --from=frontend /build/dist ./static

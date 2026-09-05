@@ -11,3 +11,7 @@
 !.env.example
 *.md
 !README.md
+# The LLM prompts are Markdown *data*, not documentation: `load_prompt` reads
+# them at runtime and raises FileNotFoundError without them, which silently
+# stops classification inside the container.
+!prompts/**/*.md
