@@ -183,6 +183,23 @@ Sources: <https://docs.trading212.com/api>,
    StockBrain paces instead of bursting, because the metadata endpoints have a
    budget of one.
 
+**Live verification status: NOT YET PERFORMED.** Everything in the two tables
+above is verified against Trading 212's current *documentation*. No live call
+has ever been made to Trading 212, because no API credentials are configured.
+The following facts are therefore *documented but not observed*, and each has a
+safe-by-construction fallback in the code:
+
+| Unobserved fact | Fallback if the observation differs |
+|---|---|
+| ISIN is populated on STOCK/ETF rows | `isin` is nullable; a row without one resolves but creates no company |
+| `shortName` is a usable market-data symbol | `market_symbol` falls back to the ticker prefix, and is never sent to the broker |
+| `workingScheduleId` resolves to an exchange | an unmapped schedule leaves `exchange` NULL, never guessed |
+| the five `x-ratelimit-*` headers arrive on every response | `RateLimitSnapshot` fields are all optional; the client paces from its own bucket |
+
+`pytest -m live -s tests/integration/test_phase4_live.py` measures all four in
+two GETs and prints the numbers. Run it and record the results here before
+Phase 6 sizes anything against this metadata.
+
 **Trading 212 pricing rule, re-checked in Phase 4.** The current public API
 documentation exposes no market-data endpoint at all — the metadata endpoints
 carry no prices, and position/order data is account state rather than a quote.
@@ -293,6 +310,15 @@ Sources: <https://docs.alpaca.markets/us/reference/stocklatestquotesingle-1>,
 7. Alpaca answers 403 (not 401) for an unauthenticated request in the documented
    FAQ, while the OpenAPI definition lists 401 for missing/invalid auth headers.
    Both are handled identically.
+
+**Live verification status: NOT YET PERFORMED.** No live call has ever been
+made to Alpaca's market-data API — the news WebSocket has never been connected
+either — because no Alpaca credentials are configured. The IEX entitlement
+claimed by the Basic plan's documentation is therefore *documented but not
+observed*, as is the actual freshness of an IEX quote. The capability probe
+exists precisely so this is discovered at startup and reported rather than
+assumed; until it has run against a real key, `realtime_pricing_usable` has
+never been `True` in this deployment and sizing would be blocked.
 
 **Entitlement posture.** SIP access is never assumed. `ALPACA_STOCK_FEED`
 defaults to `iex`, the only feed available without a paid subscription. The

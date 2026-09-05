@@ -7,6 +7,7 @@ the system, so it is tested exhaustively rather than by example.
 from __future__ import annotations
 
 import itertools
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -209,3 +210,35 @@ def test_empty_list_environment_value_yields_empty_list(
 ) -> None:
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "")
     assert Settings(app_env="test").telegram_allowed_user_ids == []
+
+
+def test_env_file_values_ignore_inline_comments_and_quotes(tmp_path: Path) -> None:
+    """A commented `.env` line must not become part of a credential.
+
+    The shipped `.env.example` annotates values inline (``ALPACA_STOCK_FEED=iex
+    # iex | sip | delayed_sip``), so a parser that kept the comment would turn a
+    valid feed into an invalid one -- and, worse, would silently append a
+    comment to an API key, which surfaces later as an unexplained auth failure
+    rather than as a configuration error.
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "# a full-line comment",
+                "ALPACA_STOCK_FEED=iex               # iex | sip | delayed_sip",
+                'ALPACA_API_KEY="quoted-key"',
+                "T212_API_SECRET=plain-secret  # trailing note",
+                "MARKET_DATA_PROBE_SYMBOL=MSFT",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env_file))
+
+    assert settings.alpaca_stock_feed == "iex"
+    assert settings.alpaca_api_key.get_secret_value() == "quoted-key"
+    assert settings.t212_api_secret.get_secret_value() == "plain-secret"
+    assert settings.market_data_probe_symbol == "MSFT"
