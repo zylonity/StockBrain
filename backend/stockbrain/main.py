@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from stockbrain.api.routes import discovery as discovery_routes
 from stockbrain.api.routes import events as events_routes
 from stockbrain.api.routes import health as health_routes
+from stockbrain.api.routes import instruments as instrument_routes
 from stockbrain.api.routes import system as system_routes
 from stockbrain.config import Settings, get_settings
 from stockbrain.db.session import Database
@@ -224,6 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(system_routes.router)
     app.include_router(events_routes.router)
     app.include_router(discovery_routes.router)
+    app.include_router(instrument_routes.router)
 
     _mount_frontend(app)
     return app

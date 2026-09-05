@@ -19,11 +19,12 @@ from stockbrain.api.schemas import (
     EventDetailResponse,
     EventListResponse,
     EventSummaryResponse,
+    InstrumentCandidateResponse,
     LlmCallResponse,
     LlmUsageResponse,
     SourceResponse,
 )
-from stockbrain.db.models.companies import EventCompanyImpact
+from stockbrain.db.models.companies import BrokerInstrument, EventCompanyImpact
 from stockbrain.db.models.research import LlmCall
 from stockbrain.db.models.sources import Event, Source
 from stockbrain.db.repositories.events import EventFilters, EventRepository
@@ -70,7 +71,20 @@ def _to_summary(
     )
 
 
-def _to_impact(impact: EventCompanyImpact) -> CompanyImpactResponse:
+def _to_impact(
+    impact: EventCompanyImpact, instrument: BrokerInstrument | None = None
+) -> CompanyImpactResponse:
+    """Show the model's hint and the verified instrument side by side.
+
+    Keeping both visible is the point: a reviewer can see that the hint was a
+    search key and that the executable identity came from broker metadata.
+    """
+    alternatives = []
+    for raw in impact.resolution_alternatives or []:
+        try:
+            alternatives.append(InstrumentCandidateResponse.model_validate(raw))
+        except ValueError:
+            continue
     return CompanyImpactResponse(
         id=impact.id,
         company_name_hint=impact.company_name_hint,
@@ -84,6 +98,16 @@ def _to_impact(impact: EventCompanyImpact) -> CompanyImpactResponse:
         explanation=impact.explanation,
         resolved_company_id=impact.company_id,
         resolution_confidence=impact.resolution_confidence,
+        resolution_status=impact.resolution_status.value,
+        resolution_method=impact.resolution_method,
+        resolution_notes=impact.resolution_notes,
+        broker_instrument_id=impact.broker_instrument_id,
+        broker_ticker=instrument.broker_ticker if instrument else None,
+        resolved_market_symbol=instrument.market_symbol if instrument else None,
+        resolved_exchange=instrument.exchange if instrument else None,
+        resolved_currency=instrument.currency if instrument else None,
+        resolved_isin=instrument.isin if instrument else None,
+        resolution_alternatives=alternatives,
     )
 
 
@@ -198,7 +222,7 @@ async def get_event(event_id: uuid.UUID, session: DbSession) -> EventDetailRespo
             event, *summary.get(event_id, (0, [], None)), company_count=len(companies)
         ),
         sources=[_to_source(source, relationship) for source, relationship in sources],
-        companies=[_to_impact(impact) for impact in companies],
+        companies=[_to_impact(impact, instrument) for impact, instrument in companies],
         rationale=rationale,
         llm_usage=LlmUsageResponse(**usage),
         llm_calls=[_to_llm_call(call) for call in calls],

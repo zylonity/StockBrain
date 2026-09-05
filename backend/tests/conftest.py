@@ -100,6 +100,8 @@ async def clean_tables(database: Database) -> AsyncIterator[Database]:
         "sources",
         "events",
         "broker_instruments",
+        "broker_working_schedules",
+        "broker_exchanges",
         "company_aliases",
         "companies",
         "jobs",

@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from stockbrain.enums import ProviderStatus
 
 __all__ = [
+    "AliasResponse",
+    "BrokerInstrumentResponse",
     "CompanyImpactResponse",
     "DiscoveryQueryResponse",
     "DiscoveryStatusResponse",
@@ -25,13 +27,20 @@ __all__ = [
     "ExecutionStatusResponse",
     "HealthResponse",
     "IngestionStatsResponse",
+    "InstrumentCandidateResponse",
+    "InstrumentSyncStatusResponse",
     "LivenessResponse",
     "LlmBudgetResponse",
     "LlmCallResponse",
     "LlmUsageResponse",
+    "MarketDataHealthResponse",
+    "PriceReactionResponse",
     "ProviderHealthResponse",
     "ProvidersResponse",
+    "QuoteResponse",
     "ReadinessResponse",
+    "ResolutionListResponse",
+    "ResolutionResponse",
     "SourceResponse",
     "SubsystemHealth",
 ]
@@ -169,6 +178,175 @@ class EventListResponse(ApiModel):
     events: list[EventSummaryResponse]
 
 
+class InstrumentCandidateResponse(ApiModel):
+    """One listing that matched, shown so an ambiguity explains itself."""
+
+    broker_instrument_id: uuid.UUID
+    broker_ticker: str
+    name: str | None = None
+    market_symbol: str | None = None
+    exchange: str | None = None
+    currency: str | None = None
+    isin: str | None = None
+    instrument_type: str | None = None
+    matched_by: str
+
+
+class BrokerInstrumentResponse(ApiModel):
+    id: uuid.UUID
+    broker: str
+    broker_ticker: str
+    name: str | None = None
+    short_name: str | None = None
+    market_symbol: str | None = None
+    market_code: str | None = None
+    exchange: str | None = None
+    currency: str | None = None
+    isin: str | None = None
+    instrument_type: str | None = None
+    extended_hours: bool = False
+    min_trade_quantity: Decimal | None = None
+    max_open_quantity: Decimal | None = None
+    working_schedule_id: int | None = None
+    added_on: dt.datetime | None = None
+    is_active: bool = True
+    company_id: uuid.UUID | None = None
+    last_refreshed_at: dt.datetime | None = None
+
+
+class ResolutionResponse(ApiModel):
+    """How one classifier company hint mapped onto a verified instrument.
+
+    Both sides are shown deliberately: the model's ticker hint next to the
+    resolved broker instrument, so a reviewer can see that the hint was a search
+    key and never the identity.
+    """
+
+    impact_id: uuid.UUID
+    event_id: uuid.UUID
+    event_title: str | None = None
+
+    company_name_hint: str
+    model_ticker_hint: str | None = None
+    model_exchange_hint: str | None = None
+
+    status: str
+    method: str | None = None
+    confidence: float | None = None
+    notes: str | None = None
+    resolved_at: dt.datetime | None = None
+
+    company_id: uuid.UUID | None = None
+    company_name: str | None = None
+    broker_instrument_id: uuid.UUID | None = None
+    broker_ticker: str | None = None
+    market_symbol: str | None = None
+    exchange: str | None = None
+    currency: str | None = None
+    isin: str | None = None
+    instrument_type: str | None = None
+
+    alternatives: list[InstrumentCandidateResponse] = Field(default_factory=list)
+
+
+class ResolutionListResponse(ApiModel):
+    items: list[ResolutionResponse]
+    total: int
+    limit: int
+    offset: int
+    counts_by_status: dict[str, int] = Field(default_factory=dict)
+
+
+class AliasResponse(ApiModel):
+    id: uuid.UUID
+    company_id: uuid.UUID
+    company_name: str | None = None
+    alias: str
+    alias_normalized: str
+    alias_type: str
+    exchange: str | None = None
+    currency: str | None = None
+    isin: str | None = None
+    is_authoritative: bool = True
+    confidence: float = 1.0
+    source: str = "MANUAL"
+    notes: str | None = None
+
+
+class InstrumentSyncStatusResponse(ApiModel):
+    broker: str
+    configured: bool
+    instruments_total: int
+    instruments_active: int
+    with_isin: int
+    with_exchange: int
+    exchanges: int
+    working_schedules: int
+    last_refreshed_at: dt.datetime | None = None
+    rate_limit: dict[str, object] = Field(default_factory=dict)
+
+
+class QuoteResponse(ApiModel):
+    """A quote as the system records it: never a bare number.
+
+    Prices are serialised as strings so a JSON parser cannot turn a ``Decimal``
+    back into a binary float on the way to the browser.
+    """
+
+    symbol: str
+    provider: str
+    feed: str
+    price_source: str
+    price: str | None = None
+    bid: str | None = None
+    ask: str | None = None
+    bid_size: int | None = None
+    ask_size: int | None = None
+    currency: str = "USD"
+    provider_timestamp: dt.datetime
+    received_at: dt.datetime
+    quote_age_ms: int
+    is_two_sided: bool
+    execution_grade: bool
+    sizing_blockers: list[str] = Field(default_factory=list)
+
+
+class MarketDataHealthResponse(ApiModel):
+    provider: str | None = None
+    configured: bool
+    state: str
+    feed: str | None = None
+    detail: str | None = None
+    checked_at: dt.datetime | None = None
+    realtime_pricing_usable: bool = False
+    probe_symbol: str | None = None
+    probe_quote_age_ms: int | None = None
+    max_quote_age_seconds: float
+    blockers: list[str] = Field(default_factory=list)
+
+
+class PriceReactionResponse(ApiModel):
+    symbol: str
+    event_time: dt.datetime
+    status: str
+    provider: str | None = None
+    feed: str | None = None
+    price_at_event: str | None = None
+    price_at_event_time: dt.datetime | None = None
+    price_at_event_basis: str | None = None
+    reference_price: str | None = None
+    reference_price_time: dt.datetime | None = None
+    reference_price_basis: str | None = None
+    reference_quote_age_ms: int | None = None
+    absolute_move: str | None = None
+    percent_move: str | None = None
+    elapsed_seconds: float
+    session_at_event: str
+    session_source: str
+    session_holiday_aware: bool
+    notes: list[str] = Field(default_factory=list)
+
+
 class CompanyImpactResponse(ApiModel):
     """A company the classifier believes an event affects.
 
@@ -188,6 +366,16 @@ class CompanyImpactResponse(ApiModel):
     explanation: str | None
     resolved_company_id: uuid.UUID | None = None
     resolution_confidence: float | None = None
+    resolution_status: str = "PENDING"
+    resolution_method: str | None = None
+    resolution_notes: str | None = None
+    broker_instrument_id: uuid.UUID | None = None
+    broker_ticker: str | None = None
+    resolved_market_symbol: str | None = None
+    resolved_exchange: str | None = None
+    resolved_currency: str | None = None
+    resolved_isin: str | None = None
+    resolution_alternatives: list[InstrumentCandidateResponse] = Field(default_factory=list)
 
 
 class LlmUsageResponse(ApiModel):

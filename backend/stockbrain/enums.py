@@ -14,16 +14,22 @@ from __future__ import annotations
 from enum import StrEnum
 
 __all__ = [
+    "EXECUTION_GRADE_PRICE_SOURCES",
     "ActorType",
+    "AliasType",
     "ApprovalChannel",
     "ApprovalStage",
+    "BarTimeframe",
     "Broker",
+    "CapabilityState",
     "EventSourceRelationship",
     "EventStatus",
     "ExecutionOutcome",
     "ImpactDirection",
+    "InstrumentSupport",
     "JobStatus",
     "JobType",
+    "MarketSession",
     "NotificationClass",
     "NotificationStatus",
     "OrderSide",
@@ -31,7 +37,10 @@ __all__ = [
     "PriceSource",
     "ProposalStatus",
     "ProviderStatus",
+    "ReactionStatus",
     "ResearchStatus",
+    "ResolutionMethod",
+    "ResolutionStatus",
     "SourceCategory",
     "SourceProvider",
     "ThesisAction",
@@ -232,6 +241,124 @@ class NotificationStatus(StrEnum):
     SUPPRESSED = "SUPPRESSED"
 
 
+class ResolutionStatus(StrEnum):
+    """Outcome of resolving a classifier company hint to a broker instrument.
+
+    Only ``RESOLVED`` may ever be used to reach an order request.  Every other
+    value blocks progression, and ``AMBIGUOUS`` blocks it *loudly*: two
+    plausible listings is a correctness problem to be settled by a human or a
+    curated alias, never by picking one.
+    """
+
+    PENDING = "PENDING"
+    RESOLVED = "RESOLVED"
+    AMBIGUOUS = "AMBIGUOUS"
+    NOT_FOUND = "NOT_FOUND"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+class ResolutionMethod(StrEnum):
+    """How a resolution was reached, strongest evidence first.
+
+    The order of the members is the order the resolver tries them, and the
+    order a reviewer should trust them in.
+    """
+
+    ISIN_EXACT = "ISIN_EXACT"
+    MANUAL_ALIAS = "MANUAL_ALIAS"
+    TICKER_EXCHANGE = "TICKER_EXCHANGE"
+    NAME_EXCHANGE_CURRENCY = "NAME_EXCHANGE_CURRENCY"
+    HEURISTIC_CANDIDATE = "HEURISTIC_CANDIDATE"
+    """Generates candidates for review.  Never resolves an executable instrument."""
+
+    NONE = "NONE"
+
+
+class AliasType(StrEnum):
+    """What kind of name a curated alias records.
+
+    ``LISTING`` aliases are scoped to an exchange/currency, which is what makes
+    "Alphabet A shares" a different mapping from "Alphabet C shares" without
+    creating a cross-listing ambiguity for the bare name "Alphabet".
+    """
+
+    LEGAL = "LEGAL"
+    COMMON = "COMMON"
+    HISTORICAL = "HISTORICAL"
+    TICKER = "TICKER"
+    LISTING = "LISTING"
+
+
+class InstrumentSupport(StrEnum):
+    """Whether StockBrain will ever price and size this instrument type."""
+
+    SUPPORTED = "SUPPORTED"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+class MarketSession(StrEnum):
+    """Trading session an instant falls in, for an instrument's own exchange."""
+
+    PRE_MARKET = "PRE_MARKET"
+    REGULAR = "REGULAR"
+    AFTER_HOURS = "AFTER_HOURS"
+    OVERNIGHT = "OVERNIGHT"
+    CLOSED = "CLOSED"
+    UNKNOWN = "UNKNOWN"
+
+
+class ReactionStatus(StrEnum):
+    """Whether an event's price reaction could be computed, and why not."""
+
+    OK = "OK"
+    NO_PRICE_AT_EVENT = "NO_PRICE_AT_EVENT"
+    NO_CURRENT_PRICE = "NO_CURRENT_PRICE"
+    NO_DATA = "NO_DATA"
+    UNSUPPORTED = "UNSUPPORTED"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+
+
+class CapabilityState(StrEnum):
+    """Result of actively probing what a configured provider can reach.
+
+    Deliberately finer-grained than :class:`ProviderStatus`, which is the
+    persisted health vocabulary: "the credentials work but the plan does not
+    cover this feed" and "the credentials are wrong" both degrade a subsystem,
+    but only one of them is fixed by paying for a subscription.
+    """
+
+    HEALTHY = "HEALTHY"
+    AUTH_FAILED = "AUTH_FAILED"
+    ENTITLEMENT_MISSING = "ENTITLEMENT_MISSING"
+    DEGRADED = "DEGRADED"
+    DOWN = "DOWN"
+    DISABLED = "DISABLED"
+    UNKNOWN = "UNKNOWN"
+
+    def to_provider_status(self) -> ProviderStatus:
+        """Map onto the persisted health vocabulary.
+
+        A missing entitlement degrades rather than downs the subsystem: IEX may
+        still answer when SIP does not, and discovery, classification and
+        resolution are all unaffected either way.
+        """
+        return _CAPABILITY_TO_PROVIDER_STATUS[self]
+
+
+class BarTimeframe(StrEnum):
+    """Bar aggregation windows StockBrain requests.
+
+    Values are Alpaca's documented ``timeframe`` strings.  A provider that
+    spells them differently translates at its own boundary.
+    """
+
+    MIN_1 = "1Min"
+    MIN_5 = "5Min"
+    MIN_15 = "15Min"
+    HOUR_1 = "1Hour"
+    DAY_1 = "1Day"
+
+
 class PriceSource(StrEnum):
     """Provenance of a reference price.
 
@@ -245,3 +372,22 @@ class PriceSource(StrEnum):
     YFINANCE = "YFINANCE"
     BROKER_T212 = "BROKER_T212"
     MANUAL = "MANUAL"
+
+
+#: Price sources that may be used to size a real order.  Trading 212's own API
+#: data is *not* here: its API Terms do not guarantee it is real-time, so it is
+#: display and reconciliation only (spec section 12).  yfinance is research
+#: data, not execution data.
+EXECUTION_GRADE_PRICE_SOURCES: frozenset[PriceSource] = frozenset(
+    {PriceSource.ALPACA_SIP, PriceSource.ALPACA_IEX}
+)
+
+_CAPABILITY_TO_PROVIDER_STATUS: dict[CapabilityState, ProviderStatus] = {
+    CapabilityState.HEALTHY: ProviderStatus.HEALTHY,
+    CapabilityState.AUTH_FAILED: ProviderStatus.DOWN,
+    CapabilityState.ENTITLEMENT_MISSING: ProviderStatus.DEGRADED,
+    CapabilityState.DEGRADED: ProviderStatus.DEGRADED,
+    CapabilityState.DOWN: ProviderStatus.DOWN,
+    CapabilityState.DISABLED: ProviderStatus.DISABLED,
+    CapabilityState.UNKNOWN: ProviderStatus.UNKNOWN,
+}

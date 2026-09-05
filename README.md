@@ -29,6 +29,13 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
   resolved by reconciliation, never by resending.
 * Trading 212 **live** execution is hard-disabled by default and cannot be
   enabled by accident (see [Execution gate](#execution-gate)).
+* A model's ticker hint is a search key, never an identity. Only a Trading 212
+  instrument the broker itself supplied can reach an order request, and an
+  ambiguous listing — a share class, an ADR, a dual listing — blocks rather than
+  resolving to whichever one looked likeliest.
+* A price used to size an order must state its source and its age. Trading 212's
+  own API data is display and reconciliation only; if no execution-grade quote
+  is available, sizing is blocked rather than falling back to unsuitable data.
 
 ## Build status
 
@@ -37,7 +44,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | 1 | Skeleton, config, logging, full persistence model, health, GUI shell, Docker | **done** |
 | 2 | Discovery ingestion (Alpaca news WS, Firecrawl, SEC EDGAR), dedupe, job queue | **done** |
 | 3 | DeepSeek event classifier, semantic dedupe, LLM telemetry and budgets | **done** |
-| 4 | Instrument resolution and market data | not started |
+| 4 | Instrument resolution and market data | **done** |
 | 5 | Pinned TradingAgents research engine | not started |
 | 6 | Risk engine, proposals, web approval | not started |
 | 7 | Telegram bot | not started |
@@ -215,6 +222,10 @@ advice.
 * Approval tokens are opaque and stored only as SHA-256 hashes. Order parameters
   are never accepted from a callback; they are re-read from the database under
   lock.
+* There are still **zero state-changing HTTP routes**, and no broker mutation
+  endpoint is implemented anywhere. The Trading 212 client that exists reads
+  instrument and exchange metadata and has no order method at all. A test
+  enumerates the route table and the OpenAPI schema to keep this true.
 
 ## Licence
 

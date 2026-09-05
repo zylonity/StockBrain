@@ -60,10 +60,11 @@ stockbrain/
 
   llm/               provider interface, DeepSeek client, pricing, budget, telemetry
   intelligence/      classifier, semantic dedupe, prompts, classification service
-  market_data/       (phase 4)
+  instruments/       resolution ladder, curated aliases, resolve service
+  market_data/       provider protocol, Alpaca adapter, sessions, price reaction
+  broker/            read-only T212 metadata + instrument sync (phase 4)
   risk/              (phase 6)
   telegram/          (phase 7)
-  broker/            (phase 8)
   jobs/              (phase 2+)
 ```
 
@@ -94,6 +95,10 @@ schema therefore enforces:
 | `uq_trade_proposals_active_instrument` — partial unique over non-terminal statuses | At most one live proposal per broker instrument. |
 | `trade_proposals.version` (optimistic lock) + `SELECT ... FOR UPDATE` | A Telegram confirm and a web confirm racing cannot both win. |
 | `uq_approval_actions_opaque_token_hash` | An approval token is single-use and globally unique. |
+| `uq_broker_instruments_broker_broker_ticker` | A concurrent metadata sync cannot duplicate an instrument. |
+| `uq_broker_exchanges_broker_provider_exchange_id` | Nor an exchange. |
+| `uq_company_aliases_authoritative_scope` — partial unique over `(alias, type, exchange, currency) WHERE is_authoritative` | Two authoritative aliases cannot silently contradict each other. |
+| `uq_companies_isin` | A company auto-created from broker metadata is created once, whatever the concurrency. |
 
 `sent_to_broker` is set in the transaction *before* the HTTP request, not after
 the response. That ordering is what makes the index meaningful: it records
@@ -263,6 +268,95 @@ the budget rolls over.
 
 Spend is summed from `llm_calls` rather than a running counter, so it always
 matches the recorded history and needs no reconciliation after a restart.
+
+### Why instrument resolution refuses rather than chooses
+
+An LLM produces a company name and, sometimes, a ticker. Neither is an
+executable identity. The only thing that may reach an order request is a
+`broker_instruments` row that Trading 212 itself supplied, so the resolver
+treats every hint as a *search key* into verified metadata and walks a ladder of
+evidence, strongest first:
+
+| Rung | Evidence | Confidence |
+|---|---|---|
+| 1 | Exact ISIN | 0.99 |
+| 2 | Curated authoritative alias | 0.97 |
+| 3 | Exact ticker + exchange | 0.92 |
+| 4 | Name + exchange + currency | 0.82 |
+| 5 | Weaker heuristics | candidates only — never resolves |
+
+If a rung matches more than one instrument the answer is `AMBIGUOUS`, carrying
+every alternative. That asymmetry is the same one deduplication uses: an
+unresolved company is visible and fixable, while a wrongly resolved one buys the
+wrong security and nobody notices until the fill. Alphabet's share classes,
+Berkshire's A/B, an ADR against its ordinary line, a UK line against a US line,
+a reused ticker and a renamed company all reach ambiguity by the *same* route —
+more than one verified listing fits the evidence — so there is no special case
+for any of them.
+
+Two smaller decisions follow from the same reasoning:
+
+* **A company is created only from an ISIN.** ISIN is the one globally unique
+  security identifier, and `uq_companies_isin` plus `INSERT ... ON CONFLICT`
+  makes "no duplicate companies" a database guarantee rather than a check-then-
+  insert race. An instrument without an ISIN still resolves; it simply has no
+  company row, which is honest rather than invented.
+* **The name-to-company-to-ISIN edge is deliberately cut.** A company row is
+  created *by* a successful resolution, so letting a later resolution look that
+  company up by name would let a resolution become the evidence that
+  re-justifies itself — an ambiguity appearing later would never be noticed. The
+  ticker edge remains, because a ticker is a discriminator in its own right.
+
+### Why the alias table is scoped and exclusive
+
+`company_aliases` is the deterministic escape hatch for names evidence cannot
+settle, so it must not become a source of the ambiguity it removes. An
+*authoritative* alias claims a `(name, type, exchange, currency)` scope, and
+`uq_company_aliases_authoritative_scope` — a partial unique index over exactly
+that tuple — makes a second, contradicting claim impossible. Last-write-wins
+here would let one careless row silently redirect a name to a different
+security.
+
+The bare name of a genuinely multi-listed company gets **no** alias. "Alphabet"
+resolving to GOOGL would be a decision disguised as data; only the
+listing-specific names ("Alphabet class A") are curated.
+
+### Why the exchange of an instrument is derived, not read
+
+Trading 212's instrument payload has no exchange field at all — only a
+`workingScheduleId`. Just `/equity/metadata/exchanges` says which exchange owns
+that schedule. So the sync fetches exchanges first, stores the schedules with
+their dated time events, and fills `broker_instruments.exchange` from the map.
+An instrument whose schedule is missing keeps a NULL exchange rather than one
+guessed from its ticker suffix, and that suffix is recorded separately as
+`market_code` so the derivation is visible for what it is.
+
+The stored time events pay for themselves twice: they are also the only
+holiday-aware session data in the system, so "was this event pre-market?" is
+answered from the broker's real calendar rather than a hard-coded clock. The
+clock fallback exists for US listings whose schedule is not loaded, and it says
+so — every session verdict carries its own source and whether it knows about
+holidays.
+
+### Why a market-data provider is probed, not trusted
+
+Alpaca's plans differ by *feed*, and a request for a feed the account does not
+own fails with an HTTP 403 that looks exactly like a bad credential. Assuming
+entitlement would mean discovering the truth at the moment a proposal needs a
+price. So the startup sequence issues one quote request and records what came
+back as `HEALTHY` / `AUTH_FAILED` / `ENTITLEMENT_MISSING` / `DEGRADED` / `DOWN` /
+`DISABLED` — finer-grained than the persisted `ProviderStatus` vocabulary,
+because "your key is wrong" and "you have not paid for SIP" need opposite
+responses even though both degrade the same subsystem.
+
+A missing entitlement never crashes anything and never silently substitutes a
+feed. Ingestion, classification and instrument resolution do not consult market
+data at all, so they are structurally unaffected; what stops is *sizing*, and it
+stops through one tested predicate, `quote_blockers`, rather than a condition
+rewritten at each call site. Trading 212's own price data can never clear that
+bar: `PriceSource.BROKER_T212` is simply absent from
+`EXECUTION_GRADE_PRICE_SOURCES`, so being the only number available does not make
+it usable.
 
 ## Untrusted content
 

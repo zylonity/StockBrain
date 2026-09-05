@@ -18,18 +18,29 @@ from dataclasses import dataclass, field
 
 import sqlalchemy as sa
 
+from stockbrain.broker.instrument_sync import InstrumentSyncService
+from stockbrain.broker.trading212_metadata import Trading212MetadataClient
 from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
+from stockbrain.db.models.companies import BrokerInstrument, EventCompanyImpact
 from stockbrain.db.models.sources import Event
 from stockbrain.db.models.system import AppSetting, DiscoveryQuery, DiscoveryTopic
 from stockbrain.db.session import Database
-from stockbrain.enums import EventStatus, JobType, ProviderStatus
+from stockbrain.enums import (
+    Broker,
+    CapabilityState,
+    EventStatus,
+    JobType,
+    ProviderStatus,
+    ResolutionStatus,
+)
 from stockbrain.errors import ProviderAuthError, ProviderEntitlementError
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
 from stockbrain.ingestion.firecrawl import FirecrawlClient
 from stockbrain.ingestion.sec_edgar import SecEdgarClient
 from stockbrain.ingestion.service import IngestionOutcome, IngestionService
 from stockbrain.ingestion.topics import seed_default_topics
+from stockbrain.instruments.service import ResolutionService
 from stockbrain.intelligence.classifier import EventClassifier
 from stockbrain.intelligence.semantic_dedupe import SemanticDeduplicator
 from stockbrain.intelligence.service import ClassificationService
@@ -42,6 +53,8 @@ from stockbrain.llm.budget import BudgetGuard, BudgetStatus
 from stockbrain.llm.deepseek import DeepSeekClient
 from stockbrain.llm.telemetry import LlmTelemetry
 from stockbrain.logging import get_logger
+from stockbrain.market_data.alpaca import AlpacaMarketDataClient
+from stockbrain.market_data.base import ProviderCapability
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
 
@@ -84,6 +97,11 @@ class ServiceContainer:
     classification: ClassificationService | None = field(default=None, init=False)
     budget: BudgetGuard | None = field(default=None, init=False)
 
+    t212_metadata: Trading212MetadataClient | None = field(default=None, init=False)
+    instrument_sync: InstrumentSyncService | None = field(default=None, init=False)
+    resolution: ResolutionService | None = field(default=None, init=False)
+    market_data: AlpacaMarketDataClient | None = field(default=None, init=False)
+
     _stream_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -117,6 +135,19 @@ class ServiceContainer:
         # User-Agent or it answers 403.
         if settings.sec_enabled and settings.sec_contact_email.strip():
             self.sec = SecEdgarClient(settings)
+
+        if alpaca_configured and settings.alpaca_market_data_enabled:
+            self.market_data = AlpacaMarketDataClient(settings)
+
+        # Read-only metadata access. This client has no order method at all --
+        # broker mutations arrive in Phase 8, behind the four-gate live check.
+        if settings.t212_metadata_enabled and settings.broker_credentials_present:
+            self.t212_metadata = Trading212MetadataClient(settings)
+            self.instrument_sync = InstrumentSyncService(self.database, self.t212_metadata)
+
+        # Resolution reads metadata already in the database, so it exists even
+        # with no broker credentials; it then honestly reports NOT_FOUND.
+        self.resolution = ResolutionService(self.database, broker=Broker.TRADING212)
 
         if settings.classifier_enabled and settings.deepseek_api_key.get_secret_value():
             self.deepseek = DeepSeekClient(settings, max_attempts=settings.deepseek_max_attempts)
@@ -158,7 +189,9 @@ class ServiceContainer:
     # ------------------------------------------------------------------
     async def start(self, *, instance_id: str) -> None:
         register_ingestion_handlers(
-            self.registry, classifier_available=self.classification is not None
+            self.registry,
+            classifier_available=self.classification is not None,
+            instrument_sync_available=self.instrument_sync is not None,
         )
 
         async with self.database.transaction() as session:
@@ -175,6 +208,13 @@ class ServiceContainer:
             queue=self.queue,
         )
         await self.runner.start()
+
+        # Spec section 23 steps 8 and 12: probe what Alpaca can actually reach,
+        # and refresh instrument metadata if it has gone stale. Both are
+        # best-effort -- a provider failure degrades its own subsystem and
+        # leaves ingestion, classification and the API running.
+        await self.check_market_data_capability()
+        await self._enqueue_instrument_refresh_if_stale()
 
         self.scheduler = Scheduler(self.database)
         self._register_schedules(self.scheduler)
@@ -195,7 +235,14 @@ class ServiceContainer:
             await self.scheduler.stop()
         if self.runner is not None:
             await self.runner.stop()
-        for client in (self.alpaca_news, self.firecrawl, self.sec, self.deepseek):
+        for client in (
+            self.alpaca_news,
+            self.firecrawl,
+            self.sec,
+            self.deepseek,
+            self.t212_metadata,
+            self.market_data,
+        ):
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.aclose()
@@ -247,6 +294,32 @@ class ServiceContainer:
                     jitter_ratio=0.05,
                 )
             )
+        if self.instrument_sync is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="instrument_refresh",
+                    interval_seconds=self.settings.instrument_refresh_interval_minutes * 60.0,
+                    run=self._enqueue_instrument_refresh,
+                    initial_delay_seconds=60.0,
+                )
+            )
+        if self.market_data is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="market_data_capability_check",
+                    interval_seconds=900.0,
+                    run=self._refresh_market_data_capability,
+                    jitter_ratio=0.1,
+                )
+            )
+        scheduler.add(
+            ScheduledTask(
+                name="resolve_pending_candidates",
+                interval_seconds=120.0,
+                run=self._enqueue_pending_resolutions,
+                initial_delay_seconds=25.0,
+            )
+        )
         scheduler.add(
             ScheduledTask(
                 name="provider_health_persist",
@@ -314,6 +387,118 @@ class ServiceContainer:
 
     async def _persist_health(self) -> None:
         await self.health.persist(self.database)
+
+    async def _enqueue_instrument_refresh(self) -> None:
+        if self.instrument_sync is None:
+            return
+        async with self.database.transaction() as session:
+            await self.queue.enqueue(
+                session,
+                JobType.INSTRUMENT_REFRESH,
+                payload={"broker": Broker.TRADING212.value},
+                # One outstanding refresh at a time: the endpoint allows one
+                # request per 50 seconds, so a backlog would only ever wait.
+                dedupe_key=f"instruments:{Broker.TRADING212.value}",
+                priority=70,
+            )
+
+    async def _enqueue_instrument_refresh_if_stale(self) -> None:
+        """Startup step 12: refresh broker instruments if they have gone stale."""
+        if self.instrument_sync is None:
+            return
+        async with self.database.session() as session:
+            newest = (
+                await session.execute(
+                    sa.select(sa.func.max(BrokerInstrument.last_refreshed_at)).where(
+                        BrokerInstrument.broker == Broker.TRADING212
+                    )
+                )
+            ).scalar_one_or_none()
+        cutoff = dt.timedelta(hours=self.settings.instrument_staleness_hours)
+        if newest is not None and (utcnow() - newest) < cutoff:
+            log.info("instrument_metadata_fresh", last_refreshed_at=newest.isoformat())
+            return
+        await self._enqueue_instrument_refresh()
+        log.info("instrument_refresh_enqueued_at_startup", reason="stale or never synced")
+
+    async def _enqueue_pending_resolutions(self) -> None:
+        """Sweep impacts whose resolution never ran.
+
+        Covers the cases the post-classification enqueue cannot: impacts created
+        before any instrument metadata existed, and jobs lost to a dying worker.
+        Re-resolving an already-resolved impact is harmless but wasteful, so only
+        PENDING rows are swept -- an AMBIGUOUS result is a decision awaiting a
+        human, not work to retry every two minutes.
+        """
+        async with self.database.transaction() as session:
+            event_ids = (
+                await session.execute(
+                    sa.select(EventCompanyImpact.event_id)
+                    .where(EventCompanyImpact.resolution_status == ResolutionStatus.PENDING)
+                    .group_by(EventCompanyImpact.event_id)
+                    .limit(25)
+                )
+            ).scalars()
+            enqueued = 0
+            for event_id in event_ids:
+                job_id = await self.queue.enqueue(
+                    session,
+                    JobType.RESOLVE_CANDIDATES,
+                    payload={"event_id": str(event_id)},
+                    dedupe_key=f"resolve:{event_id}",
+                    priority=30,
+                )
+                if job_id is not None:
+                    enqueued += 1
+        if enqueued:
+            log.info("resolution_backlog_enqueued", count=enqueued)
+
+    async def check_market_data_capability(
+        self, *, refresh: bool = False
+    ) -> ProviderCapability | None:
+        """Probe Alpaca and record what it can actually reach.
+
+        Never raises: an entitlement gap degrades pricing and nothing else. The
+        precise state (AUTH_FAILED vs ENTITLEMENT_MISSING) is kept in the health
+        record's metrics, because the coarse persisted vocabulary cannot express
+        the difference and the difference is what an operator needs.
+        """
+        if self.market_data is None:
+            return None
+        try:
+            capability = await self.market_data.capability(refresh=refresh)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("market_data_capability_error", error_type=type(exc).__name__)
+            self.health.record(
+                ProviderName.ALPACA_MARKET_DATA,
+                ProviderStatus.DOWN,
+                detail=f"{type(exc).__name__}",
+            )
+            return None
+
+        self.health.record(
+            ProviderName.ALPACA_MARKET_DATA,
+            capability.state.to_provider_status(),
+            detail=capability.detail
+            or (
+                f"feed={capability.feed} realtime_pricing_usable="
+                f"{capability.realtime_pricing_usable}"
+            ),
+            metrics=capability.as_dict(),
+        )
+        if capability.state is CapabilityState.ENTITLEMENT_MISSING:
+            log.warning(
+                "market_data_entitlement_missing",
+                feed=capability.feed,
+                remediation=(
+                    "ingestion, classification and instrument resolution continue; "
+                    "proposal sizing stays blocked rather than using unsuitable data"
+                ),
+            )
+        return capability
+
+    async def _refresh_market_data_capability(self) -> None:
+        await self.check_market_data_capability(refresh=True)
 
     async def _enqueue_pending_classifications(self) -> None:
         """Sweep events still awaiting classification.

@@ -9,7 +9,7 @@ first line of request-building code. Nothing here is guessed. Where a detail has
 not yet been checked in this repository, it is marked as carried from the
 specification and must be re-confirmed before use.
 
-Last verification pass: **2026-09-04** (Phase 3).
+Last verification pass: **2026-09-04** (Phase 4).
 
 ---
 
@@ -129,7 +129,68 @@ Discrepancy worth noting for Phase 8: the order endpoint's security schemes are
 documented as `authWithSecretKey` **or** `legacyApiKeyHeader`, i.e. a legacy
 API-key-only header scheme exists alongside key+secret Basic. The broker adapter
 must target the current key+secret scheme and must not silently fall back to the
-legacy one. To be re-confirmed when the adapter is built.
+legacy one. Re-confirmed in Phase 4: the *metadata* endpoints document the same
+two schemes, and the client sends only the Basic key+secret form.
+
+### Trading 212 — instrument and exchange metadata (Phase 4)
+
+Sources: <https://docs.trading212.com/api>,
+<https://docs.trading212.com/api/instruments/instruments.md>,
+<https://docs.trading212.com/api/instruments/exchanges.md>,
+<https://docs.trading212.com/api/section/rate-limiting>
+
+| Detail | Status |
+|---|---|
+| `GET /api/v0/equity/metadata/instruments`, rate limit **1 req / 50s** | confirmed |
+| `GET /api/v0/equity/metadata/exchanges`, rate limit **1 req / 30s** | confirmed |
+| Both refresh their underlying data every 10 minutes | confirmed |
+| Instrument fields: `addedOn`, `currencyCode`, `extendedHours`, `isin`, `maxOpenQuantity`, `name`, `shortName`, `ticker`, `type`, `workingScheduleId` | confirmed |
+| `type` enum: `CRYPTOCURRENCY ETF FOREX FUTURES INDEX STOCK WARRANT CRYPTO CVR CORPACT` | confirmed |
+| Exchange fields: `id`, `name`, `workingSchedules[].id`, `workingSchedules[].timeEvents[].date/.type` | confirmed |
+| `timeEvents.type` enum: `OPEN CLOSE BREAK_START BREAK_END PRE_MARKET_OPEN AFTER_HOURS_OPEN AFTER_HOURS_CLOSE OVERNIGHT_OPEN` | confirmed |
+| Documented failure statuses for both endpoints: 401, 403, 408, 429 | confirmed |
+| Response headers `x-ratelimit-limit`, `-period`, `-remaining`, `-reset`, `-used` | confirmed |
+| Rate limits apply **per account**, not per API key or per IP | confirmed |
+| API is enabled only for Invest and Stocks ISA accounts, and is in **beta** | confirmed |
+
+**Discrepancies against StockBrain's spec, and what was implemented:**
+
+1. **The instrument payload has no exchange field.** This is the most
+   consequential finding of the phase. An instrument carries only a
+   `workingScheduleId`, and *only* `/equity/metadata/exchanges` says which
+   exchange owns that schedule. Instrument resolution matches on exchange, so a
+   sync that fetched instruments alone would have no exchange to match against.
+   Both endpoints are therefore fetched together, exchanges first, and
+   `broker_instruments.exchange` is **derived** from the schedule map. An
+   instrument whose schedule is absent keeps a NULL exchange rather than one
+   inferred from its ticker.
+2. **There is no `minTradeQuantity`.** The specification assumed one alongside
+   `maxOpenQuantity`. The current documented response has only the maximum. The
+   column stays nullable and is parsed only if a future response supplies it;
+   nothing invents a minimum.
+3. **The rate limits are far stricter than the order endpoint's.** The spec
+   records 50 req/min for market orders and says nothing about metadata. One
+   request per 50 seconds for instruments is a different order of magnitude, and
+   a single shared token bucket would either throttle the exchanges call or
+   overrun the instruments one — so each endpoint gets its own bucket, inside
+   the retry loop so a 429 retry waits for a token too.
+4. **408 is a documented failure status.** Unusual for a GET, and it is treated
+   as transient (the shared client already classifies it that way).
+5. **`x-ratelimit-period` is documented in seconds.** It is recorded verbatim as
+   text, since the header carries no unit.
+6. The docs state the burst model explicitly: a limit of "50 per minute" permits
+   50 requests in the first five seconds, then a wait until `x-ratelimit-reset`.
+   StockBrain paces instead of bursting, because the metadata endpoints have a
+   budget of one.
+
+**Trading 212 pricing rule, re-checked in Phase 4.** The current public API
+documentation exposes no market-data endpoint at all — the metadata endpoints
+carry no prices, and position/order data is account state rather than a quote.
+Nothing in the current documentation guarantees Trading 212 data as real-time
+execution pricing, so the spec section 12 rule stands unchanged and is now
+enforced in code: `PriceSource.BROKER_T212` is absent from
+`EXECUTION_GRADE_PRICE_SOURCES`, and `quote_blockers` refuses any quote carrying
+it. Phase 4 implements no Trading 212 price path of any kind.
 
 ### Alpaca news — stream and REST
 
@@ -169,6 +230,78 @@ Sources: <https://docs.alpaca.markets/docs/streaming-real-time-news>,
 Rate-limit headers on the REST endpoint are `X-RateLimit-Limit` (100/min),
 `-Remaining` and `-Reset`; the client parses these case-insensitively and keeps a
 client-side token bucket below the ceiling.
+
+### Alpaca market data — quotes, trades, bars, entitlement
+
+Sources: <https://docs.alpaca.markets/us/reference/stocklatestquotesingle-1>,
+<https://docs.alpaca.markets/us/reference/stocklatesttradesingle-1>,
+<https://docs.alpaca.markets/us/reference/stockbarsingle-1>,
+<https://docs.alpaca.markets/us/docs/about-market-data-api>,
+<https://docs.alpaca.markets/us/docs/historical-stock-data-1>,
+<https://docs.alpaca.markets/us/docs/market-data-faq>
+
+| Detail | Status |
+|---|---|
+| Base `https://data.alpaca.markets` (sandbox `data.sandbox.alpaca.markets`) | confirmed |
+| `GET /v2/stocks/{symbol}/quotes/latest` -> `{symbol, quote:{t,bx,bp,bs,ax,ap,as,c,z}}` | confirmed |
+| `GET /v2/stocks/{symbol}/trades/latest` -> `{symbol, trade:{t,x,p,s,c,i,z}}` | confirmed |
+| `GET /v2/stocks/{symbol}/bars` -> `{symbol, bars:[{t,o,h,l,c,v,n,vw}], next_page_token}` | confirmed |
+| Auth `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` (HTTP Basic also accepted) | confirmed |
+| Rate-limit headers `X-RateLimit-Limit` / `-Remaining` / `-Reset` | confirmed |
+| Basic plan: 200 historical req/min, IEX real-time only, 15-minute SIP delay | confirmed |
+| Algo Trader Plus ($99/mo): all US exchanges, 10,000 req/min | confirmed |
+| `0` on a bid or ask means "no active bid/ask", not a price of zero | confirmed |
+| Bars `limit` max 10,000, default 1,000; pagination via `next_page_token` | confirmed |
+
+**Discrepancies against StockBrain's spec, and what was implemented:**
+
+1. **The `feed` enum is wider than the spec's, and differs per endpoint.** The
+   spec lists `iex` / `sip` / `delayed_sip`. The *latest* endpoints now accept
+   `sip`, `iex`, `delayed_sip`, `otc`, `boats` (Blue Ocean ATS overnight) and
+   `overnight`. The **historical** endpoints accept only `iex`, `sip`, `otc` and
+   `boats` — `delayed_sip` and `overnight` are not legal bars feeds. Forwarding
+   the configured feed blindly would 400 every bars request for a deployment
+   using delayed SIP, so the bars call maps an unsupported feed onto `iex` and
+   records on every bar which feed actually produced it. StockBrain does not
+   offer `otc` (needs a special broker-partner subscription), `boats` or
+   `overnight` as configuration values, because none maps to an execution-grade
+   price source for a US equity position.
+2. **The default feed depends on the account's subscription** —
+   documented as "`sip` if the user has the unlimited subscription, otherwise
+   `iex`". An omitted `feed` parameter therefore *means something different per
+   account*, which is exactly the DeepSeek `thinking` trap. The feed is sent
+   explicitly on every request and a test asserts it.
+3. **HTTP 403 means both "bad credential" and "missing entitlement".** The FAQ
+   documents the entitlement case as a 403 whose body is
+   `{"code":42210000,"message":"subscription does not permit querying recent SIP
+   data"}`. The shared HTTP client maps 401/403 to `ProviderAuthError` and 402 to
+   `ProviderEntitlementError`, so Alpaca's entitlement failures would have been
+   misclassified as credential failures — fatal instead of degrading. A
+   per-provider `refine_error` hook now inspects the body and re-classifies;
+   both cases are tested. This is why the spec's assumption that entitlement
+   surfaces as a distinct status does not hold.
+4. **The spec's `MarketDataProvider` protocol is `quote()` / `bars()`.** The
+   implemented interface adds `latest_trade()` and `capability()`: a trade print
+   is the fallback reference price when a venue has no live two-sided quote, and
+   the capability probe is how spec section 23 step 8's "Alpaca entitlement
+   check" is actually performed.
+5. **Sizes are in shares, not round lots, since 3 November 2025** — the schema
+   notes the change explicitly. Recorded as integers with no lot conversion.
+6. **Quote/trade timestamps are RFC-3339 with nanosecond precision.** Python's
+   `datetime` truncates to microseconds; the age calculation is in milliseconds,
+   so the loss is immaterial, but nothing rounds a timestamp before comparing it.
+7. Alpaca answers 403 (not 401) for an unauthenticated request in the documented
+   FAQ, while the OpenAPI definition lists 401 for missing/invalid auth headers.
+   Both are handled identically.
+
+**Entitlement posture.** SIP access is never assumed. `ALPACA_STOCK_FEED`
+defaults to `iex`, the only feed available without a paid subscription. The
+startup probe issues exactly one quote request and records
+`HEALTHY` / `AUTH_FAILED` / `ENTITLEMENT_MISSING` / `DEGRADED` / `DOWN` /
+`DISABLED`. A missing entitlement degrades pricing only: ingestion,
+classification and instrument resolution are structurally unaffected, and
+proposal sizing is blocked by `quote_blockers` rather than falling back to
+Trading 212 or yfinance data.
 
 ### Firecrawl v2 search
 
@@ -235,12 +368,6 @@ Sources: <https://www.sec.gov/search-filings/edgar-application-programming-inter
 ---
 
 ## Carried from the specification — verify before implementing
-
-### Alpaca market data (Phase 4)
-
-The `iex` / `sip` / `delayed_sip` stock feeds are not yet used. Entitlement is
-subscription-dependent, so a startup capability check is required before relying
-on any of them for pre-trade pricing.
 
 ### FRED (Phase 5)
 

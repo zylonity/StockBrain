@@ -16,7 +16,12 @@ from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import Company
 from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic
 from stockbrain.enums import JobType, ProviderStatus
-from stockbrain.errors import ProviderAuthError, ProviderEntitlementError, ProviderError
+from stockbrain.errors import (
+    ProviderAuthError,
+    ProviderEntitlementError,
+    ProviderError,
+    ProviderRateLimited,
+)
 from stockbrain.ingestion.base import DiscoveryQuerySpec
 from stockbrain.ingestion.service import IngestionOutcome
 from stockbrain.jobs.registry import HandlerContext, JobRegistry
@@ -201,6 +206,21 @@ async def handle_classify_event(context: HandlerContext) -> None:
         return
 
     services.health.record(ProviderName.DEEPSEEK, ProviderStatus.HEALTHY)
+
+    # The pipeline continues here: a classified event with affected companies
+    # gets its hints resolved to verified instruments. The dedupe key means a
+    # redelivered classify job cannot queue a second resolve for the same event.
+    if result.company_count:
+        target = result.merged_into or event_id
+        async with context.database.transaction() as session:
+            await services.queue.enqueue(
+                session,
+                JobType.RESOLVE_CANDIDATES,
+                payload={"event_id": str(target)},
+                dedupe_key=f"resolve:{target}",
+                priority=30,
+            )
+
     log.info(
         "classify_event_complete",
         event_id=str(event_id),
@@ -239,7 +259,77 @@ async def handle_alpaca_backfill(context: HandlerContext) -> None:
     )
 
 
-def register_ingestion_handlers(registry: JobRegistry, *, classifier_available: bool) -> None:
+async def handle_instrument_refresh(context: HandlerContext) -> None:
+    """Refresh Trading 212 instrument and exchange metadata.
+
+    Read-only in the strictest sense: the client this reaches has no order
+    method to call. The sync is an upsert, so a redelivered job re-writes the
+    same rows rather than duplicating or briefly emptying the table that
+    instrument resolution reads.
+    """
+    services = context.services
+    sync = services.instrument_sync
+    if sync is None:
+        raise RuntimeError("trading212 metadata client is not configured")
+
+    try:
+        result = await sync.sync()
+    except ProviderAuthError as exc:
+        services.health.record(ProviderName.TRADING212, ProviderStatus.DOWN, detail=str(exc)[:300])
+        raise
+    except ProviderRateLimited as exc:
+        # The documented limits are one request per 30-50 seconds; a 429 means
+        # something else already spent the budget, not that the sync is broken.
+        services.health.record(
+            ProviderName.TRADING212, ProviderStatus.DEGRADED, detail=str(exc)[:300]
+        )
+        raise
+    except ProviderError as exc:
+        services.health.record(
+            ProviderName.TRADING212, ProviderStatus.DEGRADED, detail=str(exc)[:300]
+        )
+        raise
+
+    services.health.record(
+        ProviderName.TRADING212,
+        ProviderStatus.HEALTHY,
+        detail=f"{result.instruments_written} instruments, {result.exchanges} exchanges",
+        metrics=result.as_dict(),
+    )
+    log.info("instrument_refresh_complete", **result.as_dict())
+
+
+async def handle_resolve_candidates(context: HandlerContext) -> None:
+    """Resolve every company hint on one event to a verified broker instrument.
+
+    Never fails the job for an unresolved company: NOT_FOUND and AMBIGUOUS are
+    *answers*, recorded on the row for a human to see. Only an infrastructure
+    failure raises.
+    """
+    services = context.services
+    resolution = services.resolution
+    if resolution is None:  # pragma: no cover - always constructed
+        raise RuntimeError("resolution service is not configured")
+
+    event_id = uuid.UUID(str(context.payload["event_id"]))
+    result = await resolution.resolve_event(event_id)
+    log.info(
+        "resolve_candidates_job_complete",
+        event_id=str(event_id),
+        considered=result.considered,
+        resolved=result.resolved,
+        ambiguous=result.ambiguous,
+        not_found=result.not_found,
+        unsupported=result.unsupported,
+    )
+
+
+def register_ingestion_handlers(
+    registry: JobRegistry,
+    *,
+    classifier_available: bool,
+    instrument_sync_available: bool = False,
+) -> None:
     """Register the handlers this deployment can actually run.
 
     ``CLASSIFY_EVENT`` is registered only when a classifier is configured.
@@ -253,3 +343,9 @@ def register_ingestion_handlers(registry: JobRegistry, *, classifier_available: 
     registry.register("ALPACA_NEWS_BACKFILL", handle_alpaca_backfill)
     if classifier_available:
         registry.register(JobType.CLASSIFY_EVENT.value, handle_classify_event)
+    if instrument_sync_available:
+        registry.register(JobType.INSTRUMENT_REFRESH.value, handle_instrument_refresh)
+    # Resolution needs no provider -- it reads metadata already in the database --
+    # so it is always registered. Without a sync it simply reports NOT_FOUND,
+    # which is the honest answer rather than a job that cannot run.
+    registry.register(JobType.RESOLVE_CANDIDATES.value, handle_resolve_candidates)

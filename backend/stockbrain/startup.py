@@ -150,7 +150,11 @@ def register_static_provider_states(settings: Settings, registry: ProviderHealth
         registry.set_disabled(ProviderName.ALPACA_NEWS, "ALPACA_NEWS_ENABLED is false")
     elif not alpaca_configured:
         registry.set_disabled(ProviderName.ALPACA_NEWS, "Alpaca credentials are not set")
-    if not alpaca_configured:
+    if not settings.alpaca_market_data_enabled:
+        registry.set_disabled(
+            ProviderName.ALPACA_MARKET_DATA, "ALPACA_MARKET_DATA_ENABLED is false"
+        )
+    elif not alpaca_configured:
         registry.set_disabled(ProviderName.ALPACA_MARKET_DATA, "Alpaca credentials are not set")
 
     if not settings.firecrawl_enabled:
@@ -169,7 +173,11 @@ def register_static_provider_states(settings: Settings, registry: ProviderHealth
     if not settings.fred_api_key.get_secret_value():
         registry.set_disabled(ProviderName.FRED, "FRED_API_KEY is not set")
 
-    if not settings.broker_credentials_present:
+    if not settings.t212_metadata_enabled:
+        registry.set_disabled(ProviderName.TRADING212, "T212_METADATA_ENABLED is false")
+    elif not settings.broker_credentials_present:
+        # Read-only metadata still needs a key pair; without one the instrument
+        # universe cannot be synced and resolution reports NOT_FOUND honestly.
         registry.set_disabled(ProviderName.TRADING212, "Trading 212 credentials are not set")
 
     if not settings.telegram_enabled:

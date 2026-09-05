@@ -109,9 +109,15 @@ async def test_failure_reschedules_until_the_budget_is_spent(clean_tables: Datab
     async with clean_tables.transaction() as session:
         job = await session.get(Job, job_id)
         assert job is not None
-        job.run_after = utcnow()
+        # The database clock, for the same reason `enqueue` uses it: `claim`
+        # compares `run_after` against PostgreSQL's `now()`, so stamping it with
+        # the application clock leaves the job intermittently unclaimable when
+        # the two drift. This is bug #5 reappearing in a test rather than in
+        # the queue.
+        job.run_after = sa.func.now()
     async with clean_tables.transaction() as session:
-        await queue.claim(session, "w")
+        claimed = await queue.claim(session, "w")
+        assert claimed is not None, "the job should be runnable again after backoff"
         assert await queue.fail(session, job_id, "boom again") is False
 
     async with clean_tables.session() as session:

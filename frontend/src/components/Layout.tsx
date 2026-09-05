@@ -9,6 +9,7 @@ const NAV = [
   { to: "/", label: "Dashboard", enabled: true },
   { to: "/events", label: "Events", enabled: true },
   { to: "/discovery", label: "Discovery", enabled: true },
+  { to: "/instruments", label: "Instruments", enabled: true },
   { to: "/health", label: "System health", enabled: true },
   { to: "/research", label: "Research", enabled: false },
   { to: "/proposals", label: "Proposals", enabled: false },
@@ -51,7 +52,7 @@ export function Layout() {
           Every broker order requires explicit two-stage human approval. No
           automatic retries on broker mutations.
         </span>
-        <span className="mono">phase 2 · discovery ingestion</span>
+        <span className="mono">phase 4 · instruments and market data</span>
       </footer>
     </div>
   );

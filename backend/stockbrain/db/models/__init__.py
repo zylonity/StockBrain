@@ -6,7 +6,9 @@ metadata, which is what Alembic autogenerate relies on.
 
 from stockbrain.db.base import Base
 from stockbrain.db.models.companies import (
+    BrokerExchange,
     BrokerInstrument,
+    BrokerWorkingSchedule,
     Company,
     CompanyAlias,
     EventCompanyImpact,
@@ -37,8 +39,10 @@ __all__ = [
     "ApprovalAction",
     "AuditLog",
     "Base",
+    "BrokerExchange",
     "BrokerInstrument",
     "BrokerOrder",
+    "BrokerWorkingSchedule",
     "Company",
     "CompanyAlias",
     "DiscoveryQuery",

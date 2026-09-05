@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Self
@@ -140,12 +140,14 @@ class ProviderHttpClient:
         backoff_base_seconds: float = 0.5,
         backoff_max_seconds: float = 8.0,
         client: httpx.AsyncClient | None = None,
+        refine_error: Callable[[httpx.Response, Exception], Exception] | None = None,
     ) -> None:
         self.provider = provider
         self._rate_limiter = rate_limiter
         self._max_attempts = max(1, max_attempts)
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
+        self._refine_error = refine_error
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             base_url=base_url,
@@ -269,6 +271,24 @@ class ProviderHttpClient:
             ) from exc
 
     def _classify(self, response: httpx.Response) -> Exception:
+        """Map a failed response onto the exception the caller must react to.
+
+        A provider-specific ``refine_error`` hook may narrow the result, and
+        only that: it is given the already-classified error and may return a
+        different *classification*, never a different retry decision.  Alpaca
+        needs it because it answers HTTP 403 both for a bad credential and for
+        a feed outside the account's plan, and those demand opposite responses.
+        """
+        error = self._classify_by_status(response)
+        if self._refine_error is None:
+            return error
+        try:
+            return self._refine_error(response, error)
+        except Exception:  # pragma: no cover - a hook must never mask the error
+            log.warning("provider_error_refinement_failed", provider=self.provider)
+            return error
+
+    def _classify_by_status(self, response: httpx.Response) -> Exception:
         status = response.status_code
         # The body may echo request parameters; only a short excerpt is kept and
         # it is never interpolated into a log line by this client.

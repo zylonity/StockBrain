@@ -280,3 +280,184 @@ export interface EventFilters {
   offset?: number;
   sinceHours?: number;
 }
+
+// ---------------------------------------------------------------------------
+// Instrument resolution (phase 4)
+//
+// The model's ticker hint and the resolved broker instrument are separate
+// fields on purpose: the UI shows both so it is visible that the hint was a
+// search key and the executable identity came from verified broker metadata.
+// ---------------------------------------------------------------------------
+
+export type ResolutionStatus =
+  | "PENDING"
+  | "RESOLVED"
+  | "AMBIGUOUS"
+  | "NOT_FOUND"
+  | "UNSUPPORTED";
+
+export interface InstrumentCandidate {
+  broker_instrument_id: string;
+  broker_ticker: string;
+  name: string | null;
+  market_symbol: string | null;
+  exchange: string | null;
+  currency: string | null;
+  isin: string | null;
+  instrument_type: string | null;
+  matched_by: string;
+}
+
+export interface Resolution {
+  impact_id: string;
+  event_id: string;
+  event_title: string | null;
+  company_name_hint: string;
+  model_ticker_hint: string | null;
+  model_exchange_hint: string | null;
+  status: ResolutionStatus;
+  method: string | null;
+  confidence: number | null;
+  notes: string | null;
+  resolved_at: string | null;
+  company_id: string | null;
+  company_name: string | null;
+  broker_instrument_id: string | null;
+  broker_ticker: string | null;
+  market_symbol: string | null;
+  exchange: string | null;
+  currency: string | null;
+  isin: string | null;
+  instrument_type: string | null;
+  alternatives: InstrumentCandidate[];
+}
+
+export interface ResolutionListResponse {
+  items: Resolution[];
+  total: number;
+  limit: number;
+  offset: number;
+  counts_by_status: Record<string, number>;
+}
+
+export interface BrokerInstrumentRecord {
+  id: string;
+  broker: string;
+  broker_ticker: string;
+  name: string | null;
+  short_name: string | null;
+  market_symbol: string | null;
+  market_code: string | null;
+  exchange: string | null;
+  currency: string | null;
+  isin: string | null;
+  instrument_type: string | null;
+  extended_hours: boolean;
+  min_trade_quantity: string | null;
+  max_open_quantity: string | null;
+  working_schedule_id: number | null;
+  added_on: string | null;
+  is_active: boolean;
+  company_id: string | null;
+  last_refreshed_at: string | null;
+}
+
+export interface InstrumentSyncStatus {
+  broker: string;
+  configured: boolean;
+  instruments_total: number;
+  instruments_active: number;
+  with_isin: number;
+  with_exchange: number;
+  exchanges: number;
+  working_schedules: number;
+  last_refreshed_at: string | null;
+  rate_limit: Record<string, unknown>;
+}
+
+export interface CompanyAliasRecord {
+  id: string;
+  company_id: string;
+  company_name: string | null;
+  alias: string;
+  alias_normalized: string;
+  alias_type: string;
+  exchange: string | null;
+  currency: string | null;
+  isin: string | null;
+  is_authoritative: boolean;
+  confidence: number;
+  source: string;
+  notes: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Market data
+//
+// Prices arrive as strings, not numbers: they are Decimals server-side and
+// JSON.parse would turn them into binary floats.
+// ---------------------------------------------------------------------------
+
+export type CapabilityState =
+  | "HEALTHY"
+  | "AUTH_FAILED"
+  | "ENTITLEMENT_MISSING"
+  | "DEGRADED"
+  | "DOWN"
+  | "DISABLED"
+  | "UNKNOWN";
+
+export interface MarketDataHealth {
+  provider: string | null;
+  configured: boolean;
+  state: CapabilityState;
+  feed: string | null;
+  detail: string | null;
+  checked_at: string | null;
+  realtime_pricing_usable: boolean;
+  probe_symbol: string | null;
+  probe_quote_age_ms: number | null;
+  max_quote_age_seconds: number;
+  blockers: string[];
+}
+
+export interface Quote {
+  symbol: string;
+  provider: string;
+  feed: string;
+  price_source: string;
+  price: string | null;
+  bid: string | null;
+  ask: string | null;
+  bid_size: number | null;
+  ask_size: number | null;
+  currency: string;
+  provider_timestamp: string;
+  received_at: string;
+  quote_age_ms: number;
+  is_two_sided: boolean;
+  execution_grade: boolean;
+  sizing_blockers: string[];
+}
+
+export interface PriceReaction {
+  symbol: string;
+  event_time: string;
+  status: string;
+  provider: string | null;
+  feed: string | null;
+  price_at_event: string | null;
+  price_at_event_time: string | null;
+  price_at_event_basis: string | null;
+  reference_price: string | null;
+  reference_price_time: string | null;
+  reference_price_basis: string | null;
+  reference_quote_age_ms: number | null;
+  absolute_move: string | null;
+  percent_move: string | null;
+  elapsed_seconds: number;
+  session_at_event: string;
+  session_source: string;
+  session_holiday_aware: boolean;
+  notes: string[];
+}

@@ -4,6 +4,7 @@ import { Layout } from "./components/Layout";
 import { Dashboard } from "./pages/Dashboard";
 import { Discovery } from "./pages/Discovery";
 import { EventDetail } from "./pages/EventDetail";
+import { Instruments } from "./pages/Instruments";
 import { Events } from "./pages/Events";
 import { SystemHealth } from "./pages/SystemHealth";
 
@@ -15,6 +16,7 @@ export function App() {
         <Route path="events" element={<Events />} />
         <Route path="events/:eventId" element={<EventDetail />} />
         <Route path="discovery" element={<Discovery />} />
+        <Route path="instruments" element={<Instruments />} />
         <Route path="health" element={<SystemHealth />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

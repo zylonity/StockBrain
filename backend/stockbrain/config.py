@@ -180,6 +180,19 @@ class Settings(BaseSettings):
     alpaca_news_ws_url: str = "wss://stream.data.alpaca.markets/v1beta1/news"
     alpaca_data_base_url: str = "https://data.alpaca.markets"
     alpaca_stock_feed: Literal["iex", "sip", "delayed_sip"] = "iex"
+    """IEX is the only feed available without a paid subscription, so it is the
+    default. Alpaca also documents ``otc``, ``boats`` and ``overnight`` feeds;
+    StockBrain does not offer them because none maps to an execution-grade
+    price source for a US equity position (see ``docs/sources.md``)."""
+
+    alpaca_market_data_enabled: bool = True
+    market_data_max_quote_age_seconds: float = 15.0
+    """Above this a quote may not size an order (spec section 20's
+    ``max_quote_age_seconds``). Phase 4 records the age; Phase 6 enforces it
+    through :func:`stockbrain.market_data.base.quote_blockers`."""
+
+    market_data_probe_symbol: str = "AAPL"
+    """Liquid US equity used for the one-request startup entitlement probe."""
 
     # ------------------------------------------------------------------
     # Firecrawl
@@ -210,6 +223,16 @@ class Settings(BaseSettings):
     t212_written_consent_confirmed: bool = False
     t212_timeout_seconds: float = 20.0
     execution_mode: ExecutionMode = ExecutionMode.MANUAL_APPROVAL
+
+    t212_metadata_enabled: bool = True
+    instrument_refresh_interval_minutes: int = 360
+    """Trading 212 refreshes instrument metadata every 10 minutes and rate-limits
+    the endpoint to one request per 50 seconds; six-hourly is ample for a
+    universe that changes by a handful of listings a week."""
+
+    instrument_staleness_hours: int = 24
+    """Older than this and the startup sequence enqueues a refresh (spec section
+    23 step 12)."""
 
     # ------------------------------------------------------------------
     # Telegram

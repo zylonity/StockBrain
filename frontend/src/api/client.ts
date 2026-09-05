@@ -8,6 +8,8 @@
  */
 
 import type {
+  BrokerInstrumentRecord,
+  CompanyAliasRecord,
   DiscoveryStatus,
   DiscoveryTopic,
   EventDetail,
@@ -15,8 +17,14 @@ import type {
   EventListResponse,
   ExecutionStatusResponse,
   HealthResponse,
+  InstrumentSyncStatus,
+  MarketDataHealth,
+  PriceReaction,
   ProvidersResponse,
   ReadinessResponse,
+  Resolution,
+  ResolutionListResponse,
+  ResolutionStatus,
 } from "./types";
 
 export class ApiError extends Error {
@@ -80,4 +88,29 @@ export const api = {
     request<DiscoveryStatus>("/api/v1/discovery/status"),
   discoveryTopics: () =>
     request<DiscoveryTopic[]>("/api/v1/discovery/topics"),
+
+  resolutions: (status?: ResolutionStatus, limit = 100) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (status) params.set("resolution_status", status);
+    return request<ResolutionListResponse>(
+      `/api/v1/instruments/resolutions?${params.toString()}`,
+    );
+  },
+  resolution: (impactId: string) =>
+    request<Resolution>(
+      `/api/v1/instruments/resolutions/${encodeURIComponent(impactId)}`,
+    ),
+  instruments: (search: string, limit = 25) =>
+    request<BrokerInstrumentRecord[]>(
+      `/api/v1/instruments?search=${encodeURIComponent(search)}&limit=${limit}`,
+    ),
+  instrumentSyncStatus: () =>
+    request<InstrumentSyncStatus>("/api/v1/instruments/sync-status"),
+  aliases: () => request<CompanyAliasRecord[]>("/api/v1/aliases"),
+  marketDataHealth: () =>
+    request<MarketDataHealth>("/api/v1/market-data/health"),
+  priceReaction: (eventId: string) =>
+    request<PriceReaction[]>(
+      `/api/v1/events/${encodeURIComponent(eventId)}/price-reaction`,
+    ),
 };

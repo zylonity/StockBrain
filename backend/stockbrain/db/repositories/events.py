@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.db.base import utcnow
-from stockbrain.db.models.companies import EventCompanyImpact
+from stockbrain.db.models.companies import BrokerInstrument, EventCompanyImpact
 from stockbrain.db.models.research import LlmCall
 from stockbrain.db.models.sources import Event, EventSourceLink, Source
 from stockbrain.enums import EventStatus, SourceProvider
@@ -128,13 +128,24 @@ class EventRepository:
         ).all()
         return {event_id: int(count) for event_id, count in rows}
 
-    async def impacts_for_event(self, event_id: uuid.UUID) -> list[EventCompanyImpact]:
+    async def impacts_for_event(
+        self, event_id: uuid.UUID
+    ) -> list[tuple[EventCompanyImpact, BrokerInstrument | None]]:
+        """Impacts with the instrument each resolved to, if any.
+
+        Outer-joined rather than lazily loaded: an unresolved impact is the
+        common case and must not cost a query per row to display as unresolved.
+        """
         stmt = (
-            sa.select(EventCompanyImpact)
+            sa.select(EventCompanyImpact, BrokerInstrument)
+            .outerjoin(
+                BrokerInstrument, BrokerInstrument.id == EventCompanyImpact.broker_instrument_id
+            )
             .where(EventCompanyImpact.event_id == event_id)
             .order_by(EventCompanyImpact.materiality_score.desc())
         )
-        return list((await self._session.execute(stmt)).scalars())
+        rows = (await self._session.execute(stmt)).all()
+        return [(impact, instrument) for impact, instrument in rows]
 
     async def llm_calls_for_event(self, event_id: uuid.UUID) -> list[LlmCall]:
         stmt = (
