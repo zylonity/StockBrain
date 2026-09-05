@@ -249,6 +249,7 @@ async def test_market_data_health_reports_disabled_without_credentials(
     assert body["state"] == "DISABLED"
     assert body["realtime_pricing_usable"] is False
     assert body["max_quote_age_seconds"] == 15.0
+    assert body["probe_quote_stale"] is False
     assert body["blockers"]
 
 

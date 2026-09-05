@@ -336,6 +336,72 @@ async def test_a_one_sided_probe_quote_degrades_rather_than_passes() -> None:
     assert capability.realtime_pricing_usable is False
 
 
+async def test_a_stale_probe_quote_stays_healthy_but_is_flagged() -> None:
+    """Observed live on 2026-09-04 at 03:40 UTC: IEX returned the 20:00 close
+    print, 7.7 hours old, and the capability reported itself usable.
+
+    That was accurate -- the feed *is* entitled -- and unreadable next to a 15s
+    sizing limit. Entitlement and freshness are now reported separately: the
+    state stays HEALTHY, because folding closing prints into DEGRADED would make
+    the subsystem look broken every night, and the staleness is stated outright.
+    """
+    stale_body = {
+        "symbol": "AAPL",
+        "quote": {**QUOTE_BODY["quote"], "t": "2026-09-04T20:00:00.006211Z"},  # type: ignore[dict-item]
+    }
+    client = _client(httpx.MockTransport(lambda _: httpx.Response(200, json=stale_body)))
+    capability = await client.capability()
+    await client.aclose()
+
+    assert capability.state is CapabilityState.HEALTHY
+    assert capability.realtime_pricing_usable is True
+    assert capability.probe_quote_stale is True
+    assert capability.probe_quote_age_ms is not None
+    assert capability.probe_quote_age_ms > 15_000
+    assert any("older than the 15s sizing limit" in reason for reason in capability.blockers)
+    assert any("outside market hours" in reason for reason in capability.blockers)
+
+
+async def test_a_fresh_probe_quote_is_not_flagged_stale() -> None:
+    """The flag must not fire during market hours, or it is worthless."""
+    import datetime as real_dt
+
+    fresh = {
+        "symbol": "AAPL",
+        "quote": {
+            **QUOTE_BODY["quote"],  # type: ignore[dict-item]
+            "t": real_dt.datetime.now(real_dt.UTC).isoformat().replace("+00:00", "Z"),
+        },
+    }
+    client = _client(httpx.MockTransport(lambda _: httpx.Response(200, json=fresh)))
+    capability = await client.capability()
+    await client.aclose()
+
+    assert capability.state is CapabilityState.HEALTHY
+    assert capability.probe_quote_stale is False
+    assert capability.blockers == ()
+
+
+async def test_a_stale_quote_is_still_refused_for_sizing() -> None:
+    """The staleness flag changes reporting, never the sizing decision.
+
+    The live probe's own quote carried a 33-dollar AAPL spread and a 7.7-hour
+    age; `quote_blockers` refused it on age, and must keep doing so.
+    """
+    stale_body = {
+        "symbol": "AAPL",
+        "quote": {**QUOTE_BODY["quote"], "t": "2026-09-04T20:00:00.006211Z"},  # type: ignore[dict-item]
+    }
+    client = _client(httpx.MockTransport(lambda _: httpx.Response(200, json=stale_body)))
+    capability = await client.capability()
+    quote = await client.latest_quote("AAPL")
+    await client.aclose()
+
+    blockers = quote_blockers(quote, capability, max_age_seconds=15)
+    assert blockers, "a closing print must never be usable for sizing"
+    assert any("older than" in reason for reason in blockers)
+
+
 async def test_capability_is_cached_until_refresh_is_requested() -> None:
     calls = 0
 

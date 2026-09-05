@@ -123,9 +123,14 @@ minversion = "8.0"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-q --strict-markers"
+# `-m "not live"` is what actually enforces the `live` marker's promise. Without
+# it the live tests were only "opt-in" because no credentials were configured:
+# the moment a real key landed in .env, a plain `pytest` started spending real
+# API calls on every run. An explicit `-m` on the command line overrides this
+# one, so `pytest -m live` still selects them.
+addopts = '-q --strict-markers -m "not live"'
 markers = [
     "integration: requires a live PostgreSQL instance (DATABASE_URL_TEST)",
-    "live: requires real third-party API credentials; never run in CI by default",
+    "live: requires real third-party API credentials; deselected by default, run with -m live",
 ]
 filterwarnings = ["error::DeprecationWarning:stockbrain.*"]

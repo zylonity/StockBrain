@@ -175,6 +175,18 @@ class ProviderCapability:
 
     probe_symbol: str | None = None
     probe_quote_age_ms: int | None = None
+    probe_quote_stale: bool = False
+    """The probe quote was older than the configured maximum age.
+
+    Separate from :attr:`state` on purpose.  Entitlement and freshness are
+    different facts: outside market hours *every* quote is the closing print, so
+    reporting DEGRADED overnight would be noise rather than signal.  The feed is
+    entitled and answering (``state`` HEALTHY, ``realtime_pricing_usable`` True)
+    while sizing right now is still refused by :func:`quote_blockers` on age.
+    A live probe at 03:40 UTC returned a 7.7-hour-old quote and reported itself
+    usable, which was accurate and unreadable at the same time; this flag is
+    what makes the two statements legible together."""
+
     available_feeds: tuple[str, ...] = ()
     blockers: tuple[str, ...] = ()
 
@@ -188,6 +200,7 @@ class ProviderCapability:
             "realtime_pricing_usable": self.realtime_pricing_usable,
             "probe_symbol": self.probe_symbol,
             "probe_quote_age_ms": self.probe_quote_age_ms,
+            "probe_quote_stale": self.probe_quote_stale,
             "available_feeds": list(self.available_feeds),
             "blockers": list(self.blockers),
         }

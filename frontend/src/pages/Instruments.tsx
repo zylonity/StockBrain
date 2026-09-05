@@ -170,11 +170,19 @@ export function Instruments() {
               : "loading"}
           </div>
           <div className="detail">
-            {marketData.data?.realtime_pricing_usable
-              ? `Real-time pricing usable · probe age ${marketData.data.probe_quote_age_ms ?? "—"}ms · ` +
-                `max quote age ${marketData.data.max_quote_age_seconds}s`
-              : (marketData.data?.blockers.join("; ") ??
-                "Pricing unavailable — proposal sizing stays blocked")}
+            {!marketData.data
+              ? "loading"
+              : !marketData.data.realtime_pricing_usable
+                ? (marketData.data.blockers.join("; ") ||
+                  "Pricing unavailable — proposal sizing stays blocked")
+                : marketData.data.probe_quote_stale
+                  ? `Feed entitled, but the last quote is ${Math.round(
+                      (marketData.data.probe_quote_age_ms ?? 0) / 1000,
+                    )}s old (limit ${marketData.data.max_quote_age_seconds}s) — ` +
+                    "sizing stays blocked until a fresh quote arrives"
+                  : `Real-time pricing usable · last quote ${
+                      marketData.data.probe_quote_age_ms ?? "—"
+                    }ms old · limit ${marketData.data.max_quote_age_seconds}s`}
           </div>
         </div>
 

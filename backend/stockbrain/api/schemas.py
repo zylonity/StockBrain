@@ -321,6 +321,7 @@ class MarketDataHealthResponse(ApiModel):
     realtime_pricing_usable: bool = False
     probe_symbol: str | None = None
     probe_quote_age_ms: int | None = None
+    probe_quote_stale: bool = False
     max_quote_age_seconds: float
     blockers: list[str] = Field(default_factory=list)
 

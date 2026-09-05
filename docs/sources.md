@@ -183,11 +183,32 @@ Sources: <https://docs.trading212.com/api>,
    StockBrain paces instead of bursting, because the metadata endpoints have a
    budget of one.
 
-**Live verification status: NOT YET PERFORMED.** Everything in the two tables
-above is verified against Trading 212's current *documentation*. No live call
-has ever been made to Trading 212, because no API credentials are configured.
-The following facts are therefore *documented but not observed*, and each has a
-safe-by-construction fallback in the code:
+**Live verification status: ATTEMPTED 2026-09-04, BLOCKED ON HTTP 401.**
+Credentials were supplied and every documented authentication form was rejected
+by the **demo** environment:
+
+```
+GET https://demo.trading212.com/api/v0/equity/metadata/exchanges
+    Basic key:secret            -> HTTP 401, empty body, no x-ratelimit-* headers
+GET https://demo.trading212.com/api/v0/equity/account/summary
+    Basic key:secret            -> HTTP 401, empty body, no x-ratelimit-* headers
+    Basic secret:key (swapped)  -> HTTP 401
+    Authorization: <raw key>    -> HTTP 401   (the documented legacyApiKeyHeader)
+```
+
+The 401 carries an empty body and **no rate-limit headers at all**, which means
+the request is rejected before the rate limiter is consulted -- a useful
+diagnostic: an auth rejection costs no request budget. The credential itself is
+clean (37 alphanumeric characters; secret 43 characters of URL-safe base64, no
+whitespace, no quotes, no inline comment), so this is not a parsing or paste
+error. The most likely cause is that the key pair was generated for the **live**
+account rather than the practice/demo account -- Trading 212 issues keys per
+environment. No live-environment call was made to confirm that: this phase has
+no business authenticating against a real-money account.
+
+Everything in the two tables above therefore remains verified against
+Trading 212's *documentation* only. These facts are still **documented but not
+observed**, and each has a safe-by-construction fallback in the code:
 
 | Unobserved fact | Fallback if the observation differs |
 |---|---|
@@ -197,8 +218,8 @@ safe-by-construction fallback in the code:
 | the five `x-ratelimit-*` headers arrive on every response | `RateLimitSnapshot` fields are all optional; the client paces from its own bucket |
 
 `pytest -m live -s tests/integration/test_phase4_live.py` measures all four in
-two GETs and prints the numbers. Run it and record the results here before
-Phase 6 sizes anything against this metadata.
+two GETs and prints the numbers. Run it with a **demo-environment** key and
+record the results here before Phase 6 sizes anything against this metadata.
 
 **Trading 212 pricing rule, re-checked in Phase 4.** The current public API
 documentation exposes no market-data endpoint at all — the metadata endpoints
@@ -311,14 +332,48 @@ Sources: <https://docs.alpaca.markets/us/reference/stocklatestquotesingle-1>,
    FAQ, while the OpenAPI definition lists 401 for missing/invalid auth headers.
    Both are handled identically.
 
-**Live verification status: NOT YET PERFORMED.** No live call has ever been
-made to Alpaca's market-data API — the news WebSocket has never been connected
-either — because no Alpaca credentials are configured. The IEX entitlement
-claimed by the Basic plan's documentation is therefore *documented but not
-observed*, as is the actual freshness of an IEX quote. The capability probe
-exists precisely so this is discovered at startup and reported rather than
-assumed; until it has run against a real key, `realtime_pricing_usable` has
-never been `True` in this deployment and sizing would be blocked.
+**Live verification PASSED 2026-09-04 03:40 UTC** (`pytest -m live -s
+tests/integration/test_phase4_live.py`, two GETs):
+
+```
+GET /v2/stocks/AAPL/quotes/latest?feed=iex      -> HTTP 200 (capability probe)
+GET /v2/stocks/AAPL/quotes/latest?feed=iex      -> HTTP 200 (observed quote)
+
+feed requested / returned : iex / iex
+capability state          : HEALTHY
+entitlement               : IEX confirmed on the Basic plan
+price source              : ALPACA_IEX
+bid / ask                 : 305.33 / 338.27   (sizes 40 / 40)
+mid                       : 321.80            (Decimal, no float artefacts)
+currency / tape           : USD / C
+conditions                : ["R"]
+provider timestamp        : 2026-09-04T20:00:00.006211+00:00
+quote age                 : 27,618,397 ms  (~7.67 h)
+two-sided                 : True
+sizing blockers           : ["quote is 27618397ms old, older than the 15s limit"]
+```
+
+Everything documented held: the quote schema, the `as`-keyword alias, the tape
+and condition fields, the explicit-feed round trip, and `Decimal` prices.
+
+**Two observations that documentation could not have given, and what changed:**
+
+1. **Outside market hours the "latest" IEX quote is the 16:00 ET closing print**
+   -- here 7.67 hours old, with a $33 spread on AAPL. `quote_blockers` correctly
+   refused it on age, so the safety property held. But `capability()` reported
+   `state: HEALTHY` and `realtime_pricing_usable: True` beside a 15-second
+   limit, which was accurate and unreadable at the same time. Entitlement and
+   freshness are now reported separately: the state stays HEALTHY, because
+   folding closing prints into DEGRADED would make the subsystem look broken
+   every night, and `ProviderCapability.probe_quote_stale` plus an explicit
+   blocker string state the staleness outright. Regression-tested both ways.
+2. **The wide overnight book is a second reason never to size on a stale
+   quote.** A $33 spread on a $321 mid is a 10% round trip. Phase 4 records the
+   spread on the DTO; a spread ceiling belongs to the Phase 6 risk engine, not
+   here, and is noted as a requirement for it.
+
+The Alpaca news WebSocket has still never been connected -- these were REST
+market-data calls only.
 
 **Entitlement posture.** SIP access is never assumed. `ALPACA_STOCK_FEED`
 defaults to `iex`, the only feed available without a paid subscription. The

@@ -384,6 +384,21 @@ class AlpacaMarketDataClient:
             if not usable:
                 blockers.append("probe quote was not two-sided")
             state = CapabilityState.HEALTHY if usable else CapabilityState.DEGRADED
+
+            # Freshness is reported, not folded into the state. Outside market
+            # hours the latest IEX quote is the closing print and is hours old;
+            # that is not an entitlement fault, and calling it one would make the
+            # subsystem read DEGRADED every night. Sizing is still refused, by
+            # `quote_blockers` on age.
+            max_age_ms = self._settings.market_data_max_quote_age_seconds * 1000
+            stale = quote.age_ms > max_age_ms
+            if stale:
+                blockers.append(
+                    f"probe quote is {quote.age_ms}ms old, older than the "
+                    f"{self._settings.market_data_max_quote_age_seconds:g}s sizing limit "
+                    "(expected outside market hours)"
+                )
+
             self._capability = ProviderCapability(
                 provider=self.name,
                 state=state,
@@ -393,6 +408,7 @@ class AlpacaMarketDataClient:
                 realtime_pricing_usable=usable,
                 probe_symbol=symbol,
                 probe_quote_age_ms=quote.age_ms,
+                probe_quote_stale=stale,
                 available_feeds=(self._feed,),
                 blockers=tuple(blockers),
             )
@@ -402,6 +418,7 @@ class AlpacaMarketDataClient:
                 feed=self._feed,
                 state=state.value,
                 quote_age_ms=quote.age_ms,
+                quote_stale=stale,
             )
             return self._capability
 

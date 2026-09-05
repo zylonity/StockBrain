@@ -417,6 +417,7 @@ export interface MarketDataHealth {
   realtime_pricing_usable: boolean;
   probe_symbol: string | null;
   probe_quote_age_ms: number | null;
+  probe_quote_stale: boolean;
   max_quote_age_seconds: number;
   blockers: string[];
 }

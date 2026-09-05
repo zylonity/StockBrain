@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Iterable
+from pathlib import Path
 
 from fastapi.routing import APIRoute
 from starlette.routing import BaseRoute
@@ -228,3 +229,21 @@ def test_the_t212_basic_credential_is_scrubbed_from_a_free_text_message() -> Non
         None, "error", {"event": "failed", "detail": "auth failed for t212-key-value"}
     )
     assert "t212-key-value" not in repr(result)
+
+
+def test_live_provider_tests_are_deselected_by_default() -> None:
+    """A plain ``pytest`` must not spend real API calls.
+
+    The ``live`` marker only documented an intention. Nothing enforced it, so
+    the live tests were opt-in purely because no credentials were configured --
+    and the moment a real key landed in ``.env`` a plain ``pytest`` started
+    calling Trading 212 and Alpaca on every run, against endpoints rate-limited
+    to one request per fifty seconds.
+    """
+    import tomllib
+
+    config = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    addopts = config["tool"]["pytest"]["ini_options"]["addopts"]
+    assert '-m "not live"' in addopts

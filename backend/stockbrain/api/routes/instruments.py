@@ -357,6 +357,7 @@ async def market_data_health(
         realtime_pricing_usable=capability.realtime_pricing_usable,
         probe_symbol=capability.probe_symbol,
         probe_quote_age_ms=capability.probe_quote_age_ms,
+        probe_quote_stale=capability.probe_quote_stale,
         max_quote_age_seconds=settings.market_data_max_quote_age_seconds,
         blockers=list(capability.blockers),
     )
