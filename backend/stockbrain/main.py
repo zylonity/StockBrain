@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from hmac import compare_digest
 from pathlib import Path
 
 import structlog
@@ -21,6 +22,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from stockbrain.api.auth import (
+    CSRF_COOKIE_NAME,
+    CSRF_HEADER_NAME,
+    SESSION_COOKIE_NAME,
+    STATE_CHANGING_METHODS,
+    is_public_path,
+    read_session,
+    verify_origin,
+    web_auth_blockers,
+)
+from stockbrain.api.routes import auth as auth_routes
 from stockbrain.api.routes import discovery as discovery_routes
 from stockbrain.api.routes import events as events_routes
 from stockbrain.api.routes import execution as execution_routes
@@ -30,6 +42,7 @@ from stockbrain.api.routes import proposals as proposal_routes
 from stockbrain.api.routes import research as research_routes
 from stockbrain.api.routes import system as system_routes
 from stockbrain.config import Settings, get_settings
+from stockbrain.db.base import utcnow as _utcnow
 from stockbrain.db.session import Database
 from stockbrain.errors import (
     ProposalAlreadyConsumed,
@@ -91,6 +104,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             blockers=settings.execution_blockers,
         )
 
+    # Said loudly on every start, because an unauthenticated API in front of a
+    # broker is the one configuration mistake nothing downstream can catch.
+    if auth_blockers := web_auth_blockers(settings):
+        log.warning("web_authentication_not_protecting", blockers=auth_blockers)
+
     services: ServiceContainer | None = None
     if database_ok:
         # Discovery, the job workers and the scheduler all need the database.
@@ -130,6 +148,8 @@ def _register_middleware(app: FastAPI, settings: Settings) -> None:
             allow_headers=["*"],
         )
 
+    _register_auth_middleware(app, settings)
+
     @app.middleware("http")
     async def request_context(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
@@ -157,6 +177,87 @@ def _register_middleware(app: FastAPI, settings: Settings) -> None:
                 duration_ms=round(duration_ms, 2),
             )
         return response
+
+
+def _register_auth_middleware(app: FastAPI, settings: Settings) -> None:
+    """Deny by default; allow only what :func:`is_public_path` names.
+
+    A middleware rather than a per-route dependency, because a dependency has to
+    be *remembered* on every new route and this has to be *un*-remembered. The
+    failure mode of forgetting is a 401 instead of an open door, and
+    ``tests/unit/test_web_auth.py`` enumerates the route table to prove no path
+    escaped.
+
+    Registered before the request-context middleware so it runs *after* it --
+    Starlette applies middleware in reverse registration order -- which means a
+    rejected request still gets a request id and still appears in the metrics.
+    """
+
+    @app.middleware("http")
+    async def require_session(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        path = request.url.path
+        if not settings.web_auth_enabled or is_public_path(path):
+            return await call_next(request)
+
+        blockers = web_auth_blockers(settings)
+        if blockers:
+            # Authentication is on and unusable: no password hash, or no signing
+            # key. Refusing everything is the only safe reading -- "cannot check
+            # a credential" must never mean "do not check a credential".
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "web authentication is enabled but not configured",
+                    "blockers": blockers,
+                },
+            )
+
+        session = read_session(
+            request.cookies.get(SESSION_COOKIE_NAME),
+            secret=settings.stockbrain_secret_key.get_secret_value(),
+            now=_utcnow(),
+        )
+        if session is None:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "authentication required"},
+                headers={"www-authenticate": "Cookie"},
+            )
+
+        if request.method.upper() in STATE_CHANGING_METHODS:
+            # Three independent checks, each of which fails closed, because what
+            # is behind these routes is an irreversible broker order.
+            if not verify_origin(
+                request.headers.get("origin"),
+                request.headers.get("referer"),
+                request.headers.get("host"),
+            ):
+                log.warning("csrf_origin_rejected", path=path, method=request.method)
+                return JSONResponse(
+                    status_code=403, content={"detail": "cross-origin request refused"}
+                )
+            cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
+            header_token = request.headers.get(CSRF_HEADER_NAME)
+            if (
+                not cookie_token
+                or not header_token
+                or not compare_digest(cookie_token, header_token)
+            ):
+                log.warning("csrf_token_rejected", path=path, method=request.method)
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": (
+                            f"a valid {CSRF_HEADER_NAME} header matching the "
+                            f"{CSRF_COOKIE_NAME} cookie is required"
+                        )
+                    },
+                )
+
+        request.state.session = session
+        return await call_next(request)
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
@@ -246,6 +347,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.services = None
 
     app.include_router(health_routes.router)
+    app.include_router(auth_routes.router)
     app.include_router(system_routes.router)
     app.include_router(events_routes.router)
     app.include_router(discovery_routes.router)

@@ -65,6 +65,16 @@ class Source(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     content_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     """SHA-256 of the normalised headline + body."""
 
+    content_fetched_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    """When full article content was fetched from the origin, if it ever was.
+
+    ``NULL`` means the row holds only what the discovery provider handed over --
+    for a Firecrawl search that is a title, a URL, a snippet and a date, which
+    is enough for deduplication and for the cheap classifier to triage but not
+    the article. Fetching the body is a separate, separately budgeted act, so
+    "do we have the body" has to be a fact on the row rather than a guess from
+    the length of ``raw_content``."""
+
     provider_metadata: Mapped[JSONDict] = mapped_column(
         "metadata", nullable=False, server_default=sa.text("'{}'::jsonb")
     )
@@ -91,6 +101,15 @@ class Source(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         sa.Index("ix_sources_content_hash", "content_hash"),
         sa.Index("ix_sources_received_at", "received_at"),
         sa.Index("ix_sources_published_at", "published_at"),
+        # The enrichment sweep asks one question -- "which Firecrawl rows still
+        # have no body?" -- and it asks it on a schedule, so the partial index
+        # keeps that from becoming a scan of every source ever ingested.
+        sa.Index(
+            "ix_sources_unfetched_content",
+            "provider",
+            "received_at",
+            postgresql_where=sa.text("content_fetched_at IS NULL"),
+        ),
     )
 
 

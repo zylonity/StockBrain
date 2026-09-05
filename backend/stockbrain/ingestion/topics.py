@@ -36,15 +36,23 @@ class TopicSeed:
     enabled: bool = True
 
 
-#: Conservative defaults: only a handful enabled, so a fresh install does not
-#: immediately burn Firecrawl credits on sixteen themes.
+#: Conservative defaults.  The intervals below are what a *seeded* topic asks
+#: for; ``FIRECRAWL_MIN_TOPIC_INTERVAL_MINUTES`` is a floor applied on top of
+#: them at enqueue time, so a slower configuration always wins.
+#:
+#: Phase 2 seeded these at 20-60 minutes with **four** topics enabled and nine
+#: enabled queries between them: 21 searches an hour, 504 a day, and -- because
+#: search also scraped every result -- around 12,000 credits a day against a
+#: 1,000-credit monthly allowance.  Two topics are now enabled by default, the
+#: intervals are measured in hours, and thematic drift is a thing you look at
+#: twice a day rather than three times an hour.
 DEFAULT_TOPICS: tuple[TopicSeed, ...] = (
     TopicSeed(
         slug="ai_infrastructure",
         name="AI infrastructure",
         description="Data centre build-out, accelerators, and the power and cooling behind them.",
-        interval_minutes=20,
-        freshness="qdr:h",
+        interval_minutes=720,
+        freshness="qdr:d",
         queries=(
             '"AI data center" investment announcement',
             '"data centre" power infrastructure contract',
@@ -55,7 +63,7 @@ DEFAULT_TOPICS: tuple[TopicSeed, ...] = (
         slug="semiconductors",
         name="Semiconductors",
         description="Fabs, equipment, export controls and supply agreements.",
-        interval_minutes=30,
+        interval_minutes=720,
         freshness="qdr:d",
         queries=(
             "semiconductor fab capacity expansion announcement",
@@ -66,29 +74,31 @@ DEFAULT_TOPICS: tuple[TopicSeed, ...] = (
         slug="power_grid",
         name="Power grid and transformers",
         description="Grid capacity, transformers, transmission and interconnection queues.",
-        interval_minutes=30,
+        interval_minutes=720,
         freshness="qdr:d",
         queries=(
             "grid transformer order backlog utility",
             "transmission interconnection capacity investment",
         ),
+        enabled=False,
     ),
     TopicSeed(
         slug="defence",
         name="Defence procurement",
         description="Contract awards, procurement programmes and defence budgets.",
-        interval_minutes=30,
+        interval_minutes=720,
         freshness="qdr:d",
         queries=(
             "defence contract awarded ministry",
             "military procurement contract award",
         ),
+        enabled=False,
     ),
     TopicSeed(
         slug="nuclear",
         name="Nuclear and SMR",
         description="Reactor projects, small modular reactors, uranium supply.",
-        interval_minutes=60,
+        interval_minutes=1440,
         freshness="qdr:d",
         queries=(
             "nuclear reactor project contract approval",
@@ -100,7 +110,7 @@ DEFAULT_TOPICS: tuple[TopicSeed, ...] = (
         slug="regulation",
         name="Major regulation and sanctions",
         description="Sanctions, export controls and significant regulatory decisions.",
-        interval_minutes=30,
+        interval_minutes=720,
         freshness="qdr:d",
         queries=(
             "sanctions export controls announced company",
@@ -112,7 +122,7 @@ DEFAULT_TOPICS: tuple[TopicSeed, ...] = (
         slug="biotech_regulatory",
         name="FDA and biotech regulatory",
         description="Approvals, rejections, clinical holds and advisory committee outcomes.",
-        interval_minutes=60,
+        interval_minutes=1440,
         freshness="qdr:d",
         queries=(
             "FDA approval rejection complete response letter",
@@ -124,7 +134,7 @@ DEFAULT_TOPICS: tuple[TopicSeed, ...] = (
         slug="supply_chain",
         name="Supply-chain disruption",
         description="Shutdowns, shortages, logistics failures and force majeure.",
-        interval_minutes=45,
+        interval_minutes=1440,
         freshness="qdr:d",
         queries=(
             "plant shutdown production halt supply disruption",
@@ -155,7 +165,10 @@ async def seed_default_topics(session: AsyncSession) -> int:
             description=seed.description,
             enabled=seed.enabled,
             interval_minutes=seed.interval_minutes,
-            result_limit=10,
+            # Per *source*. Five with the two default search sources is ten
+            # billed results, which is exactly one 2-credit billing block; six
+            # would be twelve results and cost double.
+            result_limit=5,
             freshness=seed.freshness,
             include_domains=[],
             exclude_domains=[],

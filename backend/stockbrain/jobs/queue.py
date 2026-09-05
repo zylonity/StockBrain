@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import random
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 import sqlalchemy as sa
@@ -24,9 +25,39 @@ from stockbrain.db.models.system import Job
 from stockbrain.enums import JobStatus, JobType
 from stockbrain.logging import get_logger
 
-__all__ = ["JobQueue"]
+__all__ = ["JobQueue", "QueueHealth"]
 
 log = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class QueueHealth:
+    """A readable snapshot of the job queue."""
+
+    pending: int
+    running: int
+    failed: int
+    dead: int
+    oldest_pending_age_seconds: float | None
+    oldest_pending_job_type: str | None
+    stuck: int
+    stuck_job_types: list[str]
+    counts_by_type: dict[str, int]
+    counts_by_status: dict[str, int]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "pending": self.pending,
+            "running": self.running,
+            "failed": self.failed,
+            "dead": self.dead,
+            "oldest_pending_age_seconds": self.oldest_pending_age_seconds,
+            "oldest_pending_job_type": self.oldest_pending_job_type,
+            "stuck": self.stuck,
+            "stuck_job_types": list(self.stuck_job_types),
+            "counts_by_type": dict(self.counts_by_type),
+            "counts_by_status": dict(self.counts_by_status),
+        }
 
 
 class JobQueue:
@@ -215,3 +246,83 @@ class JobQueue:
             sa.select(sa.func.count()).select_from(Job).where(Job.status == JobStatus.PENDING)
         )
         return int(result.scalar_one())
+
+    async def health(self, session: AsyncSession, *, stuck_after_seconds: int) -> QueueHealth:
+        """The five questions an operator asks when the pipeline stops moving.
+
+        "The queue *is* the audit trail" is only a virtue if somebody can read
+        it. Phase 6's bug 12 is the case in point: 144 events sat in
+        ``CLASSIFYING`` for hours while the container reported healthy and the
+        queue recorded every job as *succeeded*. A queue-depth and
+        oldest-pending reading would have shown it in one glance.
+
+        Every timestamp comparison uses the **database** clock, matching the
+        claim path, so an age reported here means the same thing the claim
+        predicate means.
+        """
+        counts = (
+            await session.execute(
+                sa.select(Job.status, Job.job_type, sa.func.count()).group_by(
+                    Job.status, Job.job_type
+                )
+            )
+        ).all()
+        by_status: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        for status, job_type, count in counts:
+            key = status.value if isinstance(status, JobStatus) else str(status)
+            by_status[key] = by_status.get(key, 0) + int(count)
+            by_type[job_type] = by_type.get(job_type, 0) + int(count)
+
+        oldest = (
+            await session.execute(
+                sa.select(
+                    Job.job_type,
+                    sa.func.extract("epoch", sa.func.now() - Job.created_at),
+                )
+                .where(Job.status == JobStatus.PENDING)
+                .order_by(Job.created_at.asc())
+                .limit(1)
+            )
+        ).first()
+
+        # A job is dead, not merely failed, when it has no attempts left: it
+        # will never run again without an operator, which is precisely why it
+        # has to be counted separately from a job that is between retries.
+        dead = int(
+            (
+                await session.execute(
+                    sa.select(sa.func.count())
+                    .select_from(Job)
+                    .where(
+                        Job.status == JobStatus.FAILED,
+                        Job.attempts >= Job.max_attempts,
+                    )
+                )
+            ).scalar_one()
+        )
+
+        stuck_rows = (
+            await session.execute(
+                sa.select(Job.job_type, sa.func.count())
+                .where(
+                    Job.status == JobStatus.RUNNING,
+                    Job.locked_at.is_not(None),
+                    Job.locked_at < sa.func.now() - dt.timedelta(seconds=stuck_after_seconds),
+                )
+                .group_by(Job.job_type)
+            )
+        ).all()
+
+        return QueueHealth(
+            pending=by_status.get(JobStatus.PENDING.value, 0),
+            running=by_status.get(JobStatus.RUNNING.value, 0),
+            failed=by_status.get(JobStatus.FAILED.value, 0),
+            dead=dead,
+            oldest_pending_age_seconds=(float(oldest[1]) if oldest else None),
+            oldest_pending_job_type=(str(oldest[0]) if oldest else None),
+            stuck=sum(int(count) for _, count in stuck_rows),
+            stuck_job_types=[str(job_type) for job_type, _ in stuck_rows],
+            counts_by_type=by_type,
+            counts_by_status=by_status,
+        )

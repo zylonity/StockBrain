@@ -10,12 +10,15 @@ import datetime as dt
 import uuid
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql as pg
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from stockbrain.db.base import Base, JSONDict, TimestampMixin, UUIDPrimaryKeyMixin
 from stockbrain.db.models._types import pg_enum
 from stockbrain.enums import (
     ActorType,
+    FirecrawlCallKind,
+    FirecrawlCallOutcome,
     JobStatus,
     NotificationClass,
     NotificationStatus,
@@ -27,6 +30,7 @@ __all__ = [
     "AuditLog",
     "DiscoveryQuery",
     "DiscoveryTopic",
+    "FirecrawlCall",
     "Job",
     "Notification",
     "ProviderHealthRecord",
@@ -166,11 +170,114 @@ class DiscoveryQuery(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     results_seen: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, server_default="0")
     credits_used: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, server_default="0")
+    next_eligible_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    """The earliest instant this query may be searched again, written durably.
+
+    Derived from ``last_run_at`` plus the effective interval on success, and
+    from the failure cooldown on failure. Stored rather than recomputed so a
+    process restart cannot reset a cooldown: the Phase 2 incident was
+    partly a scheduler that ran every task once on start-up, and a cooldown
+    that lives only in a Python object is a cooldown a restart pays for."""
+
+    searches_performed: Mapped[int] = mapped_column(
+        sa.BigInteger, nullable=False, server_default="0"
+    )
+    """Lifetime count of paid searches issued for this query."""
 
     topic: Mapped[DiscoveryTopic] = relationship(back_populates="queries")
 
     __table_args__ = (
         sa.UniqueConstraint("topic_id", "query", name="uq_discovery_queries_topic_id_query"),
+    )
+
+
+class FirecrawlCall(UUIDPrimaryKeyMixin, Base):
+    """One paid Firecrawl operation, accounted durably.
+
+    This table is the Firecrawl budget. It exists because the Phase 2
+    implementation counted credits in a Python integer and a Prometheus
+    counter, neither of which survives a restart and neither of which can
+    refuse a call -- so nothing in the system could have stopped 21 searches an
+    hour from emptying the allowance.
+
+    The row is inserted and **committed before the HTTP request**, in the same
+    spirit as ``execution_attempts.sent_to_broker``: the honest question is not
+    "what did we spend" but "what may we already have spent". A call whose
+    process died is therefore charged at its pre-call estimate rather than
+    forgotten. ``credits_charged`` is the single column the budget sums, so the
+    reconciliation from estimate to the provider's own ``creditsUsed`` happens
+    in one place.
+    """
+
+    __tablename__ = "firecrawl_calls"
+
+    kind: Mapped[FirecrawlCallKind] = mapped_column(
+        pg_enum(FirecrawlCallKind, "firecrawl_call_kind"), nullable=False
+    )
+    outcome: Mapped[FirecrawlCallOutcome] = mapped_column(
+        pg_enum(FirecrawlCallOutcome, "firecrawl_call_outcome"),
+        nullable=False,
+        default=FirecrawlCallOutcome.RESERVED,
+        server_default=FirecrawlCallOutcome.RESERVED.value,
+    )
+    reserved_at: Mapped[dt.datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+    """Database clock, always. The daily and monthly windows are computed from
+    the same clock that writes this, so a container with a skewed system time
+    cannot widen its own budget window."""
+
+    completed_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+
+    query_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("discovery_queries.id", ondelete="SET NULL")
+    )
+    topic_slug: Mapped[str | None] = mapped_column(sa.Text)
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("sources.id", ondelete="SET NULL")
+    )
+    target_url: Mapped[str | None] = mapped_column(sa.Text)
+
+    requested_limit: Mapped[int | None] = mapped_column(sa.Integer)
+    requested_sources: Mapped[list[str]] = mapped_column(
+        # A JSONB *array*, so the annotation says so. Several older columns in
+        # this file are annotated ``JSONDict`` while holding a list, which
+        # type-checks only because nothing reads them as one; a new column
+        # should not repeat that.
+        pg.JSONB,
+        nullable=False,
+        server_default=sa.text("'[]'::jsonb"),
+    )
+    scrape_requested: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, server_default=sa.false()
+    )
+
+    credits_reserved: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    """The worst case this call could cost, computed from the published billing
+    model before the request left."""
+
+    credits_reported: Mapped[int | None] = mapped_column(sa.Integer)
+    """``creditsUsed`` as the provider reported it, when it reported one."""
+
+    credits_charged: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    """What the budget counts: the provider's number when there is one, the
+    reservation otherwise. Never lower than what was actually billed as far as
+    StockBrain can tell."""
+
+    results_returned: Mapped[int | None] = mapped_column(sa.Integer)
+    pages_scraped: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
+    http_status: Mapped[int | None] = mapped_column(sa.Integer)
+    error_category: Mapped[str | None] = mapped_column(sa.Text)
+    """The exception class name, never a provider body: a Firecrawl error body
+    can echo the request, and the request carries an Authorization header."""
+
+    __table_args__ = (
+        sa.Index("ix_firecrawl_calls_reserved_at", "reserved_at"),
+        sa.Index("ix_firecrawl_calls_kind_reserved_at", "kind", "reserved_at"),
+        sa.Index("ix_firecrawl_calls_query_id", "query_id"),
+        sa.CheckConstraint("credits_reserved >= 0", name="credits_reserved_non_negative"),
+        sa.CheckConstraint("credits_charged >= 0", name="credits_charged_non_negative"),
+        sa.CheckConstraint("pages_scraped >= 0", name="pages_scraped_non_negative"),
     )
 
 

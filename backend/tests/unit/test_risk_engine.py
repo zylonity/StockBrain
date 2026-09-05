@@ -250,12 +250,27 @@ def test_account_state_at_exactly_the_age_limit_passes() -> None:
 # Currency
 # ---------------------------------------------------------------------------
 def test_cross_currency_sizing_is_refused_rather_than_invented() -> None:
-    """No verified FX source exists, so v1 is same-currency only and says so."""
+    """With ``require_same_currency`` set, a mismatch is refused and says why.
+
+    Phase 9 split the question in two -- ``currency_alignment`` is the policy
+    ("may these differ?") and ``fx_available`` is the capability ("is there a
+    verified rate?"). This asserts the policy half still blocks and still names
+    the setting responsible, so a reader of the refusal knows which knob to
+    turn rather than guessing.
+    """
+    # The real shape of the problem: a GBP account and a USD listing, priced in
+    # USD. Exactly what Phase 6 measured on 14 of 14 live positions.
     decision = ENGINE.evaluate(
-        h.inputs(instrument=h.identity(currency="GBP"), state=h.account(currency="USD"))
+        h.inputs(
+            instrument=h.identity(currency="USD"),
+            state=h.account(currency="GBP"),
+            snapshot=h.quote(currency="USD"),
+        )
     )
     assert "currency_alignment" in decision.block_rule_ids
-    assert any("FX rate source" in reason for reason in decision.blocks)
+    assert any("RISK_REQUIRE_SAME_CURRENCY" in reason for reason in decision.blocks)
+    assert not decision.sizing.executable
+    assert decision.sizing.quantity == 0
 
 
 def test_a_quote_in_another_currency_blocks_even_when_the_instrument_matches() -> None:

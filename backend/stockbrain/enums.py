@@ -384,6 +384,16 @@ class ExecutionFailure(StrEnum):
     CRASH_RECOVERY = "CRASH_RECOVERY"
     """The process died between recording the send and recording the result."""
 
+    PENDING_ORDER_LIMIT = "PENDING_ORDER_LIMIT"
+    """The broker's per-ticker pending-order queue is full, or could not be
+    read.  Nothing was transmitted.
+
+    Its own category rather than a generic ``PREFLIGHT_REFUSED`` because the
+    remedy is completely different: nothing about the trade is wrong and the
+    authorization is still good -- the queue has to drain, or the operator has
+    to cancel something in the app.  Aggregating it with a risk refusal would
+    hide a condition that resolves on its own."""
+
 
 class ReconciliationResult(StrEnum):
     """What a reconciliation pass concluded.
@@ -438,10 +448,37 @@ class JobType(StrEnum):
     SEND_NOTIFICATION = "SEND_NOTIFICATION"
     BROKER_RECONCILE = "BROKER_RECONCILE"
     FIRECRAWL_TOPIC_SEARCH = "FIRECRAWL_TOPIC_SEARCH"
+    FIRECRAWL_ENRICH = "FIRECRAWL_ENRICH"
     SEC_REFRESH = "SEC_REFRESH"
     INSTRUMENT_REFRESH = "INSTRUMENT_REFRESH"
     EXPIRE_PROPOSALS = "EXPIRE_PROPOSALS"
     PROVIDER_HEALTH_CHECK = "PROVIDER_HEALTH_CHECK"
+
+
+class FirecrawlCallKind(StrEnum):
+    """Which paid Firecrawl operation a ledger row accounts for.
+
+    Two kinds, because they bill differently: a search is 2 credits per 10
+    results and a scrape is 1 credit per page.
+    """
+
+    SEARCH = "SEARCH"
+    SCRAPE = "SCRAPE"
+
+
+class FirecrawlCallOutcome(StrEnum):
+    """How a Firecrawl ledger row ended.
+
+    ``RESERVED`` is written and committed *before* the HTTP request, exactly as
+    ``execution_attempts.sent_to_broker`` is, so a process that dies mid-call
+    leaves an over-estimate rather than an unaccounted spend. The budget counts
+    a ``RESERVED`` row at its reserved estimate; it never assumes a call that
+    vanished was free.
+    """
+
+    RESERVED = "RESERVED"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
 
 
 class NotificationClass(StrEnum):

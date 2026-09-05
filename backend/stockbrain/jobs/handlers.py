@@ -12,10 +12,19 @@ import uuid
 
 import sqlalchemy as sa
 
+from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import Company
-from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic
-from stockbrain.enums import JobType, NotificationEvent, NotificationStatus, ProviderStatus
+from stockbrain.db.models.sources import Source
+from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic, Notification
+from stockbrain.enums import (
+    FirecrawlCallKind,
+    JobType,
+    NotificationEvent,
+    NotificationStatus,
+    ProviderStatus,
+    SourceProvider,
+)
 from stockbrain.errors import (
     ProviderAuthError,
     ProviderEntitlementError,
@@ -23,21 +32,38 @@ from stockbrain.errors import (
     ProviderRateLimited,
 )
 from stockbrain.ingestion.base import DiscoveryQuerySpec
+from stockbrain.ingestion.firecrawl_budget import (
+    estimate_scrape_credits,
+    estimate_search_credits,
+)
 from stockbrain.ingestion.service import IngestionOutcome
 from stockbrain.jobs.registry import HandlerContext, JobRegistry
 from stockbrain.logging import get_logger
 from stockbrain.observability.health import ProviderName
 
-__all__ = ["register_ingestion_handlers"]
+__all__ = ["effective_topic_interval_minutes", "register_ingestion_handlers"]
 
 log = get_logger(__name__)
 
 
 async def handle_firecrawl_topic_search(context: HandlerContext) -> None:
-    """Run one stored discovery query and ingest the results."""
+    """Run one stored discovery query and ingest the *metadata* it returns.
+
+    Stage one of two.  The search asks for no page content: it is billed at two
+    credits per ten results, and asking it to scrape every result as well was
+    what emptied the credit allowance in Phase 2.  What comes back -- title,
+    URL, snippet, date -- goes through the same deduplication and the same cheap
+    classifier as every other source, and only what survives that triage earns a
+    paid content fetch (:func:`handle_firecrawl_enrich`).
+
+    Every paid call is reserved against the durable budget *before* it is made.
+    A refusal is a normal outcome, not an error: the query's cooldown is written
+    and the handler returns, so Alpaca news and SEC EDGAR carry on untouched.
+    """
     services = context.services
     client = services.firecrawl
-    if client is None:
+    budget = services.firecrawl_budget
+    if client is None or budget is None:
         raise RuntimeError("firecrawl is not configured")
 
     query_id = uuid.UUID(str(context.payload["query_id"]))
@@ -48,72 +74,281 @@ async def handle_firecrawl_topic_search(context: HandlerContext) -> None:
             log.info("discovery_query_skipped", query_id=str(query_id))
             return
         topic = await session.get(DiscoveryTopic, row.topic_id)
+        if topic is not None and not topic.enabled:
+            log.info("discovery_query_skipped", query_id=str(query_id), reason="topic disabled")
+            return
+        settings = context.services.settings
         spec = DiscoveryQuerySpec(
             query=row.query,
-            limit=topic.result_limit if topic else 10,
+            # The topic's own result_limit is honoured only as a *reduction*.
+            # A topic row asking for 100 results per source is a topic row
+            # asking for a 40-credit search, and the configured ceiling is what
+            # the operator actually agreed to spend.
+            limit=min(
+                topic.result_limit if topic else settings.firecrawl_search_result_limit,
+                settings.firecrawl_search_result_limit,
+            ),
             freshness=topic.freshness if topic else "qdr:d",
             include_domains=list(topic.include_domains) if topic else [],
             exclude_domains=list(topic.exclude_domains) if topic else [],
+            # Never true from the scheduler. Stage two fetches content.
+            scrape_content=False,
         )
         topic_slug = topic.slug if topic else None
+        effective_interval = effective_topic_interval_minutes(
+            topic.interval_minutes if topic else settings.firecrawl_min_topic_interval_minutes,
+            settings,
+        )
+
+    sources = client.search_sources()
+    reservation = await budget.reserve(
+        FirecrawlCallKind.SEARCH,
+        credits_needed=estimate_search_credits(result_limit=spec.limit, source_count=len(sources)),
+        query_id=query_id,
+        topic_slug=topic_slug,
+        target_url=None,
+        requested_limit=spec.limit,
+        requested_sources=sources,
+        scrape_requested=False,
+    )
+    if reservation is None:
+        # Budget exhausted or Firecrawl disabled. Push the query out by a full
+        # cooldown so the scheduler stops re-enqueueing a call that cannot
+        # happen, and degrade *this provider only*.
+        await _defer_discovery_query(
+            context,
+            query_id,
+            cooldown_minutes=context.services.settings.firecrawl_failure_cooldown_minutes,
+            error="firecrawl budget refused the call",
+            count_failure=False,
+        )
+        state = await budget.state()
+        services.health.record(
+            ProviderName.FIRECRAWL,
+            ProviderStatus.DEGRADED,
+            detail="; ".join(state.exhausted_reasons or state.blockers)[:300]
+            or "firecrawl budget exhausted",
+        )
+        return
 
     try:
-        documents = await client.search(spec)
+        outcome = await client.search(spec)
     except ProviderError as exc:
-        async with context.database.transaction() as session:
-            await session.execute(
-                sa.update(DiscoveryQuery)
-                .where(DiscoveryQuery.id == query_id)
-                .values(
-                    last_run_at=utcnow(),
-                    last_error=f"{type(exc).__name__}: {exc}"[:1000],
-                    consecutive_failures=DiscoveryQuery.consecutive_failures + 1,
-                    updated_at=utcnow(),
-                )
-            )
+        await budget.record_failure(
+            reservation,
+            error_category=type(exc).__name__,
+            http_status=getattr(exc, "status_code", None),
+        )
+        await _defer_discovery_query(
+            context,
+            query_id,
+            cooldown_minutes=context.services.settings.firecrawl_failure_cooldown_minutes,
+            error=f"{type(exc).__name__}: {exc}",
+            count_failure=True,
+        )
         services.health.record(
             ProviderName.FIRECRAWL,
             ProviderStatus.DOWN if isinstance(exc, ProviderAuthError) else ProviderStatus.DEGRADED,
             detail=str(exc)[:300],
         )
-        raise
+        # Deliberately not re-raised. The paid call has been accounted, the
+        # cooldown is written, and a job failure here would only add the queue's
+        # own retry on top of a call that costs money each time it is tried.
+        log.warning(
+            "firecrawl_topic_search_failed",
+            topic=topic_slug,
+            error_type=type(exc).__name__,
+        )
+        return
 
-    results = await services.ingestion.ingest_many(list(documents))
+    await budget.record_success(
+        reservation,
+        credits_reported=outcome.credits_reported,
+        results_returned=outcome.results_returned,
+        pages_scraped=outcome.scraped_pages,
+    )
+
+    results = await services.ingestion.ingest_many(list(outcome.documents))
     created = sum(1 for r in results if r.outcome is IngestionOutcome.CREATED_EVENT)
     linked = sum(1 for r in results if r.outcome is IngestionOutcome.LINKED_TO_EVENT)
     duplicates = sum(1 for r in results if r.outcome is IngestionOutcome.DUPLICATE_SOURCE)
 
     async with context.database.transaction() as session:
+        # `now()` is the database clock on purpose: the scheduler compares
+        # `next_eligible_at` against the same clock, and mixing the two is how a
+        # cooldown becomes negotiable by container clock skew.
         await session.execute(
             sa.update(DiscoveryQuery)
             .where(DiscoveryQuery.id == query_id)
             .values(
-                last_run_at=utcnow(),
-                last_success_at=utcnow(),
+                last_run_at=sa.func.now(),
+                last_success_at=sa.func.now(),
                 last_error=None,
                 consecutive_failures=0,
-                results_seen=DiscoveryQuery.results_seen + len(results),
-                credits_used=DiscoveryQuery.credits_used + client.last_credits_used,
-                updated_at=utcnow(),
+                results_seen=DiscoveryQuery.results_seen + outcome.results_returned,
+                searches_performed=DiscoveryQuery.searches_performed + 1,
+                credits_used=DiscoveryQuery.credits_used
+                + (outcome.credits_reported or reservation.credits_reserved),
+                next_eligible_at=sa.func.now() + dt.timedelta(minutes=effective_interval),
+                updated_at=sa.func.now(),
             )
         )
         if topic_slug:
             await session.execute(
                 sa.update(DiscoveryTopic)
                 .where(DiscoveryTopic.slug == topic_slug)
-                .values(last_run_at=utcnow(), updated_at=utcnow())
+                .values(last_run_at=sa.func.now(), updated_at=sa.func.now())
             )
 
     services.health.record(ProviderName.FIRECRAWL, ProviderStatus.HEALTHY)
     log.info(
         "firecrawl_topic_search_complete",
         topic=topic_slug,
-        results=len(results),
+        results_returned=outcome.results_returned,
+        documents=len(outcome.documents),
         created=created,
         linked=linked,
         duplicates=duplicates,
-        credits_used=client.last_credits_used,
+        credits_reported=outcome.credits_reported,
+        credits_reserved=reservation.credits_reserved,
+        next_eligible_in_minutes=effective_interval,
     )
+
+
+async def handle_firecrawl_enrich(context: HandlerContext) -> None:
+    """Stage two: fetch the full content of one already-triaged source.
+
+    Reached only for a source whose event the classifier promoted, so the credit
+    is spent on something the cheap layers already agreed was worth reading.
+    One page, one credit, one reservation, no retry.
+
+    Idempotent: a source that already has ``content_fetched_at`` set is skipped
+    without a call, so a redelivered job cannot pay twice for the same page.
+    """
+    services = context.services
+    client = services.firecrawl
+    budget = services.firecrawl_budget
+    if client is None or budget is None:
+        raise RuntimeError("firecrawl is not configured")
+    if not context.services.settings.firecrawl_scrape_enabled:
+        log.info("firecrawl_enrich_disabled")
+        return
+
+    source_id = uuid.UUID(str(context.payload["source_id"]))
+
+    async with context.database.session() as session:
+        source = await session.get(Source, source_id)
+        if source is None:
+            log.info("firecrawl_enrich_skipped", source_id=str(source_id), reason="missing")
+            return
+        if source.provider is not SourceProvider.FIRECRAWL:
+            # Only Firecrawl rows are Firecrawl's to bill for. An Alpaca or SEC
+            # row already arrived with its body.
+            log.info("firecrawl_enrich_skipped", source_id=str(source_id), reason="not firecrawl")
+            return
+        if source.content_fetched_at is not None:
+            log.info("firecrawl_enrich_skipped", source_id=str(source_id), reason="already fetched")
+            return
+        url = source.canonical_url or source.original_url
+        if not url:
+            log.info("firecrawl_enrich_skipped", source_id=str(source_id), reason="no url")
+            return
+
+    reservation = await budget.reserve(
+        FirecrawlCallKind.SCRAPE,
+        credits_needed=estimate_scrape_credits(pages=1),
+        source_id=source_id,
+        target_url=url,
+        scrape_requested=True,
+    )
+    if reservation is None:
+        # No cooldown to write and nothing to fail: the source keeps its
+        # metadata, the event keeps its classification, and the sweep will offer
+        # it again once the window rolls over.
+        return
+
+    try:
+        scraped = await client.scrape(url)
+    except ProviderError as exc:
+        await budget.record_failure(
+            reservation,
+            error_category=type(exc).__name__,
+            http_status=getattr(exc, "status_code", None),
+        )
+        services.health.record(
+            ProviderName.FIRECRAWL,
+            ProviderStatus.DOWN if isinstance(exc, ProviderAuthError) else ProviderStatus.DEGRADED,
+            detail=str(exc)[:300],
+        )
+        log.warning(
+            "firecrawl_enrich_failed", source_id=str(source_id), error_type=type(exc).__name__
+        )
+        return
+
+    await budget.record_success(
+        reservation,
+        # /v2/scrape reports no creditsUsed, so the reservation stands as the
+        # charge. Documented, not assumed.
+        credits_reported=None,
+        results_returned=1 if scraped.has_content else 0,
+        pages_scraped=1,
+        http_status=scraped.status_code,
+    )
+
+    await services.ingestion.attach_fetched_content(
+        source_id,
+        body=scraped.markdown,
+        fetched_url=scraped.url,
+        status_code=scraped.status_code,
+    )
+    services.health.record(ProviderName.FIRECRAWL, ProviderStatus.HEALTHY)
+    log.info(
+        "firecrawl_enrich_complete",
+        source_id=str(source_id),
+        has_content=scraped.has_content,
+        content_length=len(scraped.markdown or ""),
+    )
+
+
+def effective_topic_interval_minutes(requested_minutes: int, settings: Settings) -> int:
+    """The interval a topic actually runs on.
+
+    A topic row may ask for a *slower* cadence than the configured floor but
+    never a faster one.  Firecrawl is thematic discovery: hours, not tens of
+    minutes.  Enforcing the floor here rather than in the topic editor means an
+    old row, a restored backup or a hand-written UPDATE cannot reintroduce the
+    Phase 2 cadence.
+    """
+    return max(int(requested_minutes), int(settings.firecrawl_min_topic_interval_minutes))
+
+
+async def _defer_discovery_query(
+    context: HandlerContext,
+    query_id: uuid.UUID,
+    *,
+    cooldown_minutes: int,
+    error: str,
+    count_failure: bool,
+) -> None:
+    """Write a durable cooldown for a query that did not produce results.
+
+    Uses the database clock for both the timestamp and the deadline, so the
+    cooldown means the same thing to the scheduler that reads it.  A budget
+    refusal does not increment ``consecutive_failures``: the provider did not
+    fail, StockBrain declined to spend.
+    """
+    async with context.database.transaction() as session:
+        values: dict[str, object] = {
+            "last_run_at": sa.func.now(),
+            "last_error": error[:1000],
+            "next_eligible_at": sa.func.now() + dt.timedelta(minutes=max(1, cooldown_minutes)),
+            "updated_at": sa.func.now(),
+        }
+        if count_failure:
+            values["consecutive_failures"] = DiscoveryQuery.consecutive_failures + 1
+        await session.execute(
+            sa.update(DiscoveryQuery).where(DiscoveryQuery.id == query_id).values(**values)
+        )
 
 
 async def handle_sec_refresh(context: HandlerContext) -> None:
@@ -399,6 +634,12 @@ async def handle_send_notification(context: HandlerContext) -> None:
     the job simply succeeds having told nobody, which is the truth.
     """
     runtime = getattr(context.services, "telegram", None)
+    if "notification_id" in context.payload:
+        # An operational alert rather than a proposal transition. Delivered by
+        # the same job type because the durability, the dedupe key and the
+        # "never auto-resend" rule are identical -- only the rendering differs.
+        await _deliver_alert(context, uuid.UUID(str(context.payload["notification_id"])))
+        return
     proposal_id = uuid.UUID(str(context.payload["proposal_id"]))
     event = NotificationEvent(str(context.payload["event"]))
     detail = context.payload.get("detail")
@@ -420,6 +661,71 @@ async def handle_send_notification(context: HandlerContext) -> None:
         status=result.status.value,
         delivered=result.delivered,
     )
+
+
+async def _deliver_alert(context: HandlerContext, notification_id: uuid.UUID) -> None:
+    """Send one operational alert, and record what happened to it.
+
+    No buttons and no approval token: an alert is information, and offering an
+    action on it would be offering an action nobody validated. A failed send is
+    recorded and **never** retried -- the Phase 7 rule, unchanged: a resend
+    cannot distinguish "never arrived" from "arrived, status write failed".
+    """
+    services = context.services
+    runtime = getattr(services, "telegram", None)
+
+    async with context.database.session() as session:
+        notification = await session.get(Notification, notification_id)
+        if notification is None:
+            log.info("alert_notification_missing", notification_id=str(notification_id))
+            return
+        if notification.status is not NotificationStatus.PENDING:
+            log.debug("alert_notification_already_handled", notification_id=str(notification_id))
+            return
+        title = notification.title
+        body = notification.body
+
+    if runtime is None:
+        async with context.database.transaction() as session:
+            await session.execute(
+                sa.update(Notification)
+                .where(Notification.id == notification_id)
+                .values(
+                    status=NotificationStatus.SUPPRESSED,
+                    error="the Telegram bot is not running",
+                )
+            )
+        log.info("alert_suppressed", notification_id=str(notification_id))
+        return
+
+    try:
+        reference = await runtime.notifier.send_operational_alert(title=title, body=body)
+    except Exception as exc:
+        async with context.database.transaction() as session:
+            await session.execute(
+                sa.update(Notification)
+                .where(Notification.id == notification_id)
+                .values(status=NotificationStatus.FAILED, error=type(exc).__name__)
+            )
+        log.warning(
+            "alert_send_failed",
+            notification_id=str(notification_id),
+            error_type=type(exc).__name__,
+        )
+        return
+
+    async with context.database.transaction() as session:
+        await session.execute(
+            sa.update(Notification)
+            .where(Notification.id == notification_id)
+            .values(
+                status=NotificationStatus.SENT,
+                sent_at=utcnow(),
+                delivery_reference=reference,
+                error=None,
+            )
+        )
+    log.info("alert_sent", notification_id=str(notification_id))
 
 
 #: Transitions after which no button on an existing message can still be valid.
@@ -516,6 +822,7 @@ def register_ingestion_handlers(
     until a key is supplied.
     """
     registry.register(JobType.FIRECRAWL_TOPIC_SEARCH.value, handle_firecrawl_topic_search)
+    registry.register(JobType.FIRECRAWL_ENRICH.value, handle_firecrawl_enrich)
     registry.register(JobType.SEC_REFRESH.value, handle_sec_refresh)
     registry.register("ALPACA_NEWS_BACKFILL", handle_alpaca_backfill)
     if classifier_available:

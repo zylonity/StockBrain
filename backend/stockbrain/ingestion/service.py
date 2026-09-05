@@ -31,6 +31,7 @@ from stockbrain.enums import (
     EventSourceRelationship,
     EventStatus,
     JobType,
+    SourceProvider,
 )
 from stockbrain.ingestion.base import RawSourceDocument
 from stockbrain.ingestion.dedupe import (
@@ -39,7 +40,11 @@ from stockbrain.ingestion.dedupe import (
     find_matching_event,
     title_hash,
 )
-from stockbrain.ingestion.normalizer import NormalizedSource, normalize_document
+from stockbrain.ingestion.normalizer import (
+    NormalizedSource,
+    html_to_text,
+    normalize_document,
+)
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
 from stockbrain.observability.metrics import METRICS
@@ -261,6 +266,118 @@ class IngestionService:
         return IngestionResult(
             outcome=IngestionOutcome.CREATED_EVENT, source_id=source.id, event_id=event.id
         )
+
+    async def attach_fetched_content(
+        self,
+        source_id: uuid.UUID,
+        *,
+        body: str | None,
+        fetched_url: str | None = None,
+        status_code: int | None = None,
+    ) -> bool:
+        """Store content fetched for an already-ingested source.
+
+        The second half of the two-stage discovery model: stage one persisted a
+        title, a URL and a snippet, and this writes the article that a paid
+        content fetch returned for it.
+
+        Three things it deliberately does **not** do:
+
+        * It does not recompute ``content_hash``.  The hash is the row's
+          identity for deduplication, and two searches that returned the same
+          URL must keep colliding on ``uq_sources_canonical_url_hash`` after one
+          of them has been enriched.  Rewriting the hash would make the same
+          article ingestable a second time.
+        * It does not re-run event grouping.  The source already belongs to an
+          event; a longer body is not new evidence of a different one.
+        * It does not overwrite existing content with nothing.  A scrape that
+          came back empty marks the attempt as made -- so no credit is spent on
+          it again -- and leaves the snippet in place.
+
+        Returns whether a body was actually stored.
+        """
+        async with self._database.transaction() as session:
+            source = await session.get(Source, source_id)
+            if source is None:
+                return False
+            stored = bool(body and body.strip())
+            if stored:
+                source.raw_content = body
+                source.normalized_text = html_to_text(body)
+            # Set either way: the fetch happened, and the point of the column is
+            # to stop it happening again.
+            source.content_fetched_at = utcnow()
+            source.provider_metadata = {
+                **source.provider_metadata,
+                "content_fetch": {
+                    "fetched_url": fetched_url,
+                    "status_code": status_code,
+                    "stored": stored,
+                },
+            }
+            session.add(
+                AuditLog(
+                    actor_type=ActorType.SYSTEM,
+                    actor_id="ingestion",
+                    action="SOURCE_CONTENT_FETCHED",
+                    entity_type="source",
+                    entity_id=source_id,
+                    details={
+                        "stored": stored,
+                        "status_code": status_code,
+                        "content_length": len(body or ""),
+                    },
+                )
+            )
+        log.info("source_content_fetched", source_id=str(source_id), stored=stored)
+        return stored
+
+    async def enqueue_content_fetches(self, *, limit: int) -> int:
+        """Offer up to ``limit`` triaged Firecrawl sources for a content fetch.
+
+        The triage is the classifier's, not this method's: only a source whose
+        event the classifier promoted to ``CANDIDATE`` is offered, which is what
+        makes the paid fetch a fetch of something already judged interesting.
+
+        ``limit`` is the caller's bound, and the durable Firecrawl budget is the
+        real one -- this only enqueues, and a job that finds the budget
+        exhausted spends nothing.
+        """
+        enqueued = 0
+        async with self._database.transaction() as session:
+            rows = (
+                await session.execute(
+                    sa.select(Source.id)
+                    .join(EventSourceLink, EventSourceLink.source_id == Source.id)
+                    .join(Event, Event.id == EventSourceLink.event_id)
+                    .where(
+                        Source.provider == SourceProvider.FIRECRAWL,
+                        Source.content_fetched_at.is_(None),
+                        Event.status == EventStatus.CANDIDATE,
+                    )
+                    .order_by(Source.received_at.desc())
+                    .limit(max(1, limit))
+                )
+            ).scalars()
+            for source_id in rows:
+                job_id = await self._queue.enqueue(
+                    session,
+                    JobType.FIRECRAWL_ENRICH,
+                    payload={"source_id": str(source_id)},
+                    # One outstanding fetch per source. Two jobs for one URL is
+                    # two credits for one article.
+                    dedupe_key=f"firecrawl-enrich:{source_id}",
+                    priority=70,
+                    # A paid, non-idempotent-in-cost call. One attempt: the
+                    # sweep offers it again next tick if it is still wanted, and
+                    # that path re-checks the budget.
+                    max_attempts=1,
+                )
+                if job_id is not None:
+                    enqueued += 1
+        if enqueued:
+            log.info("firecrawl_content_fetches_enqueued", count=enqueued)
+        return enqueued
 
     async def ingest_many(self, documents: list[RawSourceDocument]) -> list[IngestionResult]:
         """Ingest a batch, one transaction each.

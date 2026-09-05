@@ -35,7 +35,7 @@ from stockbrain.enums import (
     ThesisAction,
 )
 from stockbrain.risk.config import SpreadPolicy
-from stockbrain.risk.models import ZERO, RiskInputs, RuleResult
+from stockbrain.risk.models import ZERO, FxSnapshot, RiskInputs, RuleResult
 
 __all__ = [
     "EXPOSURE_INCREASING_ACTIONS",
@@ -43,6 +43,7 @@ __all__ = [
     "action_is_executable",
     "cap_rule_results",
     "confidence_size_factor",
+    "fx_rate_drift",
     "gate_results",
     "notional_caps",
     "proposal_ttl",
@@ -93,6 +94,8 @@ def gate_results(inputs: RiskInputs) -> list[RuleResult]:
         _spread_ceiling(inputs),
         _market_session(inputs),
         _currency_alignment(inputs),
+        _fx_available(inputs),
+        _fx_freshness(inputs),
         _current_position(inputs),
         _duplicate_or_conflicting_proposal(inputs),
         _max_active_proposals(inputs),
@@ -366,57 +369,217 @@ def _market_session(inputs: RiskInputs) -> RuleResult:
 
 
 def _currency_alignment(inputs: RiskInputs) -> RuleResult:
-    """Cross-currency sizing is refused rather than guessed.
+    """Whether this deployment permits the instrument and the account to differ.
 
-    Trading 212 documents that orders execute only in the primary account
-    currency and that multi-currency accounts are not supported through the
-    API.  StockBrain has no verified FX source, and a size computed from an
-    invented rate is a wrong size.  So v1 is same-currency only, enforced here
-    and stated in the refusal.
+    A *policy* question, deliberately separate from "is there a rate".
+    ``RISK_REQUIRE_SAME_CURRENCY`` is the operator saying whether cross-currency
+    sizing is allowed at all; :func:`_fx_available` and :func:`_fx_freshness`
+    then say whether it can actually be done. Conflating the two is what let
+    Phase 6's version return ``WARN`` for a permitted mismatch and then hand
+    sizing a GBP ceiling to divide by a USD ask -- a wrong quantity, silently,
+    with a warning nobody had to act on.
+
+    Version 2: the permitted branch is now a ``PASS`` that names the FX gates as
+    the thing standing behind it, and there is no branch that permits a mismatch
+    without one.
     """
     identity_currency = (inputs.identity.currency or "").upper()
     quote_currency = (inputs.quote.currency or "").upper() if inputs.quote else ""
     account_currency = (inputs.account.currency or "").upper() if inputs.account else ""
-    if not inputs.config.require_same_currency:
-        return RuleResult(
-            rule_id="currency_alignment",
-            rule_version=1,
-            outcome=RuleOutcome.WARN,
-            reason="cross-currency sizing is permitted by configuration but has no FX source",
-            observed=f"instrument {identity_currency} / account {account_currency}",
-            threshold="same currency",
-        )
+
     if not account_currency or not identity_currency:
         return RuleResult(
             rule_id="currency_alignment",
-            rule_version=1,
+            rule_version=2,
             outcome=RuleOutcome.BLOCK,
             reason="instrument or account currency is unknown, so sizing cannot be reconciled",
             observed=f"instrument {identity_currency or '?'} / account {account_currency or '?'}",
             threshold="same currency",
         )
+
     mismatches = [
         f"instrument {identity_currency} != account {account_currency}"
         if identity_currency != account_currency
         else "",
-        f"quote {quote_currency} != account {account_currency}"
-        if quote_currency and quote_currency != account_currency
+        # The quote must agree with the *instrument*, not with the account: a
+        # USD listing priced in USD is correct on a GBP account. A quote in a
+        # third currency is a resolution failure and blocks either way, because
+        # no single rate can reconcile three currencies.
+        f"quote {quote_currency} != instrument {identity_currency}"
+        if quote_currency and quote_currency != identity_currency
         else "",
     ]
     problems = [item for item in mismatches if item]
+    observed = (
+        f"instrument {identity_currency} / quote {quote_currency or '?'} "
+        f"/ account {account_currency}"
+    )
+
+    if quote_currency and quote_currency != identity_currency:
+        return RuleResult(
+            rule_id="currency_alignment",
+            rule_version=2,
+            outcome=RuleOutcome.BLOCK,
+            reason=(
+                f"the quote is denominated in {quote_currency} but the listing is "
+                f"{identity_currency}; no single FX rate reconciles three currencies"
+            ),
+            observed=observed,
+            threshold="quote currency == instrument currency",
+        )
+
+    if identity_currency == account_currency:
+        return RuleResult(
+            rule_id="currency_alignment",
+            rule_version=2,
+            outcome=RuleOutcome.PASS,
+            reason=f"instrument, quote and account are all denominated in {account_currency}",
+            observed=observed,
+            threshold="same currency",
+        )
+
+    if inputs.config.require_same_currency:
+        return RuleResult(
+            rule_id="currency_alignment",
+            rule_version=2,
+            outcome=RuleOutcome.BLOCK,
+            reason=(
+                "RISK_REQUIRE_SAME_CURRENCY is true, so cross-currency sizing is not "
+                "permitted by this deployment: " + "; ".join(problems)
+            ),
+            observed=observed,
+            threshold="same currency",
+        )
+
     return RuleResult(
         rule_id="currency_alignment",
-        rule_version=1,
-        outcome=RuleOutcome.BLOCK if problems else RuleOutcome.PASS,
+        rule_version=2,
+        outcome=RuleOutcome.PASS,
         reason=(
-            "cross-currency sizing is unsupported and no FX rate source is configured: "
-            + "; ".join(problems)
-            if problems
-            else f"instrument, quote and account are all denominated in {account_currency}"
+            f"cross-currency sizing is permitted by configuration; the "
+            f"{account_currency}->{identity_currency} conversion is gated by fx_available "
+            f"and fx_freshness"
         ),
-        observed=f"instrument {identity_currency} / quote {quote_currency or '?'} "
-        f"/ account {account_currency}",
-        threshold="same currency",
+        observed=observed,
+        threshold="verified FX rate required",
+    )
+
+
+def _fx_available(inputs: RiskInputs) -> RuleResult:
+    """Whether a usable FX rate exists for this instrument and account.
+
+    The FX analogue of ``quote_available``, and it fails closed in exactly the
+    same way: no rate, the wrong pair, or a source the operator has not
+    permitted to size a trade all ``BLOCK``.  Nothing here can produce a
+    conversion factor of one for two different currencies -- the snapshot type
+    cannot represent that state.
+
+    Staleness is deliberately *not* judged here.  A missing rate and a stale
+    rate demand different responses at send time: the first says nothing about
+    the trade, the second says this deployment is behind.  Splitting them is
+    what lets :mod:`stockbrain.execution.preflight` defer one and retire the
+    other.
+    """
+    account_currency = (inputs.account.currency or "").upper() if inputs.account else ""
+    identity_currency = (inputs.identity.currency or "").upper()
+    if not account_currency or not identity_currency:
+        return _skipped("fx_available", 1, "the account or instrument currency is unknown")
+    if account_currency == identity_currency:
+        return RuleResult(
+            rule_id="fx_available",
+            rule_version=1,
+            outcome=RuleOutcome.PASS,
+            reason=f"no conversion is needed: both sides are {account_currency}",
+            observed=f"{account_currency} == {identity_currency}",
+            threshold="no conversion required",
+        )
+
+    snapshot = inputs.fx
+    if snapshot is None:
+        return RuleResult(
+            rule_id="fx_available",
+            rule_version=1,
+            outcome=RuleOutcome.BLOCK,
+            reason=(
+                f"no FX facts were supplied for {account_currency}->{identity_currency}; "
+                f"a rate is never assumed"
+            ),
+            observed="none",
+            threshold=f"a verified {account_currency}->{identity_currency} rate",
+        )
+    # Staleness is fx_freshness's rule. Everything else the snapshot objected to
+    # belongs here, and an unusable snapshot with only an age objection still
+    # blocks -- through the other rule, in the same evaluation.
+    structural = tuple(reason for reason in snapshot.blockers if " old, older than " not in reason)
+    if structural:
+        return RuleResult(
+            rule_id="fx_available",
+            rule_version=1,
+            outcome=RuleOutcome.BLOCK,
+            reason="; ".join(structural),
+            observed=snapshot.pair or "none",
+            threshold=f"a verified {account_currency}->{identity_currency} rate",
+        )
+    return RuleResult(
+        rule_id="fx_available",
+        rule_version=1,
+        outcome=RuleOutcome.PASS,
+        reason=(
+            f"{snapshot.pair} at {snapshot.rate} from {snapshot.provider} "
+            f"({snapshot.grade.value.lower() if snapshot.grade else 'unknown'}-grade "
+            f"{snapshot.rate_type or 'rate'})"
+        ),
+        observed=f"{snapshot.pair}={snapshot.rate}",
+        threshold=f"a verified {account_currency}->{identity_currency} rate",
+    )
+
+
+def _fx_freshness(inputs: RiskInputs) -> RuleResult:
+    """Whether the FX rate is recent enough to size against.
+
+    The limit lives with the provider grade rather than here: an execution-grade
+    feed and a daily central-bank fixing are held to different budgets, and
+    :func:`stockbrain.fx.base.fx_blockers` is the single place that decides
+    which. This rule reports that verdict in the persisted rule vocabulary.
+    """
+    account_currency = (inputs.account.currency or "").upper() if inputs.account else ""
+    identity_currency = (inputs.identity.currency or "").upper()
+    if not account_currency or not identity_currency:
+        return _skipped("fx_freshness", 1, "the account or instrument currency is unknown")
+    if account_currency == identity_currency:
+        return RuleResult(
+            rule_id="fx_freshness",
+            rule_version=1,
+            outcome=RuleOutcome.PASS,
+            reason="no rate is used, so none can be stale",
+            observed="0",
+            threshold="no conversion required",
+        )
+    snapshot = inputs.fx
+    if snapshot is None:
+        return _skipped("fx_freshness", 1, "no FX facts were supplied")
+    stale = [reason for reason in snapshot.blockers if " old, older than " in reason]
+    if stale:
+        return RuleResult(
+            rule_id="fx_freshness",
+            rule_version=1,
+            outcome=RuleOutcome.BLOCK,
+            reason="; ".join(stale),
+            observed=str(snapshot.age_seconds) if snapshot.age_seconds is not None else "unknown",
+            threshold="within the configured FX age limit",
+        )
+    if snapshot.age_seconds is None:
+        return _skipped("fx_freshness", 1, "the rate carried no measurable age")
+    return RuleResult(
+        rule_id="fx_freshness",
+        rule_version=1,
+        outcome=RuleOutcome.PASS,
+        reason=(
+            f"the {snapshot.pair} rate is {snapshot.age_seconds}s old, within the limit for a "
+            f"{snapshot.grade.value.lower() if snapshot.grade else 'unknown'}-grade source"
+        ),
+        observed=str(snapshot.age_seconds),
+        threshold="within the configured FX age limit",
     )
 
 
@@ -671,24 +834,45 @@ def notional_caps(inputs: RiskInputs) -> list[NotionalCap]:
     )
 
     # The broker's own maximum open quantity for this instrument.
+    #
+    # This is the one cap derived from a *price* rather than from a portfolio
+    # figure, so it arrives in the instrument's currency and has to be converted
+    # before it can sit in a list of account-currency ceilings. Phase 6 could
+    # skip that because the two currencies were required to match; with FX in
+    # play, leaving it unconverted would put a USD number into a GBP minimum and
+    # silently become the binding cap.
     max_open = inputs.identity.max_open_quantity
     price = inputs.quote.mid if inputs.quote else None
+    fx = inputs.fx
     if max_open is not None and price is not None and price > ZERO:
         held_quantity = position.quantity if position else ZERO
         remaining = max(ZERO, max_open - held_quantity)
-        caps.append(
-            NotionalCap(
-                rule_id="broker_max_open_quantity",
-                rule_version=1,
-                limit=remaining * price,
-                observed=str(held_quantity),
-                threshold=str(max_open),
-                reason=(
-                    f"the broker caps open quantity at {max_open} for "
-                    f"{inputs.identity.broker_ticker}; {held_quantity} is already held"
-                ),
+        limit_instrument = remaining * price
+        limit_account: Decimal | None
+        if fx is None or not fx.conversion_required:
+            limit_account = limit_instrument
+        elif fx.usable:
+            limit_account = fx.to_account_currency(limit_instrument)
+        else:
+            # No usable rate: `fx_available` has already blocked, and inventing
+            # a converted ceiling here would be the one thing this whole
+            # subsystem exists to prevent. The cap is omitted rather than
+            # guessed; the decision is blocked regardless.
+            limit_account = None
+        if limit_account is not None:
+            caps.append(
+                NotionalCap(
+                    rule_id="broker_max_open_quantity",
+                    rule_version=2,
+                    limit=limit_account,
+                    observed=str(held_quantity),
+                    threshold=str(max_open),
+                    reason=(
+                        f"the broker caps open quantity at {max_open} for "
+                        f"{inputs.identity.broker_ticker}; {held_quantity} is already held"
+                    ),
+                )
             )
-        )
     return caps
 
 
@@ -799,6 +983,80 @@ def reference_price_drift(
             else (
                 f"the market has moved {drift:.4f} from the {reference_price} reference price, "
                 f"beyond the {max_drift_pct} limit; the proposal no longer describes this trade"
+            )
+        ),
+        observed=str(drift.quantize(Decimal("0.000001"))),
+        threshold=str(max_drift_pct),
+    )
+
+
+def fx_rate_drift(
+    authorized_rate: Decimal | None,
+    current: FxSnapshot | None,
+    *,
+    max_drift_pct: Decimal,
+) -> RuleResult:
+    """Whether the exchange rate has moved away from the one a proposal was sized on.
+
+    The FX analogue of :func:`reference_price_drift`, and it exists for the same
+    reason: a quantity computed against a rate that no longer holds is not the
+    trade the operator authorized. On a GBP account buying a USD listing, a one
+    percent move in GBP/USD moves the trade's account-currency notional by one
+    percent -- straight through the per-trade cap, the cash reserve and the
+    concentration limit, none of which were re-derived.
+
+    Past the envelope the proposal is **invalidated and re-derived**, never
+    silently resized. Re-pricing under somebody's finger is how a person
+    approves a trade they did not read.
+
+    ``WARN`` rather than ``PASS`` when there is nothing to compare: at
+    generation time no rate has been authorized yet, and reporting "no drift"
+    for a comparison that never happened would be a rule that looks like it ran.
+    """
+    if current is None or current.same_currency:
+        return RuleResult(
+            rule_id="fx_rate_drift",
+            rule_version=1,
+            outcome=RuleOutcome.PASS,
+            reason="no conversion is involved, so no rate can drift",
+            observed="0",
+            threshold=str(max_drift_pct),
+        )
+    if authorized_rate is None or authorized_rate <= ZERO:
+        return RuleResult(
+            rule_id="fx_rate_drift",
+            rule_version=1,
+            outcome=RuleOutcome.WARN,
+            reason="no authorized FX rate to compare against",
+            observed=None,
+            threshold=str(max_drift_pct),
+        )
+    if not current.usable or current.rate is None:
+        return RuleResult(
+            rule_id="fx_rate_drift",
+            rule_version=1,
+            outcome=RuleOutcome.BLOCK,
+            reason=(
+                "the authorized FX rate cannot be compared against a current one: "
+                + ("; ".join(current.blockers) or "no current rate")
+            ),
+            observed=None,
+            threshold=str(max_drift_pct),
+        )
+    drift = abs(current.rate - authorized_rate) / authorized_rate
+    ok = drift <= max_drift_pct
+    return RuleResult(
+        rule_id="fx_rate_drift",
+        rule_version=1,
+        outcome=RuleOutcome.PASS if ok else RuleOutcome.BLOCK,
+        reason=(
+            f"{current.pair} has moved {drift:.6f} from the authorized {authorized_rate}, "
+            f"within the {max_drift_pct} limit"
+            if ok
+            else (
+                f"{current.pair} has moved {drift:.6f} from the authorized {authorized_rate}, "
+                f"beyond the {max_drift_pct} limit; the account-currency size the operator "
+                f"approved no longer holds"
             )
         ),
         observed=str(drift.quantize(Decimal("0.000001"))),

@@ -31,6 +31,12 @@ def _settings(**overrides: object) -> Settings:
         "app_env": "test",
         "log_level": "WARNING",
         "stockbrain_secret_key": "test-secret-key-not-used-in-production",
+        # Off for the majority of tests, whose subject is not the login flow.
+        # `tests/unit/test_web_auth.py` and `tests/integration/test_web_auth.py`
+        # turn it on explicitly and are the tests that prove it works -- so
+        # "authentication is enforced" is asserted where it can be asserted
+        # properly rather than incidentally in three hundred other tests.
+        "web_auth_enabled": False,
     }
     if TEST_DATABASE_URL:
         base["database_url"] = TEST_DATABASE_URL
@@ -108,6 +114,9 @@ async def clean_tables(database: Database) -> AsyncIterator[Database]:
         "company_aliases",
         "companies",
         "jobs",
+        "firecrawl_calls",
+        "discovery_queries",
+        "discovery_topics",
         "llm_calls",
         "notifications",
         "audit_log",

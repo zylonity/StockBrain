@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -21,6 +22,7 @@ from stockbrain.enums import SourceCategory, SourceProvider
 
 __all__ = [
     "DiscoveryQuerySpec",
+    "DiscoverySearchOutcome",
     "DiscoverySearchProvider",
     "FilingProvider",
     "NewsProvider",
@@ -86,7 +88,16 @@ class DiscoveryQuerySpec(BaseModel):
     include_domains: list[str] = Field(default_factory=list)
     exclude_domains: list[str] = Field(default_factory=list)
     country: str = "US"
-    scrape_content: bool = True
+    scrape_content: bool = False
+    """Whether to attach ``scrapeOptions`` to the search.
+
+    **Default false, and the scheduler never sets it.**  Firecrawl charges one
+    credit per result page scraped on top of the search itself, so a
+    twenty-result thematic search with this on costs twenty-four credits
+    instead of four.  It defaulted to ``True`` through Phase 8, which is the
+    single largest contributor to the credit incident recorded in
+    ``docs/sources.md``.  Full content is fetched separately, per surviving
+    result, by ``FIRECRAWL_ENRICH``."""
 
 
 @runtime_checkable
@@ -106,13 +117,39 @@ class NewsProvider(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoverySearchOutcome:
+    """A search's documents plus what the call itself cost.
+
+    The cost is part of the return value rather than an attribute on the client
+    because a metered provider's spend has to be recorded durably by the caller,
+    in the same transaction as the work it paid for.  A counter living on a
+    long-lived client object is a counter that disappears on restart -- which is
+    precisely how the Firecrawl credit allowance was emptied unnoticed.
+
+    ``results_returned`` counts what the provider billed for.  It is not
+    ``len(documents)``: a result with no URL has no identity and is dropped, but
+    it was returned and charged all the same.
+    """
+
+    documents: tuple[RawSourceDocument, ...]
+    results_returned: int
+    credits_reported: int | None = None
+    """The provider's own accounting, when it supplies one."""
+
+    warning: str | None = None
+    scraped_pages: int = 0
+    """How many results carried body content.  Non-zero only when the caller
+    explicitly asked for content, which costs extra per page."""
+
+
 @runtime_checkable
 class DiscoverySearchProvider(Protocol):
     """Broad-web thematic discovery."""
 
     name: str
 
-    async def search(self, spec: DiscoveryQuerySpec) -> Sequence[RawSourceDocument]: ...
+    async def search(self, spec: DiscoveryQuerySpec) -> DiscoverySearchOutcome: ...
 
 
 @runtime_checkable

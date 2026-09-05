@@ -83,6 +83,9 @@ postgres_data/
 postgres-data/
 stockbrain_data/
 *.dump
+# `scripts/backup.sh` writes here by default. A directory of database dumps is
+# the entire audit trail in plain form; it must never reach a commit.
+/backups/
 *.sql.gz
 *.sqlite
 *.sqlite3

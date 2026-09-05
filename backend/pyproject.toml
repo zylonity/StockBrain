@@ -111,6 +111,7 @@ ignore = [
 "tests/integration/test_phase6_live.py" = ["T201"]
 "tests/integration/test_phase7_live.py" = ["T201"]
 "tests/integration/test_phase8_live.py" = ["T201"]
+"tests/integration/test_phase9_live.py" = ["T201"]
 "alembic/versions/*" = ["E501"]
 
 [tool.ruff.lint.isort]

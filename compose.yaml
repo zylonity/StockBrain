@@ -27,7 +27,21 @@ services:
     ports:
       # Bind to loopback by default. Expose on the LAN (or via Tailscale) only
       # deliberately; never publish this to the public internet.
+      #
+      # Loopback is *defence in depth*, not the security boundary: web
+      # authentication is on by default (spec section 19) and every
+      # state-changing route needs a session plus a CSRF token. Both matter --
+      # a Docker port publication is one edit away from being wrong, and a
+      # password is one omission away from being unset.
       - "127.0.0.1:8080:8080"
+    # No setuid escalation from anything inside the container.
+    security_opt:
+      - no-new-privileges:true
+    # Longer than Compose's 10s default. Shutdown stops the Telegram poller,
+    # cancels the scheduler tasks, drains the job workers and disposes the
+    # connection pool; being killed part-way through leaves jobs RUNNING that
+    # the stale-claim reaper then has to recover.
+    stop_grace_period: 30s
     volumes:
       - stockbrain_data:/data
     healthcheck:
@@ -40,6 +54,13 @@ services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    # Deliberately no `ports:`. The database is reachable only on the compose
+    # network, which is why `scripts/backup.sh` runs pg_dump *inside* the
+    # container rather than connecting from the host. The development overlay
+    # publishes it on loopback; that overlay must never be used on TrueNAS.
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
     environment:
       POSTGRES_DB: stockbrain
       POSTGRES_USER: stockbrain

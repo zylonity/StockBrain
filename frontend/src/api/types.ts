@@ -245,6 +245,126 @@ export interface DiscoveryStatus {
   scheduled_tasks: ScheduledTask[];
   stats: IngestionStats;
   budget: LlmBudget | null;
+  firecrawl: FirecrawlBudget | null;
+  queue: JobQueueHealth | null;
+}
+
+export interface FirecrawlUsage {
+  searches: number;
+  scrapes: number;
+  estimated_credits: number;
+  provider_reported_credits: number;
+  pages_scraped: number;
+}
+
+/**
+ * Firecrawl's cadence and spend.
+ *
+ * Every field here exists because Phase 2 had none of them: the only visible
+ * signal that 21 searches an hour were emptying the credit allowance was a
+ * Prometheus counter nobody was scraping, and an HTTP 402 twenty-nine searches
+ * later. There is deliberately no field for the API key.
+ */
+export interface FirecrawlBudget {
+  enabled: boolean;
+  blockers: string[];
+  exhausted: boolean;
+  exhausted_reasons: string[];
+  search_exhausted: boolean;
+  scrape_exhausted: boolean;
+  today: FirecrawlUsage;
+  month: FirecrawlUsage;
+  max_searches_per_day: number;
+  max_scrapes_per_day: number;
+  daily_credit_cap: number;
+  monthly_credit_cap: number;
+  searches_remaining_today: number;
+  scrapes_remaining_today: number;
+  daily_credits_remaining: number;
+  monthly_credits_remaining: number;
+  min_topic_interval_minutes: number;
+  search_result_limit: number;
+  search_sources: string[];
+  scrape_enabled: boolean;
+  day_start: string;
+  month_start: string;
+  last_successful_call_at: string | null;
+  last_call_at: string | null;
+  recent_results_returned: number | null;
+  per_topic: FirecrawlTopicUsage[];
+}
+
+/** Per query, so "why has this topic not run" has an answer. */
+export interface FirecrawlTopicUsage {
+  topic: string;
+  query: string;
+  enabled: boolean;
+  last_run_at: string | null;
+  last_success_at: string | null;
+  next_eligible_at: string | null;
+  effective_interval_minutes: number;
+  consecutive_failures: number;
+  searches_performed: number;
+  results_seen: number;
+  credits_used: number;
+  last_error: string | null;
+}
+
+/**
+ * The five questions an operator asks when the pipeline stops moving.
+ *
+ * `oldest_pending_age_seconds` is the useful one: Phase 6's bug 12 left 144
+ * events unclassified for hours while every health check stayed green.
+ */
+export interface JobQueueHealth {
+  pending: number;
+  running: number;
+  failed: number;
+  dead: number;
+  oldest_pending_age_seconds: number | null;
+  oldest_pending_job_type: string | null;
+  stuck: number;
+  stuck_job_types: string[];
+  counts_by_type: Record<string, number>;
+  counts_by_status: Record<string, number>;
+}
+
+/** Foreign-exchange source, freshness and grade. */
+export interface FxStatus {
+  provider: string;
+  grade: string | null;
+  configured: boolean;
+  available: boolean;
+  blockers: string[];
+  detail: string | null;
+  max_age_seconds: number;
+  reference_max_age_seconds: number;
+  allow_reference_grade: boolean;
+  max_rate_drift_pct: string;
+  probe_pair: string;
+  probe_rate: string | null;
+  probe_age_seconds: string | null;
+  probe_provider_timestamp: string | null;
+}
+
+/**
+ * Whether this deployment's HTTP surface is actually protected.
+ *
+ * `auth_effective` differs from `auth_enabled` when authentication is switched
+ * on but has no password hash or no signing key — in which case every protected
+ * route answers 503, which is safe and worth being able to see.
+ */
+export interface WebSecurityStatus {
+  auth_enabled: boolean;
+  auth_effective: boolean;
+  blockers: string[];
+  trusted_network_acknowledged: boolean;
+  session_ttl_seconds: number;
+  cookie_secure: boolean;
+  cookie_samesite: string;
+  csrf_header: string;
+  public_paths: string[];
+  cors_allow_origins: string[];
 }
 
 export interface DiscoveryQueryRecord {
@@ -814,4 +934,22 @@ export interface ExecutionStatusSummary {
   /** Reported rather than assumed: a client that forgot would build a retry. */
   order_endpoint_idempotent: boolean;
   notice: string;
+}
+
+/**
+ * Whether the browser holds a valid session, and whether it needs one.
+ *
+ * `auth_required` false means the deployment has deliberately turned web
+ * authentication off and is relying on network trust (an authenticating reverse
+ * proxy, or a Tailscale-only listener). `blockers` is non-empty when
+ * authentication is switched on but not usable -- no password hash, or no
+ * signing key -- in which case every protected route answers 503 and the
+ * message says which.
+ */
+export interface SessionView {
+  authenticated: boolean;
+  auth_required: boolean;
+  username: string | null;
+  expires_at: string | null;
+  blockers: string[];
 }

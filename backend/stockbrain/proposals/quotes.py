@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, BrokerWorkingSchedule
 from stockbrain.errors import ProviderError
-from stockbrain.market_data.base import MarketDataProvider, quote_blockers
+from stockbrain.market_data.base import MarketDataProvider, provider_grade_blockers
 from stockbrain.market_data.sessions import (
     SessionVerdict,
     session_from_schedule,
@@ -77,17 +77,16 @@ class QuoteFetcher:
         except ProviderError as exc:
             return None, f"market-data provider failed ({type(exc).__name__})"
 
-        blockers = tuple(
-            quote_blockers(
-                quote,
-                capability,
-                max_age_seconds=float(config.max_quote_age_seconds),
-                # The spread is assessed separately below so it can be reported
-                # as its own rule with its own numbers; passing it here too
-                # would duplicate the sentence in the provider blocker list.
-                max_spread_bps=None,
-            )
-        )
+        # Source grade only: entitlement, provider health and feed provenance.
+        # Age and width are each reported by their own rule with their own
+        # numbers -- `quote_freshness` and `spread_ceiling` -- so folding them
+        # in here would duplicate the sentence *and*, worse, make a stale quote
+        # block `price_source_execution_grade`, which the send-time preflight
+        # classifies as a statement about the trade rather than a deferral. A
+        # market-data provider running a minute behind would then retire every
+        # authorized proposal it touched. (Found in Phase 9; Phase 4's bug 9 and
+        # Phase 8's bug 21 are the same distinction at other layers.)
+        blockers = tuple(provider_grade_blockers(quote, capability))
         verdict = await session_verdict_for(session, instrument, moment)
         return (
             QuoteSnapshot(

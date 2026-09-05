@@ -28,13 +28,19 @@ from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, EventCompanyImpact
 from stockbrain.db.models.sources import Event
-from stockbrain.db.models.system import AppSetting, DiscoveryQuery, DiscoveryTopic
+from stockbrain.db.models.system import (
+    AppSetting,
+    DiscoveryQuery,
+    DiscoveryTopic,
+    Notification,
+)
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     Broker,
     CapabilityState,
     EventStatus,
     JobType,
+    NotificationStatus,
     ProviderStatus,
     ResolutionStatus,
 )
@@ -42,8 +48,11 @@ from stockbrain.errors import ProviderAuthError, ProviderEntitlementError
 from stockbrain.execution.base import Trading212ExecutionProvider
 from stockbrain.execution.reconciliation import ReconciliationService
 from stockbrain.execution.service import ExecutionService
+from stockbrain.fx.base import FxRateProvider
+from stockbrain.fx.service import FxService, build_fx_provider
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
 from stockbrain.ingestion.firecrawl import FirecrawlClient
+from stockbrain.ingestion.firecrawl_budget import FirecrawlBudget
 from stockbrain.ingestion.sec_edgar import SecEdgarClient
 from stockbrain.ingestion.service import IngestionOutcome, IngestionService
 from stockbrain.ingestion.topics import seed_default_topics
@@ -55,7 +64,10 @@ from stockbrain.intelligence.research_transport import ResearchTransport
 from stockbrain.intelligence.semantic_dedupe import SemanticDeduplicator
 from stockbrain.intelligence.service import ClassificationService
 from stockbrain.intelligence.tradingagents_adapter import TradingAgentsResearchEngine
-from stockbrain.jobs.handlers import register_ingestion_handlers
+from stockbrain.jobs.handlers import (
+    effective_topic_interval_minutes,
+    register_ingestion_handlers,
+)
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.jobs.registry import JobRegistry
 from stockbrain.jobs.runner import JobRunner
@@ -66,6 +78,7 @@ from stockbrain.llm.telemetry import LlmTelemetry
 from stockbrain.logging import get_logger
 from stockbrain.market_data.alpaca import AlpacaMarketDataClient
 from stockbrain.market_data.base import ProviderCapability
+from stockbrain.observability.alerts import OperationalAlerts
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
 from stockbrain.proposals.service import ProposalService
@@ -105,6 +118,7 @@ class ServiceContainer:
 
     alpaca_news: AlpacaNewsClient | None = field(default=None, init=False)
     firecrawl: FirecrawlClient | None = field(default=None, init=False)
+    firecrawl_budget: FirecrawlBudget | None = field(default=None, init=False)
     sec: SecEdgarClient | None = field(default=None, init=False)
 
     deepseek: DeepSeekClient | None = field(default=None, init=False)
@@ -119,11 +133,14 @@ class ServiceContainer:
     risk_config: RiskConfig = field(init=False)
     resolution: ResolutionService | None = field(default=None, init=False)
     market_data: AlpacaMarketDataClient | None = field(default=None, init=False)
+    fx_provider: FxRateProvider | None = field(default=None, init=False)
+    fx: FxService = field(init=False)
     research: ResearchService | None = field(default=None, init=False)
     research_transport: ResearchTransport | None = field(default=None, init=False)
     fred: FredMacroProvider | None = field(default=None, init=False)
 
     control: ControlStateService = field(init=False)
+    alerts: OperationalAlerts | None = field(default=None, init=False)
     telegram: TelegramRuntime | None = field(default=None, init=False)
 
     t212_orders: Trading212OrderClient | None = field(default=None, init=False)
@@ -141,6 +158,19 @@ class ServiceContainer:
         # configured is not an execution control.
         self.control = ControlStateService(self.database)
         self._build_providers()
+        if self.settings.alerts_enabled:
+            # Constructed after the providers so it can read their budgets.
+            # It never *changes* anything -- no pause, no halt, no cancel, no
+            # order -- which is why it takes the registry and the guards rather
+            # than the services that own them.
+            self.alerts = OperationalAlerts(
+                self.database,
+                self.settings,
+                health=self.health,
+                llm_budget=self.budget,
+                firecrawl_budget=self.firecrawl_budget,
+                queue=self.queue,
+            )
         if self.settings.proposals_enabled:
             self.proposals = ProposalService(
                 self.database,
@@ -148,6 +178,7 @@ class ServiceContainer:
                 risk_config=self.risk_config,
                 account_state=self.account_state,
                 market_data=self.market_data,
+                fx=self.fx,
                 broker=Broker.TRADING212,
                 control=self.control,
             )
@@ -228,7 +259,21 @@ class ServiceContainer:
         if alpaca_configured and settings.alpaca_news_enabled:
             self.alpaca_news = AlpacaNewsClient(settings)
 
-        if settings.firecrawl_enabled and settings.firecrawl_api_key.get_secret_value():
+        # The budget is constructed whether or not the client is, so the GUI and
+        # the health endpoint can report yesterday's usage and today's caps for a
+        # provider that is currently switched off. Constructing it does not
+        # permit a call; `enabled` carries the configuration blockers, and a
+        # disabled budget refuses every reservation.
+        self.firecrawl_budget = FirecrawlBudget(
+            self.database,
+            enabled=settings.firecrawl_available,
+            blockers=tuple(settings.firecrawl_blockers),
+            max_searches_per_day=settings.firecrawl_max_searches_per_day,
+            max_scrapes_per_day=settings.firecrawl_max_scrapes_per_day,
+            daily_credit_cap=settings.firecrawl_daily_credit_cap,
+            monthly_credit_cap=settings.firecrawl_monthly_credit_cap,
+        )
+        if settings.firecrawl_available:
             self.firecrawl = FirecrawlClient(settings)
 
         # data.sec.gov needs no key, but it does need a contact in the
@@ -238,6 +283,12 @@ class ServiceContainer:
 
         if alpaca_configured and settings.alpaca_market_data_enabled:
             self.market_data = AlpacaMarketDataClient(settings)
+
+        # Foreign exchange. Constructed unconditionally so that "no FX source"
+        # is a service that reports why rather than an attribute that is None --
+        # a caller that has to check for None is a caller that can forget to.
+        self.fx_provider = build_fx_provider(settings)
+        self.fx = FxService(settings, provider=self.fx_provider)
 
         # Read-only metadata and account access. Neither client has an order
         # method at all -- broker mutations arrive in Phase 8, behind the
@@ -426,6 +477,7 @@ class ServiceContainer:
             self.t212_metadata,
             self.t212_account,
             self.market_data,
+            self.fx,
             self.research_transport,
             self.fred,
         ):
@@ -447,14 +499,27 @@ class ServiceContainer:
                 )
             )
         if self.firecrawl is not None:
+            # The sweep ticks often and decides *nothing* about cadence: the
+            # durable `next_eligible_at` column does. Ticking every five minutes
+            # rather than every minute is simply five times less pointless work
+            # for a provider whose cadence is measured in hours.
             scheduler.add(
                 ScheduledTask(
                     name="firecrawl_topic_sweep",
-                    interval_seconds=60.0,
+                    interval_seconds=300.0,
                     run=self._enqueue_due_topic_searches,
-                    initial_delay_seconds=20.0,
+                    initial_delay_seconds=120.0,
                 )
             )
+            if self.settings.firecrawl_scrape_enabled:
+                scheduler.add(
+                    ScheduledTask(
+                        name="firecrawl_enrichment_sweep",
+                        interval_seconds=300.0,
+                        run=self._enqueue_firecrawl_enrichment,
+                        initial_delay_seconds=180.0,
+                    )
+                )
         if self.sec is not None:
             scheduler.add(
                 ScheduledTask(
@@ -571,6 +636,16 @@ class ServiceContainer:
                 initial_delay_seconds=25.0,
             )
         )
+        if self.alerts is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="operational_alerts",
+                    interval_seconds=self.settings.alert_scan_interval_seconds,
+                    run=self._scan_alerts,
+                    initial_delay_seconds=90.0,
+                    jitter_ratio=0.1,
+                )
+            )
         scheduler.add(
             ScheduledTask(
                 name="provider_health_persist",
@@ -591,43 +666,128 @@ class ServiceContainer:
             await self.research.enqueue_event()
 
     async def _enqueue_due_topic_searches(self) -> None:
-        """Enqueue every enabled query whose topic interval has elapsed.
+        """Enqueue every enabled query whose durable cooldown has elapsed.
 
-        The scheduler ticks every minute and decides *which* queries are due from
-        their own ``last_run_at``, so a per-topic interval needs no per-topic
-        timer and survives a restart.
+        Three properties this has that the Phase 2 version did not:
+
+        * **Eligibility is a column, not a subtraction.**  ``next_eligible_at``
+          is written by the handler after every attempt -- succeeded, failed or
+          budget-refused -- so a restart cannot reset a cooldown and a failing
+          query cannot be retried on the success cadence.
+        * **The interval floor is applied here too.**  A topic row asking for
+          twenty minutes gets the configured floor instead, so a restored
+          backup or a hand-written UPDATE cannot reintroduce the cadence that
+          emptied the allowance.
+        * **The budget is consulted before anything is enqueued.**  Queueing
+          work that will refuse itself is noise; it also churns the dedupe key
+          and the queue depth for no benefit.
+
+        The scheduler still only *enqueues*.  It makes no HTTP call and spends
+        nothing, and the dedupe key is what stops a slow provider from
+        accumulating a backlog of identical searches.
         """
         if not self.settings.discovery_enabled or await self._discovery_paused():
             return
+        if self.firecrawl is None or self.firecrawl_budget is None:
+            return
 
-        now = utcnow()
+        budget = await self.firecrawl_budget.state()
+        if budget.search_exhausted:
+            # Not an error and not a global failure: Alpaca news and SEC EDGAR
+            # are unaffected and keep filling the pipeline.
+            log.info(
+                "firecrawl_sweep_skipped",
+                reason="budget",
+                searches_today=budget.today.searches,
+                credits_today=budget.today.credits,
+            )
+            return
+
+        # How many searches may still be enqueued today. Bounding the enqueue by
+        # the remaining budget keeps the queue from holding jobs that exist only
+        # to be refused.
+        allowance = budget.searches_remaining
+
         async with self.database.transaction() as session:
             rows = (
                 await session.execute(
                     sa.select(DiscoveryQuery, DiscoveryTopic)
                     .join(DiscoveryTopic, DiscoveryTopic.id == DiscoveryQuery.topic_id)
                     .where(DiscoveryQuery.enabled.is_(True), DiscoveryTopic.enabled.is_(True))
+                    # Oldest first, so a budget that only covers part of the
+                    # backlog spends it on the queries that have waited longest
+                    # rather than on whichever row PostgreSQL returned first.
+                    .order_by(
+                        DiscoveryQuery.next_eligible_at.asc().nullsfirst(),
+                        DiscoveryQuery.created_at.asc(),
+                    )
+                    .with_for_update(of=DiscoveryQuery, skip_locked=True)
                 )
             ).all()
 
+            # The database clock, matching what the handler wrote.
+            now = (await session.execute(sa.select(sa.func.now()))).scalar_one()
+
             enqueued = 0
             for query, topic in rows:
-                interval = dt.timedelta(minutes=max(1, topic.interval_minutes))
-                if query.last_run_at is not None and (now - query.last_run_at) < interval:
+                if enqueued >= allowance:
+                    break
+                interval = dt.timedelta(
+                    minutes=effective_topic_interval_minutes(topic.interval_minutes, self.settings)
+                )
+                eligible_at = query.next_eligible_at
+                if eligible_at is None and query.last_run_at is not None:
+                    # A row written before `next_eligible_at` existed. Derive it
+                    # once from the last run rather than treating the NULL as
+                    # "run immediately" -- which is exactly the reading that
+                    # would re-run every query the moment this ships.
+                    eligible_at = query.last_run_at + interval
+                    query.next_eligible_at = eligible_at
+                if eligible_at is not None and eligible_at > now:
                     continue
                 job_id = await self.queue.enqueue(
                     session,
                     JobType.FIRECRAWL_TOPIC_SEARCH,
                     payload={"query_id": str(query.id), "topic": topic.slug},
                     # One outstanding job per query: a slow provider must not let
-                    # a backlog of identical searches build up.
+                    # a backlog of identical searches build up, and two workers
+                    # must not pay for the same search twice.
                     dedupe_key=f"firecrawl:{query.id}",
                     priority=60,
+                    # A paid call. One attempt only -- the queue's retry would be
+                    # a second reservation for the same search, and the durable
+                    # cooldown is the retry.
+                    max_attempts=1,
                 )
                 if job_id is not None:
                     enqueued += 1
+                    # Claim the slot immediately so a second scheduler loop, or
+                    # this one on its next tick, cannot enqueue the same query
+                    # again before the handler has written its own cooldown.
+                    query.next_eligible_at = now + interval
             if enqueued:
-                log.info("firecrawl_searches_enqueued", count=enqueued)
+                log.info(
+                    "firecrawl_searches_enqueued",
+                    count=enqueued,
+                    searches_remaining_today=allowance - enqueued,
+                )
+
+    async def _enqueue_firecrawl_enrichment(self) -> None:
+        """Offer triaged Firecrawl sources for a paid content fetch.
+
+        Stage two of the two-stage model.  Bounded twice: by the batch size
+        here, and by the durable scrape budget inside the handler.
+        """
+        if not self.settings.discovery_enabled or await self._discovery_paused():
+            return
+        if self.firecrawl is None or self.firecrawl_budget is None:
+            return
+        if not self.settings.firecrawl_scrape_enabled:
+            return
+        budget = await self.firecrawl_budget.state()
+        if budget.scrape_exhausted:
+            return
+        await self.ingestion.enqueue_content_fetches(limit=budget.scrapes_remaining)
 
     async def _enqueue_sec_refresh(self) -> None:
         if not self.settings.discovery_enabled or await self._discovery_paused():
@@ -643,6 +803,41 @@ class ServiceContainer:
 
     async def _persist_health(self) -> None:
         await self.health.persist(self.database)
+
+    async def _scan_alerts(self) -> None:
+        """Look for the conditions worth telling somebody about, and enqueue them.
+
+        The scan writes notification rows; delivery is a job, exactly as it is
+        for a proposal transition. An alert that already happened must not fail
+        because Telegram is unreachable, and a redelivered job is harmless
+        because the row's dedupe key -- not this method's memory -- is what makes
+        the message once-only.
+        """
+        if self.alerts is None:
+            return
+        scan = await self.alerts.scan()
+        if not (scan.fired or scan.resolved):
+            return
+        async with self.database.transaction() as session:
+            pending = (
+                await session.execute(
+                    sa.select(Notification.id).where(
+                        Notification.entity_type == "alert",
+                        Notification.status == NotificationStatus.PENDING,
+                    )
+                )
+            ).scalars()
+            for notification_id in pending:
+                await self.queue.enqueue(
+                    session,
+                    JobType.SEND_NOTIFICATION,
+                    payload={"notification_id": str(notification_id)},
+                    dedupe_key=f"alert-send:{notification_id}",
+                    priority=10,
+                    # One attempt: a failed alert is recorded and never
+                    # auto-resent, the same rule as a proposal notification.
+                    max_attempts=1,
+                )
 
     async def _enqueue_instrument_refresh(self) -> None:
         if self.instrument_sync is None:

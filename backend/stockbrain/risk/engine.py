@@ -10,7 +10,8 @@ somebody remembered to call.
 The evaluation order is fixed:
 
 1. **Gates.**  Identity, account state, quote provenance, freshness, spread,
-   session, currency, position, duplicate proposals, confidence floor.  Any
+   session, currency, FX availability and freshness, position, duplicate
+   proposals, confidence floor.  Any
    ``BLOCK`` here ends the decision; nothing downstream can revive it.
 2. **Caps.**  Each computes a notional ceiling from the snapshot.  The engine
    takes the minimum.  A cap with no headroom becomes a block.
@@ -86,6 +87,7 @@ class RiskEngine:
             account=inputs.account,
             max_notional=effective_cap,
             size_factor=size_factor,
+            fx=inputs.fx,
         )
 
         reduced = any(rule.outcome is RuleOutcome.REDUCE for rule in rules)
@@ -112,6 +114,7 @@ class RiskEngine:
                 "identity": inputs.identity.as_dict(),
                 "account": inputs.account.as_dict() if inputs.account else None,
                 "quote": inputs.quote.as_dict() if inputs.quote else None,
+                "fx": inputs.fx.as_dict() if inputs.fx else None,
                 "reserved": inputs.reserved.as_dict(),
                 "config": inputs.config.as_dict(),
                 "now": inputs.now.isoformat(),

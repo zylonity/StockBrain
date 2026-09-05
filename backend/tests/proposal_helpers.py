@@ -126,6 +126,8 @@ def settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = {
         "app_env": "test",
         "stockbrain_secret_key": "test-secret-key",
+        # The login flow has its own tests; these exercise proposals.
+        "web_auth_enabled": False,
         "t212_api_key": "key",
         "t212_api_secret": "secret",
         # The seeded quote is a two-sided regular-hours book, but a test run at

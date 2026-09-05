@@ -41,6 +41,7 @@ __all__ = [
     "BrokerEnvironment",
     "ExecutionMode",
     "ExecutionPolicy",
+    "FxProviderName",
     "LogFormat",
     "Settings",
     "get_settings",
@@ -67,6 +68,28 @@ class BrokerEnvironment(StrEnum):
 
     DEMO = "demo"
     LIVE = "live"
+
+
+class FxProviderName(StrEnum):
+    """Which foreign-exchange source may size a cross-currency trade.
+
+    ``none`` is the default and is a safe, meaningful setting: cross-currency
+    sizing stays blocked, which is Phase 6's behaviour.  Choosing a source has
+    entitlement and trust consequences, so it is never inferred from a
+    credential happening to be present.
+
+    * ``alpaca`` -- ``/v1beta1/forex/latest/rates``, live bid/mid/ask with an
+      instant timestamp.  **Measured 2026-09-05: HTTP 403 "insufficient grants"
+      on this account** -- forex is not part of the plan that covers IEX equity
+      data.
+    * ``frankfurter`` -- central-bank reference fixings, no key, no quota, and
+      documented by its own authors as "not for live trading".  Usable only with
+      ``FX_ALLOW_REFERENCE_GRADE=true``.
+    """
+
+    NONE = "none"
+    ALPACA = "alpaca"
+    FRANKFURTER = "frankfurter"
 
 
 class ExecutionMode(StrEnum):
@@ -207,9 +230,93 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------------
     # Firecrawl
+    #
+    # Firecrawl is **broad thematic discovery**, not the fast-news path: Alpaca
+    # news and SEC EDGAR handle time-critical financial discovery, and both are
+    # unmetered by comparison. Every value below exists because Phase 2's
+    # cadence emptied a credit allowance in about an hour (see
+    # ``docs/sources.md`` and ``docs/operations.md``): 9 enabled queries on
+    # 20/30-minute intervals is 21 searches an hour, and each one scraped every
+    # result page at 1 credit apiece.
+    #
+    # Firecrawl bills (verified 2026-09-05 against
+    # <https://docs.firecrawl.dev/billing>): **search = 2 credits per 10
+    # results, rounded up per 10**, and **scrape = 1 credit per page**.
+    # ``limit`` is per *source*, so two sources at limit 10 is 20 billed
+    # results, and ``scrapeOptions`` adds one credit for every one of them.
     # ------------------------------------------------------------------
     firecrawl_api_key: SecretStr = SecretStr("")
     firecrawl_base_url: str = "https://api.firecrawl.dev"
+
+    firecrawl_min_topic_interval_minutes: int = Field(default=720, ge=15, le=20160)
+    """Floor on a topic's own ``interval_minutes``, in minutes.
+
+    A topic row may ask for a *slower* cadence than this but never a faster one.
+    Twelve hours by default: thematic drift is measured in days, and anything
+    faster is a job Alpaca news already does for free. Raising the floor is
+    safe; lowering it is what caused the incident."""
+
+    firecrawl_max_searches_per_day: int = Field(default=12, ge=0, le=10000)
+    """Hard ceiling on paid search calls per UTC day, counted durably.
+
+    Not a target. With the default 5-per-source limit each search is 2 credits,
+    so twelve searches is 24 credits a day."""
+
+    firecrawl_max_scrapes_per_day: int = Field(default=6, ge=0, le=10000)
+    """Hard ceiling on paid full-content fetches per UTC day.
+
+    A scrape only happens for a result that already survived deduplication and
+    the cheap classifier, so this is deliberately small."""
+
+    firecrawl_daily_credit_cap: int = Field(default=30, ge=0, le=1000000)
+    """Hard ceiling on *estimated* credits per UTC day.
+
+    Estimated from the published billing model and then reconciled against the
+    ``creditsUsed`` the search response actually reports, so the number this cap
+    compares against is the provider's own accounting wherever the provider
+    supplies one."""
+
+    firecrawl_monthly_credit_cap: int = Field(default=900, ge=0, le=10000000)
+    """Hard ceiling on estimated credits per UTC calendar month.
+
+    Firecrawl's allowance is monthly, so a daily cap alone cannot protect it: 30
+    a day for 31 days is 930. 900 leaves headroom inside a 1,000-credit
+    allowance for a manual search and for the estimate being wrong."""
+
+    firecrawl_search_result_limit: int = Field(default=5, ge=1, le=100)
+    """``limit`` sent to ``/v2/search`` -- **per source**, not per request.
+
+    Five with the two default sources is ten billed results, which is exactly
+    one 2-credit billing block. Six would be twelve results and 4 credits."""
+
+    firecrawl_search_sources: CommaSeparatedStrs
+    """Which ``/v2/search`` sources to request; defaults to ``web,news``.
+
+    Each source multiplies the billed result count, so this is a cost knob as
+    much as a coverage one."""
+
+    firecrawl_scrape_enabled: bool = True
+    """Whether the second stage may fetch full article content at all.
+
+    False leaves discovery running on search metadata alone -- title, URL,
+    snippet and date -- which is enough for the classifier to triage."""
+
+    firecrawl_scrape_timeout_seconds: float = Field(default=60.0, ge=5.0, le=300.0)
+
+    firecrawl_failure_cooldown_minutes: int = Field(default=60, ge=1, le=20160)
+    """How long a query waits after a *failure* before it is eligible again.
+
+    Separate from the success interval: a query that is failing must not be
+    retried on the ordinary cadence, because Firecrawl charges for a request its
+    infrastructure processed even when the answer was an error."""
+
+    firecrawl_enabled: bool = False
+    """Default **off**.
+
+    The one provider in this system that can spend real money on a schedule with
+    no human in the loop. A fresh deployment discovers through Alpaca news and
+    SEC EDGAR, and enabling Firecrawl is a deliberate act taken after reading
+    the budget above."""
 
     # ------------------------------------------------------------------
     # SEC EDGAR (no API key; descriptive User-Agent is mandatory)
@@ -223,6 +330,59 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     fred_api_key: SecretStr = SecretStr("")
     fred_base_url: str = "https://api.stlouisfed.org/fred"
+
+    # ------------------------------------------------------------------
+    # Foreign exchange (Phase 9)
+    #
+    # The live account is GBP and the priced universe is USD, so without a
+    # verified rate the risk engine blocks every proposal it can price. It
+    # blocks by design -- an invented rate is a wrong size -- and these settings
+    # are what let a *verified* rate lift that block without ever inferring one.
+    # ------------------------------------------------------------------
+    fx_provider: FxProviderName = FxProviderName.NONE
+    """Which source may size a cross-currency trade.  Default ``none``: the
+    conservative Phase 6 behaviour, preserved unless an operator chooses."""
+
+    fx_max_age_seconds: float = Field(default=900.0, ge=1.0, le=86400.0)
+    """Freshness limit for an **execution-grade** rate, in seconds.
+
+    Fifteen minutes.  Longer than the 15-second quote limit because an FX rate
+    moves in basis points over minutes where an equity book can gap, and because
+    the rate here bounds a *cap* rather than setting an execution price -- the
+    broker applies its own FX at settlement.  Still short enough that a feed
+    that has stopped updating is caught."""
+
+    fx_reference_max_age_seconds: float = Field(default=90000.0, ge=1.0, le=604800.0)
+    """Freshness limit for a **reference-grade** fixing, in seconds.
+
+    Twenty-five hours, which covers one publication gap.  Central banks do not
+    publish at weekends or on holidays, so a Monday-morning rate is dated the
+    previous Friday and cross-currency sizing blocks until the next fixing --
+    when equity markets are closed anyway.  Raising this to cover a weekend is
+    an explicit decision to size against a rate three days old."""
+
+    fx_allow_reference_grade: bool = False
+    """Whether a published fixing may size a trade at all.
+
+    Default false.  Frankfurter's own documentation says it "is not for live
+    trading"; honouring that is the difference between using a reference rate
+    knowingly and mistaking it for a dealable quote."""
+
+    fx_max_rate_drift_pct: Decimal = Decimal("0.005")
+    """How far the FX rate may move between authorization and transmission.
+
+    The analogue of ``RISK_MAX_REFERENCE_PRICE_DRIFT_PCT``, and it exists for
+    the same reason: an authorization is a statement about a moment. Half a
+    percent on a major pair is a large intraday move; past it the proposal is
+    invalidated and re-derived rather than silently resized."""
+
+    fx_frankfurter_base_url: str = "https://api.frankfurter.dev"
+
+    fx_probe_base_currency: str = "GBP"
+    fx_probe_quote_currency: str = "USD"
+    """The pair used for the one-request entitlement probe.  Defaults to the
+    account's own pair, because "forex works" is not the useful question --
+    "this pair works on this plan" is."""
 
     # ------------------------------------------------------------------
     # Trading 212
@@ -261,6 +421,23 @@ class Settings(BaseSettings):
     Trading 212 defaults this to false and StockBrain keeps that: the Phase 6
     spread ceiling is calibrated on regular-hours books, and an overnight book
     was measured at 1,024 bps."""
+
+    t212_max_pending_orders_per_ticker: int = Field(default=50, ge=1, le=1000)
+    """Trading 212's documented functional limit: 50 pending orders per ticker
+    per account.
+
+    Configuration rather than a constant because it is a *documented functional
+    limit*, not an API contract -- if the broker changes it, an operator should
+    be able to follow without a deployment. It is never raised above what the
+    broker documents by anything StockBrain does."""
+
+    t212_pending_order_headroom: int = Field(default=5, ge=0, le=100)
+    """How many of those fifty slots StockBrain refuses to use.
+
+    The broker's list can lag a fill, the operator can queue orders by hand in
+    the app between one check and the next, and the limit is enforced by a
+    rejection from a **non-idempotent** endpoint. Stopping five short costs
+    nothing and means StockBrain never discovers the limit by hitting it."""
 
     t212_order_timeout_seconds: float = Field(default=30.0, ge=5.0, le=120.0)
     """Timeout for the one order POST.
@@ -412,12 +589,72 @@ class Settings(BaseSettings):
     stored thesis, but it is the command most likely to be repeated."""
 
     # ------------------------------------------------------------------
+    # Web authentication (Phase 9, spec section 19)
+    #
+    # "This is a personal app but it handles broker actions." Through Phase 8
+    # there was no authentication at all: seven state-changing routes, one of
+    # which transmits a real order, reachable by anything that could open a
+    # socket to the port. The spec's own words apply: "If accessed only over
+    # LAN/Tailscale, still require auth."
+    # ------------------------------------------------------------------
+    alert_queue_backlog_seconds: float = Field(default=1800.0, ge=60.0, le=86400.0)
+    """How long the oldest pending job may wait before it is an alert.
+
+    Thirty minutes. The pipeline's slowest legitimate step is a research run at
+    up to ten minutes, so half an hour is well past "busy" and firmly into
+    "something has stopped" -- which is the condition Phase 6's bug 12 produced
+    and nothing reported."""
+
+    alert_scan_interval_seconds: float = Field(default=300.0, ge=30.0, le=3600.0)
+    """How often the operational alert scan runs.  It makes no external call;
+    the cost is a handful of aggregate queries."""
+
+    alerts_enabled: bool = True
+
+    web_auth_enabled: bool = True
+    """Default **on**.  The only supported way to run without it is to set this
+    false *and* acknowledge the trusted-network model below, which is refused in
+    production without the acknowledgement."""
+
+    web_owner_username: str = "owner"
+
+    web_owner_password_hash: SecretStr = SecretStr("")
+    """scrypt hash of the owner's password, generated by
+    ``python -m stockbrain.hash_password``.
+
+    A hash, never the password: the environment of a long-running container is
+    readable by anything that can exec into it, and a hash there is worth far
+    less than a password there."""
+
+    web_session_ttl_seconds: int = Field(default=43200, ge=300, le=2592000)
+    """Twelve hours.  Long enough not to interrupt a working session, short
+    enough that a forgotten open browser is not a permanent credential."""
+
+    web_cookie_secure: bool | None = None
+    """Force the ``Secure`` cookie flag on or off.
+
+    ``None`` means "on in production, off otherwise", which is what makes a
+    plain-HTTP LAN deployment work at all -- a ``Secure`` cookie on an
+    ``http://`` origin is never stored, and the operator would see a login that
+    silently does nothing. Set true behind a TLS-terminating reverse proxy."""
+
+    web_trusted_network_acknowledged: bool = False
+    """Records that the operator has *deliberately* chosen network trust instead
+    of authentication -- an authenticating reverse proxy, a Tailscale-only
+    listener, or an accepted risk.
+
+    Its only function is to make ``WEB_AUTH_ENABLED=false`` in production an
+    explicit decision rather than an omission. There is deliberately no way to
+    satisfy it by accident."""
+
+    # ------------------------------------------------------------------
     # Subsystem toggles (env-level defaults; runtime flags live in PostgreSQL)
     # ------------------------------------------------------------------
     discovery_enabled: bool = True
     alpaca_news_enabled: bool = True
-    firecrawl_enabled: bool = True
     sec_enabled: bool = True
+    # ``firecrawl_enabled`` lives with the rest of the Firecrawl budget above:
+    # the switch and the money it commits belong beside each other.
 
     # ------------------------------------------------------------------
     # Validators
@@ -439,6 +676,7 @@ class Settings(BaseSettings):
         "cors_allow_origins",
         "risk_allowed_instrument_types",
         "risk_allowed_sessions",
+        "firecrawl_search_sources",
         mode="before",
     )
     @classmethod
@@ -572,6 +810,23 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_pending_order_limit(self) -> Settings:
+        """The headroom must leave at least one usable slot.
+
+        Headroom >= limit would mean no order could ever be transmitted, which
+        would present as "execution silently does nothing" rather than as a
+        configuration error.
+        """
+        if self.t212_pending_order_headroom >= self.t212_max_pending_orders_per_ticker:
+            raise ValueError(
+                "T212_PENDING_ORDER_HEADROOM must be less than "
+                "T212_MAX_PENDING_ORDERS_PER_TICKER, otherwise no order can ever be sent "
+                f"(headroom {self.t212_pending_order_headroom} >= limit "
+                f"{self.t212_max_pending_orders_per_ticker})"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_budgets(self) -> Settings:
         """A hard limit below its soft limit would make the soft limit unreachable."""
         if self.llm_daily_hard_usd < self.llm_daily_soft_usd:
@@ -580,10 +835,152 @@ class Settings(BaseSettings):
             raise ValueError("LLM_MONTHLY_HARD_USD must be >= LLM_MONTHLY_SOFT_USD")
         return self
 
+    @field_validator("firecrawl_search_sources", mode="after")
+    @classmethod
+    def _normalise_firecrawl_sources(cls, value: list[str]) -> list[str]:
+        """Default to ``web,news`` and refuse a source ``/v2/search`` does not offer.
+
+        An unknown source name would be rejected by the API *after* the request
+        was billed, so it is caught here instead. Order is preserved and
+        duplicates are dropped, because a repeated source would be requested --
+        and billed -- twice.
+        """
+        allowed = {"web", "news", "images"}
+        if not value:
+            return ["web", "news"]
+        cleaned: list[str] = []
+        for raw in value:
+            name = raw.strip().lower()
+            if not name:
+                continue
+            if name not in allowed:
+                raise ValueError(
+                    f"FIRECRAWL_SEARCH_SOURCES contains {raw!r}; "
+                    f"/v2/search documents only {sorted(allowed)}"
+                )
+            if name not in cleaned:
+                cleaned.append(name)
+        if not cleaned:
+            return ["web", "news"]
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_firecrawl_budget(self) -> Settings:
+        """Reject a Firecrawl budget that cannot hold.
+
+        Each check is a combination that would look configured and then spend
+        more than the operator intended, which is exactly the class of mistake
+        this whole section exists to prevent.
+        """
+        problems: list[str] = []
+        if self.firecrawl_monthly_credit_cap < self.firecrawl_daily_credit_cap:
+            problems.append(
+                "FIRECRAWL_MONTHLY_CREDIT_CAP must be >= FIRECRAWL_DAILY_CREDIT_CAP, "
+                "otherwise the daily cap can never be reached"
+            )
+        # The cheapest a single search can be is one 2-credit billing block. A
+        # daily credit cap below the cost of the searches the daily search cap
+        # permits is not a stricter limit, it is two limits that disagree.
+        cheapest_search_credits = 2
+        if (
+            self.firecrawl_max_searches_per_day
+            and self.firecrawl_daily_credit_cap < cheapest_search_credits
+        ):
+            problems.append(
+                "FIRECRAWL_DAILY_CREDIT_CAP is below the 2 credits a single /v2/search "
+                "costs, so FIRECRAWL_MAX_SEARCHES_PER_DAY can never be used"
+            )
+        if problems:
+            raise ValueError("Invalid Firecrawl budget: " + "; ".join(problems))
+        return self
+
+    @field_validator("fx_probe_base_currency", "fx_probe_quote_currency", mode="after")
+    @classmethod
+    def _normalise_probe_currency(cls, value: str) -> str:
+        code = value.strip().upper()
+        if len(code) != 3 or not code.isalpha():
+            raise ValueError(f"currency codes must be three ISO 4217 letters (got {value!r})")
+        return code
+
+    @model_validator(mode="after")
+    def _validate_fx(self) -> Settings:
+        """Reject an FX configuration that could not size anything, or that lies.
+
+        Two combinations are refused rather than tolerated, because both look
+        configured and behave as though FX were unavailable:
+        """
+        problems: list[str] = []
+        if self.fx_probe_base_currency == self.fx_probe_quote_currency:
+            problems.append(
+                "FX_PROBE_BASE_CURRENCY and FX_PROBE_QUOTE_CURRENCY must differ; "
+                "a same-currency pair is not a rate"
+            )
+        if self.fx_reference_max_age_seconds < self.fx_max_age_seconds:
+            problems.append(
+                "FX_REFERENCE_MAX_AGE_SECONDS must be >= FX_MAX_AGE_SECONDS: a daily "
+                "fixing cannot be held to a stricter freshness bar than a live quote"
+            )
+        if self.fx_provider is FxProviderName.FRANKFURTER and not self.fx_allow_reference_grade:
+            problems.append(
+                "FX_PROVIDER=frankfurter requires FX_ALLOW_REFERENCE_GRADE=true: the "
+                "service publishes central-bank fixings and documents that it is not "
+                "for live trading, so every rate it returns would be refused. Set the "
+                "flag to size against a reference rate knowingly, or use "
+                "FX_PROVIDER=none to keep cross-currency sizing blocked"
+            )
+        if self.fx_max_rate_drift_pct <= 0 or self.fx_max_rate_drift_pct > 1:
+            problems.append("FX_MAX_RATE_DRIFT_PCT must be between 0 (exclusive) and 1")
+        if not self.risk_require_same_currency and self.fx_provider is FxProviderName.NONE:
+            # Phase 6 tolerated this pairing and it was the one genuinely unsafe
+            # combination in the risk configuration: `currency_alignment`
+            # returned WARN for a permitted mismatch, nothing blocked, and
+            # sizing then divided an account-currency ceiling by an
+            # instrument-currency price. The quantity that came out was wrong by
+            # the exchange rate. Refusing to start says so instead.
+            problems.append(
+                "RISK_REQUIRE_SAME_CURRENCY=false permits cross-currency sizing but "
+                "FX_PROVIDER=none supplies no rate to size with. Set FX_PROVIDER, or "
+                "leave RISK_REQUIRE_SAME_CURRENCY=true to keep cross-currency proposals "
+                "blocked. This pairing previously produced a warning and a quantity "
+                "computed by dividing an account-currency cap by an instrument-currency "
+                "price"
+            )
+        if problems:
+            raise ValueError("Invalid FX configuration: " + "; ".join(problems))
+        return self
+
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> Settings:
         if self.app_env is AppEnv.PRODUCTION and not self.stockbrain_secret_key.get_secret_value():
             raise ValueError("STOCKBRAIN_SECRET_KEY is required when APP_ENV=production")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_web_auth(self) -> Settings:
+        """Refuse a web-authentication configuration that protects nothing.
+
+        Two refusals, both about the same failure: an unauthenticated API that
+        nobody meant to deploy.
+        """
+        problems: list[str] = []
+        # A missing password hash is deliberately *not* a startup failure. It is
+        # reported by `web_auth_blockers` and it makes every protected route
+        # answer 503 with that reason -- the same shape as an empty Telegram
+        # allowlist, which disables the bot rather than the process. A fresh
+        # deployment therefore comes up, serves its health endpoints, tells the
+        # operator to set a password, and grants access to nothing.
+        if not self.web_auth_enabled and (
+            self.app_env is AppEnv.PRODUCTION and not self.web_trusted_network_acknowledged
+        ):
+            problems.append(
+                "WEB_AUTH_ENABLED=false in production requires "
+                "WEB_TRUSTED_NETWORK_ACKNOWLEDGED=true. Specification section 19 requires "
+                "authentication even on a LAN or Tailscale network; running without it is "
+                "supported only as a deliberate, recorded choice to rely on an "
+                "authenticating reverse proxy"
+            )
+        if problems:
+            raise ValueError("Invalid web authentication configuration: " + "; ".join(problems))
         return self
 
     # ------------------------------------------------------------------
@@ -698,6 +1095,67 @@ class Settings(BaseSettings):
             blockers.append("PROPOSALS_ENABLED is false")
         blockers.extend(automation_capability(self).blockers)
         return blockers
+
+    @property
+    def fx_blockers(self) -> list[str]:
+        """Every configuration reason cross-currency sizing is unavailable.
+
+        Deliberately configuration-only.  Whether the *live* source answers, and
+        whether the rate it returned is fresh enough, are runtime facts measured
+        by :class:`~stockbrain.fx.service.FxService` -- and a rate that arrives
+        stale must block the individual trade, not the whole subsystem.
+        """
+        blockers: list[str] = []
+        if self.fx_provider is FxProviderName.NONE:
+            blockers.append(
+                "FX_PROVIDER is 'none': cross-currency sizing is blocked and no rate "
+                "is ever inferred"
+            )
+            return blockers
+        if self.fx_provider is FxProviderName.ALPACA and not (
+            self.alpaca_api_key.get_secret_value() and self.alpaca_api_secret.get_secret_value()
+        ):
+            blockers.append("FX_PROVIDER=alpaca but Alpaca credentials are not configured")
+        if self.fx_provider is FxProviderName.FRANKFURTER and not self.fx_allow_reference_grade:
+            # Unreachable through the validator above; kept so the predicate
+            # stands on its own if the validator is ever relaxed.
+            blockers.append(  # pragma: no cover - the validator refuses to start
+                "FX_ALLOW_REFERENCE_GRADE is false, so a reference-grade fixing "
+                "may not size a trade"
+            )
+        return blockers
+
+    @property
+    def fx_configured(self) -> bool:
+        return not self.fx_blockers
+
+    @property
+    def firecrawl_blockers(self) -> list[str]:
+        """Every reason no paid Firecrawl call will be made, in GUI-ready wording.
+
+        Same shape as :attr:`execution_blockers`: "available" is defined as "no
+        blockers remain", so a health panel can never show a blocker beside a
+        green light. Budget exhaustion is *not* here -- it is durable runtime
+        state read from PostgreSQL, not configuration.
+        """
+        blockers: list[str] = []
+        if not self.discovery_enabled:
+            blockers.append("DISCOVERY_ENABLED is false")
+        if not self.firecrawl_enabled:
+            blockers.append("FIRECRAWL_ENABLED is false")
+        if not self.firecrawl_api_key.get_secret_value():
+            blockers.append("FIRECRAWL_API_KEY is not set")
+        if self.firecrawl_max_searches_per_day <= 0:
+            blockers.append("FIRECRAWL_MAX_SEARCHES_PER_DAY is 0")
+        if self.firecrawl_daily_credit_cap <= 0:
+            blockers.append("FIRECRAWL_DAILY_CREDIT_CAP is 0")
+        if self.firecrawl_monthly_credit_cap <= 0:
+            blockers.append("FIRECRAWL_MONTHLY_CREDIT_CAP is 0")
+        return blockers
+
+    @property
+    def firecrawl_available(self) -> bool:
+        return not self.firecrawl_blockers
 
     @property
     def telegram_configured(self) -> bool:

@@ -15,6 +15,11 @@ export function SystemHealth() {
   const control = usePolling(api.controlState, 15_000);
   const telegram = usePolling(api.telegramStatus, 30_000);
   const execution = usePolling(api.executionSummary, 20_000);
+  // Both make one provider probe, so they poll slowly. FX in particular
+  // reaches out to a rate source; asking it every fifteen seconds would be
+  // impolite to a free public API for no operational benefit.
+  const fx = usePolling(api.fxStatus, 60_000);
+  const security = usePolling(api.webSecurity, 120_000);
   const [busy, setBusy] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
 
@@ -228,6 +233,155 @@ export function SystemHealth() {
               )}
             </tbody>
           </table>
+        ) : (
+          <p className="muted">Loading…</p>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Foreign exchange</h2>
+        {fx.data ? (
+          <>
+            <p className="metric-note">
+              Cross-currency sizing depends on this entirely. A GBP account
+              holding USD listings cannot size anything without a rate, and a
+              rate that is missing, stale, of the wrong pair or of a grade this
+              deployment has not permitted all block — never an assumed 1.0.
+            </p>
+            <table>
+              <tbody>
+                <tr>
+                  <td>Provider</td>
+                  <td className="mono">
+                    {fx.data.provider}
+                    {fx.data.grade && <span className="detail"> {fx.data.grade}</span>}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Usable now</td>
+                  <td>
+                    <StatusPill
+                      status={
+                        fx.data.provider === "none"
+                          ? "DISABLED"
+                          : fx.data.available
+                            ? "HEALTHY"
+                            : "DOWN"
+                      }
+                    />
+                  </td>
+                </tr>
+                <tr>
+                  <td>{fx.data.probe_pair}</td>
+                  <td className="mono">
+                    {fx.data.probe_rate ?? "—"}
+                    {fx.data.probe_age_seconds && (
+                      <span className="detail">
+                        {" "}
+                        {Math.round(Number(fx.data.probe_age_seconds))}s old
+                      </span>
+                    )}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Freshness limits</td>
+                  <td className="mono detail">
+                    {fx.data.max_age_seconds}s execution ·{" "}
+                    {fx.data.reference_max_age_seconds}s reference
+                    {fx.data.allow_reference_grade
+                      ? " (reference permitted)"
+                      : " (reference refused)"}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Drift envelope</td>
+                  <td className="mono detail">
+                    {fx.data.max_rate_drift_pct} — past this an authorized
+                    proposal is invalidated, never resized
+                  </td>
+                </tr>
+                {fx.data.blockers.length > 0 && (
+                  <tr>
+                    <td>Blockers</td>
+                    <td className="detail">
+                      <ul className="reason-list">
+                        {fx.data.blockers.map((blocker) => (
+                          <li key={blocker}>{blocker}</li>
+                        ))}
+                      </ul>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </>
+        ) : (
+          <p className="muted">Loading…</p>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Web access</h2>
+        {security.data ? (
+          <>
+            {!security.data.auth_effective && (
+              <div className="banner banner-warn">
+                This interface can authorize real broker orders and is not
+                currently protected by a password.
+                {security.data.trusted_network_acknowledged
+                  ? " A trusted-network model has been acknowledged; make sure the reverse proxy in front of it actually authenticates."
+                  : " Set WEB_OWNER_PASSWORD_HASH — see docs/operations.md."}
+              </div>
+            )}
+            <table>
+              <tbody>
+                <tr>
+                  <td>Authentication</td>
+                  <td>
+                    <StatusPill
+                      status={
+                        security.data.auth_effective
+                          ? "HEALTHY"
+                          : security.data.trusted_network_acknowledged
+                            ? "DISABLED"
+                            : "DOWN"
+                      }
+                    />
+                  </td>
+                </tr>
+                <tr>
+                  <td>Session</td>
+                  <td className="mono detail">
+                    {Math.round(security.data.session_ttl_seconds / 3600)}h ·
+                    SameSite={security.data.cookie_samesite} ·{" "}
+                    {security.data.cookie_secure ? "Secure" : "not Secure"}
+                  </td>
+                </tr>
+                <tr>
+                  <td>CSRF header</td>
+                  <td className="mono detail">{security.data.csrf_header}</td>
+                </tr>
+                <tr>
+                  <td>Unauthenticated paths</td>
+                  <td className="mono detail">
+                    {security.data.public_paths.join(", ")}
+                  </td>
+                </tr>
+                {security.data.blockers.length > 0 && (
+                  <tr>
+                    <td>Blockers</td>
+                    <td className="detail">
+                      <ul className="reason-list">
+                        {security.data.blockers.map((blocker) => (
+                          <li key={blocker}>{blocker}</li>
+                        ))}
+                      </ul>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </>
         ) : (
           <p className="muted">Loading…</p>
         )}

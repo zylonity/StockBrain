@@ -35,12 +35,14 @@ from stockbrain.enums import (
     RuleOutcome,
     ThesisAction,
 )
+from stockbrain.fx.base import FxDirection, FxRateGrade, currency_pair, normalize_currency
 from stockbrain.risk.config import RiskConfig
 from stockbrain.risk.spread import SpreadAssessment
 
 __all__ = [
     "ZERO",
     "AccountState",
+    "FxSnapshot",
     "InstrumentIdentity",
     "PositionState",
     "QuoteSnapshot",
@@ -211,6 +213,172 @@ class QuoteSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class FxSnapshot:
+    """The FX facts a decision was made on, frozen at one instant.
+
+    A snapshot, not a live handle -- exactly like :class:`QuoteSnapshot`, and
+    for the same reason: the engine must judge the numbers that get persisted
+    onto the proposal, or the record and the decision diverge.
+
+    Two shapes it can take, and only two:
+
+    * **Same currency.**  ``same_currency`` is true, ``rate`` is ``None`` and
+      no conversion happens.  Reported as its own state rather than as a rate
+      of one, so a reader can tell "no conversion was needed" from "converted
+      at parity".
+    * **A measured rate.**  ``rate`` is present with its pair, provider, grade,
+      timestamp and age, and ``blockers`` is empty.
+
+    Anything else -- no rate, the wrong pair, a stale rate, a reference-grade
+    rate the operator has not permitted -- arrives with ``blockers`` populated,
+    ``usable`` false, and every conversion method refusing.  There is no
+    representable state in which two different currencies are converted at 1.0.
+    """
+
+    account_currency: str
+    instrument_currency: str
+    same_currency: bool
+    blockers: tuple[str, ...] = ()
+    rate: Decimal | None = None
+    base_currency: str | None = None
+    quote_currency: str | None = None
+    provider: str | None = None
+    grade: FxRateGrade | None = None
+    rate_type: str | None = None
+    provider_timestamp: dt.datetime | None = None
+    received_at: dt.datetime | None = None
+    age_seconds: Decimal | None = None
+    provider_timestamp_precision: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        """Whether a conversion may be performed at all.
+
+        Defined as "no blockers remain", so this and :attr:`blockers` cannot
+        disagree.
+        """
+        return not self.blockers
+
+    @property
+    def pair(self) -> str | None:
+        if self.base_currency is None or self.quote_currency is None:
+            return None
+        return currency_pair(self.base_currency, self.quote_currency)
+
+    @property
+    def conversion_required(self) -> bool:
+        return not self.same_currency
+
+    def _direction_for(self, *, from_currency: str, to_currency: str) -> FxDirection:
+        source = normalize_currency(from_currency)
+        target = normalize_currency(to_currency)
+        if source == target:
+            return FxDirection.IDENTITY
+        if not self.usable or self.rate is None:
+            raise ValueError(
+                "this FX snapshot may not convert anything: " + "; ".join(self.blockers)
+            )
+        base = normalize_currency(self.base_currency)
+        quote = normalize_currency(self.quote_currency)
+        if (source, target) == (base, quote):
+            return FxDirection.DIRECT
+        if (source, target) == (quote, base):
+            return FxDirection.INVERTED
+        raise ValueError(
+            f"the {self.pair} rate cannot convert {source} to {target}; StockBrain "
+            f"never chains rates through a third currency"
+        )
+
+    def _convert(self, amount: Decimal, *, from_currency: str, to_currency: str) -> Decimal:
+        """Multiply or **divide** -- never multiply by a precomputed reciprocal.
+
+        ``amount * (1 / rate)`` and ``amount / rate`` are not the same number in
+        ``Decimal``: the reciprocal is rounded to the context's precision first
+        and the error is then scaled by the amount. Dividing once keeps the
+        round trip exact, which is what makes
+        ``to_account_currency(to_instrument_currency(x)) == x`` hold -- and that
+        identity is what lets a converted cap be compared against the cap it
+        came from.
+        """
+        direction = self._direction_for(from_currency=from_currency, to_currency=to_currency)
+        if direction is FxDirection.IDENTITY:
+            return amount
+        assert self.rate is not None  # guaranteed by _direction_for
+        if direction is FxDirection.DIRECT:
+            return amount * self.rate
+        return amount / self.rate
+
+    def to_instrument_currency(self, amount: Decimal) -> Decimal:
+        """Convert an account-currency amount into the instrument's currency.
+
+        This is the direction that matters for sizing: every cap is denominated
+        in the account currency and every price is denominated in the
+        instrument's, so the caps have to move to the price rather than the
+        other way round -- dividing a GBP ceiling by a USD ask is the specific
+        arithmetic Phase 6 refused to do.
+        """
+        return self._convert(
+            amount,
+            from_currency=self.account_currency,
+            to_currency=self.instrument_currency,
+        )
+
+    def to_account_currency(self, amount: Decimal) -> Decimal:
+        """Convert an instrument-currency amount into the account's currency.
+
+        Used for the recorded notional and the cash impact, which are the
+        numbers every cap and every portfolio percentage is measured against.
+        """
+        return self._convert(
+            amount,
+            from_currency=self.instrument_currency,
+            to_currency=self.account_currency,
+        )
+
+    def direction(self) -> FxDirection:
+        """Which way the sizing conversion used the measured pair."""
+        if self.same_currency:
+            return FxDirection.IDENTITY
+        return self._direction_for(
+            from_currency=self.account_currency, to_currency=self.instrument_currency
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "account_currency": self.account_currency,
+            "instrument_currency": self.instrument_currency,
+            "same_currency": self.same_currency,
+            "usable": self.usable,
+            "blockers": list(self.blockers),
+            "rate": _opt_str(self.rate),
+            "base_currency": self.base_currency,
+            "quote_currency": self.quote_currency,
+            "pair": self.pair,
+            "provider": self.provider,
+            "grade": self.grade.value if self.grade else None,
+            "rate_type": self.rate_type,
+            "direction": (self.direction().value if self.same_currency or self.usable else None),
+            "provider_timestamp": (
+                self.provider_timestamp.isoformat() if self.provider_timestamp else None
+            ),
+            "provider_timestamp_precision": self.provider_timestamp_precision,
+            "received_at": self.received_at.isoformat() if self.received_at else None,
+            "age_seconds": _opt_str(self.age_seconds),
+        }
+
+    @classmethod
+    def same_currency_snapshot(cls, currency: str) -> FxSnapshot:
+        """The snapshot for "the instrument and the account agree"."""
+        code = normalize_currency(currency)
+        return cls(
+            account_currency=code,
+            instrument_currency=code,
+            same_currency=True,
+            provider="identity",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ReservedExposure:
     """What other live proposals have already claimed.
 
@@ -256,8 +424,20 @@ class RiskInputs:
     quote: QuoteSnapshot | None
     reserved: ReservedExposure
     now: dt.datetime
+    fx: FxSnapshot | None = None
+    """The FX facts, or ``None`` when they could not even be assembled.
+
+    ``None`` and "a snapshot carrying blockers" are different failures and both
+    block: the first means nothing is known about the currencies, the second
+    means something is known and it is not good enough."""
+
     account_state_missing_reason: str | None = None
     quote_missing_reason: str | None = None
+    authorized_fx_rate: Decimal | None = None
+    """The rate the *authorized* proposal was sized against, when re-evaluating
+    one.  Present only on the revalidation path; its absence is why
+    ``fx_rate_drift`` reports ``WARN`` rather than ``PASS`` at generation time --
+    there is nothing to have drifted from yet."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,10 +476,34 @@ class SizingResult:
     side: OrderSide | None
     quantity: Decimal
     target_notional: Decimal
+    """The trade's notional in the **instrument's** currency: quantity times the
+    marketable price.  This is the number a broker would recognise."""
+
     max_quantity: Decimal
     max_notional: Decimal
+    """The binding cap, in the **account's** currency.  Every ``RISK_*`` money
+    limit is denominated there, because that is the currency the portfolio,
+    the cash buffer and the concentration percentages are measured in."""
+
     reference_price: Decimal | None
     currency: str | None
+    """The instrument's currency: what ``reference_price`` and
+    ``target_notional`` are denominated in."""
+
+    account_currency: str | None = None
+    notional_account_currency: Decimal = ZERO
+    """``target_notional`` converted into the account currency.
+
+    Recorded separately rather than replacing ``target_notional`` because both
+    are true and they answer different questions: what the broker will trade,
+    and what it costs the portfolio.  Conflating them is how a USD number ends
+    up being compared against a GBP cap."""
+
+    max_notional_instrument_currency: Decimal = ZERO
+    """``max_notional`` converted into the instrument's currency -- the number
+    the quantity was actually derived from.  Persisted so a size can be
+    re-checked without re-deriving the conversion."""
+
     reasons: tuple[str, ...] = ()
     executable: bool = False
 
@@ -312,6 +516,9 @@ class SizingResult:
             "max_notional": str(self.max_notional),
             "reference_price": _opt_str(self.reference_price),
             "currency": self.currency,
+            "account_currency": self.account_currency,
+            "notional_account_currency": str(self.notional_account_currency),
+            "max_notional_instrument_currency": str(self.max_notional_instrument_currency),
             "reasons": list(self.reasons),
             "executable": self.executable,
         }

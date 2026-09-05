@@ -1,10 +1,11 @@
 """The broker execution interface, and the Trading 212 adapter for it.
 
-The interface is deliberately four operations wide and no wider.  There is no
+The interface is deliberately five operations wide and no wider.  There is no
 "call this endpoint" escape hatch, no generic request method and no cancel: a
-caller can reserve a rate-limit slot, submit one command, look one order up, and
-search for orders that might match an attempt.  Anything a future broker needs
-beyond that is a change to this file, reviewed as such.
+caller can reserve a rate-limit slot, count what is already queued for a
+listing, submit one command, look one order up, and search for orders that
+might match an attempt.  Anything a future broker needs beyond that is a change
+to this file, reviewed as such.
 
 Cancellation is absent on purpose.  Trading 212 documents
 ``DELETE /equity/orders/{id}``, and Phase 8 does not call it: cancelling races a
@@ -26,6 +27,7 @@ from stockbrain.execution.models import (
     BrokerOrderView,
     CandidateSearch,
     ExecutionCommand,
+    PendingOrderCount,
 )
 from stockbrain.logging import get_logger
 
@@ -50,6 +52,16 @@ class BrokerExecutionProvider(Protocol):
 
         Must be called before the transaction that records a send, so that a
         denial is provably a pre-send condition.
+        """
+        ...
+
+    async def count_pending(self, broker_ticker: str) -> PendingOrderCount:
+        """How many orders are already queued at the broker for this listing.
+
+        A read.  It exists because the broker documents a per-ticker pending
+        limit and answering "are we about to hit it" from StockBrain's own
+        records alone is not possible: the operator can queue orders by hand in
+        the app, and those count.
         """
         ...
 
@@ -88,6 +100,40 @@ class Trading212ExecutionProvider:
 
     async def reserve_slot(self) -> bool:
         return await self._client.reserve_order_slot()
+
+    async def count_pending(self, broker_ticker: str) -> PendingOrderCount:
+        """Count the broker's pending orders for one listing.
+
+        Counts **every** pending order for the ticker, not only the ones
+        StockBrain placed: the broker's limit does not care who queued them, and
+        a count that excluded the operator's own app orders would under-state
+        exactly the case that matters.
+
+        A failed read returns ``read_ok=False`` rather than raising.  The caller
+        turns that into a refusal, which keeps "the broker would not tell us"
+        and "the broker told us fifty" on the same safe side of the decision.
+        """
+        try:
+            orders = await self._client.fetch_pending_orders()
+        except ProviderError as exc:
+            log.warning(
+                "pending_order_count_failed",
+                broker_ticker=broker_ticker,
+                error_category=type(exc).__name__,
+            )
+            return PendingOrderCount(
+                broker_ticker=broker_ticker,
+                pending=0,
+                read_ok=False,
+                error_category=type(exc).__name__,
+            )
+        matching = [order for order in orders if order.broker_ticker == broker_ticker]
+        return PendingOrderCount(
+            broker_ticker=broker_ticker,
+            pending=len(matching),
+            read_ok=True,
+            api_initiated=sum(1 for order in matching if order.placed_by_api),
+        )
 
     async def submit(self, command: ExecutionCommand) -> BrokerAcknowledgement:
         response = await self._client.submit_market_order(

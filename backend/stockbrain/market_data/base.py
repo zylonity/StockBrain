@@ -35,6 +35,7 @@ __all__ = [
     "ProviderCapability",
     "Quote",
     "Trade",
+    "provider_grade_blockers",
     "quote_blockers",
     "to_decimal",
 ]
@@ -206,6 +207,42 @@ class ProviderCapability:
         }
 
 
+def provider_grade_blockers(
+    quote: Quote | None, capability: ProviderCapability | None
+) -> list[str]:
+    """Reasons this *source* may not price an order, independent of this moment.
+
+    Entitlement and provenance only: is a capability established, is the
+    provider healthy, does the plan include usable real-time pricing, and is
+    the feed one of the execution-grade sources.
+
+    Deliberately **not** freshness and **not** width.  Phase 4's bug 9 was the
+    capability probe conflating entitlement with freshness, and this is the same
+    distinction one layer up: ``quote_freshness`` owns the age and
+    ``spread_ceiling`` owns the width, each with its own numbers and its own
+    threshold.  Keeping them apart matters beyond tidiness -- Phase 8's
+    ``preflight`` classifies a *stale* input as a deferral and everything else
+    as a statement about the trade, so a stale quote leaking into a
+    source-grade blocker retires an authorized proposal that a provider running
+    a minute behind should merely have delayed.  (Found in Phase 9.)
+    """
+    blockers: list[str] = []
+    if capability is None:
+        blockers.append("no market-data provider capability has been established")
+    elif capability.state is not CapabilityState.HEALTHY:
+        blockers.append(f"market-data provider is {capability.state.value}")
+    elif not capability.realtime_pricing_usable:
+        blockers.append("provider has no usable real-time pricing")
+
+    if quote is None:
+        blockers.append("no quote is available for this instrument")
+        return blockers
+
+    if quote.price_source not in EXECUTION_GRADE_PRICE_SOURCES:
+        blockers.append(f"price source {quote.price_source.value} is display/reconciliation only")
+    return blockers
+
+
 def quote_blockers(
     quote: Quote | None,
     capability: ProviderCapability | None,
@@ -231,20 +268,10 @@ def quote_blockers(
     live overnight AAPL book was both stale *and* 1024 bps wide, and a book that
     wide during regular hours would be fresh and still unusable.
     """
-    blockers: list[str] = []
-    if capability is None:
-        blockers.append("no market-data provider capability has been established")
-    elif capability.state is not CapabilityState.HEALTHY:
-        blockers.append(f"market-data provider is {capability.state.value}")
-    elif not capability.realtime_pricing_usable:
-        blockers.append("provider has no usable real-time pricing")
-
+    blockers = provider_grade_blockers(quote, capability)
     if quote is None:
-        blockers.append("no quote is available for this instrument")
         return blockers
 
-    if quote.price_source not in EXECUTION_GRADE_PRICE_SOURCES:
-        blockers.append(f"price source {quote.price_source.value} is display/reconciliation only")
     if not quote.is_two_sided:
         blockers.append("quote is not two-sided (no live bid or no live ask)")
     if quote.price is None or quote.price <= 0:

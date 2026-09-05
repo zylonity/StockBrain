@@ -5,7 +5,7 @@ output other than two scalars the caller already validated -- an action and a
 confidence factor bounded by the risk configuration -- and neither can raise a
 size above what the caps permit.
 
-Three choices are worth their reasons:
+Four choices are worth their reasons:
 
 * **The reference price is the marketable side, not the mid.**  A market buy
   lifts the ask and a market sell hits the bid.  Sizing a buy against the mid
@@ -19,6 +19,16 @@ Three choices are worth their reasons:
   but off by default.
 * **A size that rounds to nothing is not a trade.**  It is reported as
   non-executable with the reason, rather than as a zero-quantity order.
+* **The caps move to the price, never the price to the caps.**  Every ceiling
+  arrives denominated in the *account* currency and every price is denominated
+  in the *instrument's*.  Converting the ceiling into the instrument's currency
+  and dividing there is the arithmetic that is actually defined; dividing a GBP
+  ceiling by a USD ask is the operation Phase 6 refused to perform, and it is
+  what the FX snapshot exists to replace.  A snapshot that may not convert
+  raises, and every caller reaches this function only after ``fx_available``
+  and ``fx_freshness`` have passed -- but the raise is caught here and reported
+  as a non-executable size, because a sizing function that can throw is a
+  sizing function that can take down a sweep.
 """
 
 from __future__ import annotations
@@ -27,7 +37,13 @@ from decimal import ROUND_DOWN, Decimal
 
 from stockbrain.enums import OrderSide, ThesisAction
 from stockbrain.risk.config import RiskConfig
-from stockbrain.risk.models import ZERO, AccountState, InstrumentIdentity, QuoteSnapshot
+from stockbrain.risk.models import (
+    ZERO,
+    AccountState,
+    FxSnapshot,
+    InstrumentIdentity,
+    QuoteSnapshot,
+)
 from stockbrain.risk.models import SizingResult as SizingResult
 
 __all__ = ["ACTION_SIDES", "size_trade"]
@@ -55,55 +71,49 @@ def size_trade(
     account: AccountState | None,
     max_notional: Decimal,
     size_factor: Decimal = Decimal(1),
+    fx: FxSnapshot | None = None,
 ) -> SizingResult:
     """Produce the order parameters, or explain why there are none.
 
     ``max_notional`` is the minimum of every applicable cap, already computed by
-    the engine.  ``size_factor`` is the product of every reduction factor
-    (research confidence, a wide-spread policy) and is always in ``(0, 1]``.
+    the engine, and is denominated in the **account** currency.  ``size_factor``
+    is the product of every reduction factor (research confidence, a
+    wide-spread policy) and is always in ``(0, 1]``.  ``fx`` carries the
+    conversion between the account and instrument currencies; ``None`` is
+    treated as "same currency", which is only ever reached when the two codes
+    already agree.
     """
     side = ACTION_SIDES[action]
     reasons: list[str] = []
     currency = identity.currency
+    account_currency = account.currency if account else None
+    snapshot = fx or FxSnapshot.same_currency_snapshot(currency or account_currency or "")
 
     if side is None:
-        return SizingResult(
+        return _nothing(
             side=None,
-            quantity=ZERO,
-            target_notional=ZERO,
-            max_quantity=ZERO,
-            max_notional=ZERO,
-            reference_price=None,
             currency=currency,
+            account_currency=account_currency,
             reasons=(f"{action.value} produces no executable order",),
-            executable=False,
         )
 
     if quote is None or quote.bid is None or quote.ask is None:
-        return SizingResult(
+        return _nothing(
             side=side,
-            quantity=ZERO,
-            target_notional=ZERO,
-            max_quantity=ZERO,
-            max_notional=max_notional,
-            reference_price=None,
             currency=currency,
+            account_currency=account_currency,
+            max_notional=max_notional,
             reasons=("no two-sided quote, so there is no reference price",),
-            executable=False,
         )
 
     reference_price = quote.ask if side is OrderSide.BUY else quote.bid
     if reference_price <= ZERO:
-        return SizingResult(
+        return _nothing(
             side=side,
-            quantity=ZERO,
-            target_notional=ZERO,
-            max_quantity=ZERO,
-            max_notional=max_notional,
-            reference_price=None,
             currency=currency,
+            account_currency=account_currency,
+            max_notional=max_notional,
             reasons=("the marketable side of the quote carries no positive price",),
-            executable=False,
         )
     reasons.append(
         f"reference price {reference_price} is the "
@@ -111,24 +121,84 @@ def size_trade(
         f"{side.value.lower()} actually trades against"
     )
 
-    if side is OrderSide.BUY:
-        return _size_buy(
+    if snapshot.conversion_required:
+        if not snapshot.usable:
+            # Reached only if a caller bypassed the gates. Reported rather than
+            # raised, and carrying no size.
+            return _nothing(
+                side=side,
+                currency=currency,
+                account_currency=account_currency,
+                max_notional=max_notional,
+                reference_price=reference_price,
+                reasons=("the FX snapshot may not convert: " + "; ".join(snapshot.blockers),),
+            )
+        reasons.append(
+            f"caps are denominated in {snapshot.account_currency} and the price in "
+            f"{snapshot.instrument_currency}; converted at {snapshot.pair}="
+            f"{snapshot.rate} from {snapshot.provider} "
+            f"({snapshot.direction().value.lower()})"
+        )
+
+    try:
+        if side is OrderSide.BUY:
+            return _size_buy(
+                config=config,
+                identity=identity,
+                reference_price=reference_price,
+                currency=currency,
+                account_currency=account_currency,
+                fx=snapshot,
+                max_notional=max_notional,
+                size_factor=size_factor,
+                reasons=reasons,
+            )
+        return _size_sell(
+            action=action,
             config=config,
             identity=identity,
+            account=account,
             reference_price=reference_price,
             currency=currency,
-            max_notional=max_notional,
-            size_factor=size_factor,
+            account_currency=account_currency,
+            fx=snapshot,
             reasons=reasons,
         )
-    return _size_sell(
-        action=action,
-        config=config,
-        identity=identity,
-        account=account,
+    except ValueError as exc:  # pragma: no cover - the gates run first
+        reasons.append(f"the conversion could not be performed: {exc}")
+        return _nothing(
+            side=side,
+            currency=currency,
+            account_currency=account_currency,
+            max_notional=max_notional,
+            reference_price=reference_price,
+            reasons=tuple(reasons),
+        )
+
+
+def _nothing(
+    *,
+    side: OrderSide | None,
+    currency: str | None,
+    account_currency: str | None,
+    reasons: tuple[str, ...],
+    max_notional: Decimal = ZERO,
+    reference_price: Decimal | None = None,
+) -> SizingResult:
+    """A non-executable result.  Carries no quantity at all, never a zero order."""
+    return SizingResult(
+        side=side,
+        quantity=ZERO,
+        target_notional=ZERO,
+        max_quantity=ZERO,
+        max_notional=max_notional,
         reference_price=reference_price,
         currency=currency,
+        account_currency=account_currency,
+        notional_account_currency=ZERO,
+        max_notional_instrument_currency=ZERO,
         reasons=reasons,
+        executable=False,
     )
 
 
@@ -138,11 +208,12 @@ def _size_buy(
     identity: InstrumentIdentity,
     reference_price: Decimal,
     currency: str | None,
+    account_currency: str | None,
+    fx: FxSnapshot,
     max_notional: Decimal,
     size_factor: Decimal,
     reasons: list[str],
 ) -> SizingResult:
-    max_quantity = _round_quantity(max_notional / reference_price, config)
     if max_notional <= ZERO:
         reasons.append("no notional headroom remains for an exposure-increasing trade")
         return SizingResult(
@@ -153,41 +224,60 @@ def _size_buy(
             max_notional=ZERO,
             reference_price=reference_price,
             currency=currency,
+            account_currency=account_currency,
+            notional_account_currency=ZERO,
+            max_notional_instrument_currency=ZERO,
             reasons=tuple(reasons),
             executable=False,
         )
 
-    target_notional = max_notional * size_factor
-    if size_factor < Decimal(1):
-        reasons.append(f"size factor {size_factor} reduces {max_notional} to {target_notional}")
+    # The cap, moved into the currency the price is quoted in. Every quantity
+    # below is derived from this number, so the conversion happens exactly once.
+    max_notional_instrument = fx.to_instrument_currency(max_notional)
+    max_quantity = _round_quantity(max_notional_instrument / reference_price, config)
 
-    quantity = _round_quantity(target_notional / reference_price, config)
+    target_notional_instrument = max_notional_instrument * size_factor
+    if size_factor < Decimal(1):
+        reasons.append(
+            f"size factor {size_factor} reduces {max_notional_instrument} to "
+            f"{target_notional_instrument} {currency or ''}".rstrip()
+        )
+
+    quantity = _round_quantity(target_notional_instrument / reference_price, config)
     if quantity > max_quantity:  # pragma: no cover - defensive; factor is <= 1
         quantity = max_quantity
     actual_notional = quantity * reference_price
+    actual_notional_account = fx.to_account_currency(actual_notional)
 
     if quantity <= ZERO:
         reasons.append(
-            f"a target of {target_notional} {currency or ''} buys less than one "
+            f"a target of {target_notional_instrument} {currency or ''} buys less than one "
             f"{'unit' if config.allow_fractional_quantity else 'whole share'} "
             f"at {reference_price}"
         )
         return SizingResult(
             side=OrderSide.BUY,
             quantity=ZERO,
-            target_notional=target_notional,
+            target_notional=target_notional_instrument,
             max_quantity=max_quantity,
             max_notional=max_notional,
             reference_price=reference_price,
             currency=currency,
+            account_currency=account_currency,
+            notional_account_currency=fx.to_account_currency(target_notional_instrument),
+            max_notional_instrument_currency=max_notional_instrument,
             reasons=tuple(reasons),
             executable=False,
         )
 
-    if actual_notional < config.min_trade_notional:
+    # The minimum trade notional is an account-currency limit, like every other
+    # RISK_* money value, so it is compared against the converted number rather
+    # than against the instrument-currency one.
+    if actual_notional_account < config.min_trade_notional:
         reasons.append(
-            f"{quantity} share(s) at {reference_price} is {actual_notional}, below the "
-            f"{config.min_trade_notional} minimum trade notional"
+            f"{quantity} share(s) at {reference_price} is {actual_notional_account} "
+            f"{account_currency or ''}, below the {config.min_trade_notional} minimum "
+            f"trade notional".replace("  ", " ")
         )
         return SizingResult(
             side=OrderSide.BUY,
@@ -197,14 +287,22 @@ def _size_buy(
             max_notional=max_notional,
             reference_price=reference_price,
             currency=currency,
+            account_currency=account_currency,
+            notional_account_currency=actual_notional_account,
+            max_notional_instrument_currency=max_notional_instrument,
             reasons=tuple(reasons),
             executable=False,
         )
 
     reasons.append(
         f"{quantity} share(s) at {reference_price} commits {actual_notional} "
-        f"of the {max_notional} permitted"
+        f"of the {max_notional_instrument} permitted"
     )
+    if fx.conversion_required:
+        reasons.append(
+            f"that is {actual_notional_account} {account_currency or ''} against the "
+            f"{max_notional} {account_currency or ''} cap".replace("  ", " ")
+        )
     if identity.max_open_quantity is not None:
         reasons.append(f"the broker caps open quantity at {identity.max_open_quantity}")
     return SizingResult(
@@ -215,6 +313,9 @@ def _size_buy(
         max_notional=max_notional,
         reference_price=reference_price,
         currency=currency,
+        account_currency=account_currency,
+        notional_account_currency=actual_notional_account,
+        max_notional_instrument_currency=max_notional_instrument,
         reasons=tuple(reasons),
         executable=True,
     )
@@ -228,6 +329,8 @@ def _size_sell(
     account: AccountState | None,
     reference_price: Decimal,
     currency: str | None,
+    account_currency: str | None,
+    fx: FxSnapshot,
     reasons: list[str],
 ) -> SizingResult:
     """Reduce or close an owned long.
@@ -243,16 +346,12 @@ def _size_sell(
         reasons.append(
             f"{action.value} needs an existing long position; none is available for trading"
         )
-        return SizingResult(
+        return _nothing(
             side=OrderSide.SELL,
-            quantity=ZERO,
-            target_notional=ZERO,
-            max_quantity=ZERO,
-            max_notional=ZERO,
-            reference_price=reference_price,
             currency=currency,
+            account_currency=account_currency,
+            reference_price=reference_price,
             reasons=tuple(reasons),
-            executable=False,
         )
 
     if action is ThesisAction.SELL:
@@ -275,15 +374,20 @@ def _size_sell(
             )
 
     max_quantity = _round_quantity(available, config)
+    max_notional_instrument = max_quantity * reference_price
+    max_notional_account = fx.to_account_currency(max_notional_instrument)
     if quantity <= ZERO:
         return SizingResult(
             side=OrderSide.SELL,
             quantity=ZERO,
             target_notional=ZERO,
             max_quantity=max_quantity,
-            max_notional=max_quantity * reference_price,
+            max_notional=max_notional_account,
             reference_price=reference_price,
             currency=currency,
+            account_currency=account_currency,
+            notional_account_currency=ZERO,
+            max_notional_instrument_currency=max_notional_instrument,
             reasons=tuple(reasons),
             executable=False,
         )
@@ -294,9 +398,12 @@ def _size_sell(
         quantity=quantity,
         target_notional=notional,
         max_quantity=max_quantity,
-        max_notional=max_quantity * reference_price,
+        max_notional=max_notional_account,
         reference_price=reference_price,
         currency=currency,
+        account_currency=account_currency,
+        notional_account_currency=fx.to_account_currency(notional),
+        max_notional_instrument_currency=max_notional_instrument,
         reasons=tuple(reasons),
         executable=True,
     )

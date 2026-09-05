@@ -663,6 +663,138 @@ class IngestionStatsResponse(ApiModel):
     latest_source_at: dt.datetime | None
 
 
+class FirecrawlUsageResponse(ApiModel):
+    searches: int
+    scrapes: int
+    estimated_credits: int
+    provider_reported_credits: int
+    pages_scraped: int
+
+
+class FirecrawlBudgetResponse(ApiModel):
+    """Firecrawl's cadence and spend, with no key and no secret in it.
+
+    Every field here exists because Phase 2 had none of them: the only visible
+    signal that 21 searches an hour were emptying a credit allowance was a
+    Prometheus counter nobody was scraping, and HTTP 402 twenty-nine searches
+    later.
+    """
+
+    enabled: bool
+    blockers: list[str]
+    exhausted: bool
+    exhausted_reasons: list[str]
+    search_exhausted: bool
+    scrape_exhausted: bool
+    today: FirecrawlUsageResponse
+    month: FirecrawlUsageResponse
+    max_searches_per_day: int
+    max_scrapes_per_day: int
+    daily_credit_cap: int
+    monthly_credit_cap: int
+    searches_remaining_today: int
+    scrapes_remaining_today: int
+    daily_credits_remaining: int
+    monthly_credits_remaining: int
+    min_topic_interval_minutes: int
+    search_result_limit: int
+    search_sources: list[str]
+    scrape_enabled: bool
+    day_start: dt.datetime
+    month_start: dt.datetime
+    last_successful_call_at: dt.datetime | None = None
+    last_call_at: dt.datetime | None = None
+    recent_results_returned: int | None = None
+    per_topic: list[FirecrawlTopicUsageResponse] = Field(default_factory=list)
+
+
+class FirecrawlTopicUsageResponse(ApiModel):
+    """One query's cadence, so "why has this not run" has an answer."""
+
+    topic: str
+    query: str
+    enabled: bool
+    last_run_at: dt.datetime | None
+    last_success_at: dt.datetime | None
+    next_eligible_at: dt.datetime | None
+    effective_interval_minutes: int
+    consecutive_failures: int
+    searches_performed: int
+    results_seen: int
+    credits_used: int
+    last_error: str | None
+
+
+class FxStatusResponse(ApiModel):
+    """Foreign-exchange source, freshness and grade.
+
+    Reported because cross-currency sizing depends on it entirely: on a GBP
+    account holding USD listings, "no FX" and "stale FX" are the difference
+    between a working system and one that blocks every proposal it can price.
+    """
+
+    provider: str
+    grade: str | None
+    configured: bool
+    available: bool
+    blockers: list[str]
+    detail: str | None = None
+    max_age_seconds: float
+    reference_max_age_seconds: float
+    allow_reference_grade: bool
+    max_rate_drift_pct: Decimal
+    probe_pair: str
+    probe_rate: Decimal | None = None
+    probe_age_seconds: Decimal | None = None
+    probe_provider_timestamp: dt.datetime | None = None
+
+
+class JobQueueHealthResponse(ApiModel):
+    """Operational visibility for the PostgreSQL job queue.
+
+    "The queue is the audit trail" is only true if somebody can read it. These
+    are the five questions an operator actually asks when the pipeline has
+    stopped moving.
+    """
+
+    pending: int
+    running: int
+    failed: int
+    dead: int
+    """Jobs that exhausted ``max_attempts``. Terminal; they never run again
+    without an operator, which is exactly why they need surfacing."""
+
+    oldest_pending_age_seconds: float | None
+    oldest_pending_job_type: str | None
+    stuck: int
+    """RUNNING with a lock older than ``JOB_CLAIM_TIMEOUT_SECONDS`` -- a worker
+    that died, or a handler that hangs."""
+
+    stuck_job_types: list[str]
+    counts_by_type: dict[str, int]
+    counts_by_status: dict[str, int]
+
+
+class WebSecurityResponse(ApiModel):
+    """The HTTP surface's own posture, reported rather than assumed."""
+
+    auth_enabled: bool
+    auth_effective: bool
+    """``auth_enabled`` and nothing missing.  The two differ when
+    authentication is switched on but has no password hash or no signing key,
+    in which case every protected route answers 503 -- which is safe, and worth
+    being able to see."""
+
+    blockers: list[str]
+    trusted_network_acknowledged: bool
+    session_ttl_seconds: int
+    cookie_secure: bool
+    cookie_samesite: str
+    csrf_header: str
+    public_paths: list[str]
+    cors_allow_origins: list[str]
+
+
 class DiscoveryStatusResponse(ApiModel):
     discovery_enabled: bool
     paused: bool
@@ -674,3 +806,5 @@ class DiscoveryStatusResponse(ApiModel):
     scheduled_tasks: list[dict[str, object]]
     stats: IngestionStatsResponse
     budget: LlmBudgetResponse | None = None
+    firecrawl: FirecrawlBudgetResponse | None = None
+    queue: JobQueueHealthResponse | None = None

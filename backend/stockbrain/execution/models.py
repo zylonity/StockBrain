@@ -26,6 +26,7 @@ __all__ = [
     "BrokerOrderView",
     "CandidateSearch",
     "ExecutionCommand",
+    "PendingOrderCount",
     "PreflightRefusal",
 ]
 
@@ -124,6 +125,45 @@ class BrokerAcknowledgement:
     http_status: int
     payload: dict[str, Any]
     rate_limit: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingOrderCount:
+    """How many orders are already queued at the broker for one listing.
+
+    Trading 212 documents a functional limit of **50 pending orders per ticker
+    per account**.  Phase 8's live verification made that limit reachable rather
+    than theoretical: an ``AAPL_US_EQ`` market order submitted while the market
+    was closed returned HTTP 200 with status ``NEW`` and sat in the queue.
+    Repeat that on a schedule and the fifty-first submission is rejected by the
+    broker -- which is a rejection StockBrain can see coming and should not
+    provoke.
+
+    ``read_ok`` is the field that matters.  A count StockBrain could not obtain
+    is not a count of zero: it is an unknown, and the conservative response to
+    an unknown standing between us and a non-idempotent POST is to refuse.
+    """
+
+    broker_ticker: str
+    pending: int
+    read_ok: bool
+    api_initiated: int = 0
+    """How many of them StockBrain placed (``initiatedFrom == "API"``).  Not the
+    number the limit is measured against -- the broker counts every pending
+    order for the ticker, including ones placed by hand in the app -- but it is
+    the number an operator needs to see when deciding whether the queue is
+    theirs or ours."""
+
+    error_category: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "broker_ticker": self.broker_ticker,
+            "pending": self.pending,
+            "api_initiated": self.api_initiated,
+            "read_ok": self.read_ok,
+            "error_category": self.error_category,
+        }
 
 
 @dataclass(frozen=True, slots=True)

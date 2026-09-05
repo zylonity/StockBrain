@@ -23,6 +23,8 @@ pytestmark = pytest.mark.integration
 async def client(migrated_database: str) -> AsyncIterator[httpx.AsyncClient]:
     settings = Settings(
         app_env="test",
+        # These tests exercise the read API, not the login flow.
+        web_auth_enabled=False,
         log_level="CRITICAL",
         database_url=migrated_database,
         stockbrain_secret_key="test-key",
@@ -98,6 +100,7 @@ async def test_health_reflects_a_database_outage_that_starts_after_startup(
     app.state.database = Database(
         Settings(
             app_env="test",
+            web_auth_enabled=False,
             log_level="CRITICAL",
             database_url="postgresql+asyncpg://nobody:nothing@127.0.0.1:1/stockbrain",
         )

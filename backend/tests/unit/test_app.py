@@ -23,6 +23,8 @@ async def unreachable_db_client() -> AsyncIterator[httpx.AsyncClient]:
     settings = Settings(
         app_env="test",
         log_level="CRITICAL",
+        # These tests are about degrading without the database, not about login.
+        web_auth_enabled=False,
         # Port 1 is reserved and never listening, so the connection fails fast.
         database_url="postgresql+asyncpg://nobody:nothing@127.0.0.1:1/stockbrain",
     )

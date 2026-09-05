@@ -448,6 +448,28 @@ class ProposalNotifier:
             proposal.updated_at = now
 
     # ------------------------------------------------------------------
+    async def send_operational_alert(self, *, title: str, body: str) -> str | None:
+        """Deliver one operational alert to every configured target.
+
+        No keyboard and no token: an alert is information. Offering an action on
+        it would be offering an action nobody validated, and the only actions
+        this system has are the ones a proposal's own buttons carry.
+
+        Returns the delivery reference for the last target, or raises. The
+        caller records the outcome; nothing here retries -- a resend cannot
+        distinguish "never arrived" from "arrived, status write failed", and
+        the second reading is a duplicate alarm.
+        """
+        if self._sender is None:
+            raise RuntimeError("the Telegram bot is not running")
+        text = f"{bold(esc(title))}\n{esc(body)}"
+        reference: str | None = None
+        for chat_id in self.targets:
+            for part in chunk(text):
+                message_id = await self._sender.send_message(chat_id, part)
+            reference = f"{chat_id}:{message_id}"
+        return reference
+
     async def blank_keyboards(self, proposal_id: uuid.UUID) -> None:
         """Remove the inline keyboards on every message about this proposal.
 

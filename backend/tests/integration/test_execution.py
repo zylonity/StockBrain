@@ -16,7 +16,6 @@ from decimal import Decimal
 import pytest
 import sqlalchemy as sa
 
-from stockbrain.config import Settings
 from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.portfolio import BrokerOrder
@@ -25,7 +24,6 @@ from stockbrain.db.models.system import AuditLog
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     AuthorizationSource,
-    Broker,
     ExecutionFailure,
     ExecutionOutcome,
     ExecutionPolicy,
@@ -40,74 +38,19 @@ from stockbrain.errors import (
     DefinitePreSendFailure,
 )
 from stockbrain.execution.service import ExecutionService
-from stockbrain.proposals.service import ProposalService
 from tests import proposal_helpers as helpers
-from tests.execution_helpers import FakeProvider, acknowledgement_for, order_view
+from tests.execution_helpers import (
+    FakeProvider,
+    acknowledgement_for,
+    authorized,
+    build,
+    execution_settings,
+    order_view,
+)
 
 pytestmark = pytest.mark.integration
 
 WEB_ACTOR = "web:local-operator"
-
-
-def execution_settings(**overrides: object) -> Settings:
-    base: dict[str, object] = {
-        # The master switch. Default false, so a deployment does not start
-        # sending the moment Phase 8 lands; every test that expects a
-        # transmission turns it on deliberately.
-        "t212_execution_enabled": True,
-    }
-    base.update(overrides)
-    return helpers.settings(**base)
-
-
-def build(
-    database: Database,
-    settings: Settings,
-    *,
-    provider: FakeProvider | None = None,
-    market_data: helpers.StubMarketData | None = None,
-) -> tuple[ProposalService, ExecutionService, FakeProvider]:
-    control = ControlStateService(database)
-    proposals = helpers.service_with(database, settings, market_data=market_data, control=control)
-    broker = provider or FakeProvider(_environment=settings.t212_env.value)
-    execution = ExecutionService(
-        database,
-        settings,
-        proposals=proposals,
-        provider=broker,
-        control=control,
-        broker=Broker.TRADING212,
-    )
-    return proposals, execution, broker
-
-
-async def authorized(
-    database: Database,
-    settings: Settings,
-    *,
-    provider: FakeProvider | None = None,
-    market_data: helpers.StubMarketData | None = None,
-    source: AuthorizationSource = AuthorizationSource.HUMAN_WEB,
-    positions: dict[str, tuple[Decimal, Decimal]] | None = None,
-    action: ThesisAction = ThesisAction.BUY,
-) -> tuple[ProposalService, ExecutionService, FakeProvider, uuid.UUID]:
-    """Seed a world and drive one proposal all the way to APPROVED."""
-    proposals, execution, broker = build(
-        database, settings, provider=provider, market_data=market_data
-    )
-    await helpers.seed(database, action=action)
-    # The account snapshot has to come from the environment under test, or
-    # `account_state_available` blocks before anything interesting happens.
-    await helpers.fund(database, positions=positions, environment=settings.t212_env.value)
-    generated = await proposals.generate(helpers.THESIS_ID)
-    assert generated.proposal_id is not None, generated.reason
-    if not generated.authorized:
-        await proposals.authorize(
-            generated.proposal_id,
-            source=source,
-            actor=WEB_ACTOR if source is AuthorizationSource.HUMAN_WEB else "telegram:4242",
-        )
-    return proposals, execution, broker, generated.proposal_id
 
 
 async def attempts_of(database: Database, proposal_id: uuid.UUID) -> list[ExecutionAttempt]:

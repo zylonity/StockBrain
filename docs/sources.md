@@ -9,7 +9,7 @@ first line of request-building code. Nothing here is guessed. Where a detail has
 not yet been checked in this repository, it is marked as carried from the
 specification and must be re-confirmed before use.
 
-Last verification pass: **2026-09-05** (Phase 5; upstream/live checks began September 4).
+Last verification pass: **2026-09-05** (Phase 9; upstream/live checks began September 4).
 
 ---
 
@@ -1111,3 +1111,286 @@ truncates it to PostgreSQL's 63-character limit with a hash suffix — producing
 `ck_execution_attempts_ck_execution_attempts_broker_outc_db79`, a name no
 migration can drop. This is Phase 6's bug #13 wearing a different hat. Drop
 constraints by their **bare** names.
+
+---
+
+# Phase 9 — cost control, foreign exchange, and the Firecrawl incident
+
+## The Firecrawl credit incident, reconstructed
+
+Evidence: `firecrawl_activity_logs.csv` (29 rows, exported from the Firecrawl
+dashboard), the PostgreSQL `jobs` table, the `sources` table, and the Phase 2
+implementation as committed in `b6dfdb7`.
+
+### What the log shows
+
+| Fact | Value |
+|---|---|
+| Calls in the log | **29**, all `kind=search`, all `api_version=v2`, all `origin=api` |
+| Window | 2026-09-05 **04:59:16.574Z → 06:01:32.060Z** = 62.1 minutes |
+| Observed rate | **28 calls/hour** over the window |
+| Distinct queries | **9** — exactly the enabled query set |
+| Follow-up scrape calls | **none** in the log; content came from `scrapeOptions` on the search |
+
+Grouped by minute, the pattern is four independent per-topic timers plus one
+full sweep at process start:
+
+```
+04:59:16-39   9 searches   every enabled query, on start-up
+05:19:54      3            ai_infrastructure          (20 min later)
+05:30:04-11   6            semiconductors/power_grid/defence (30 min)
+05:40:27      3            ai_infrastructure          (20 min)
+06:00:33-38   6            the three 30-minute topics
+06:01:31-32   2            ai_infrastructure          (third cycle)
+```
+
+Corroborated exactly by the job history: `FIRECRAWL_TOPIC_SEARCH` shows
+**29 SUCCEEDED** and **127 FAILED**, every failure
+`ProviderEntitlementError: firecrawl: subscription does not cover this resource
+(HTTP 402)`. The 29 successes are the 29 log rows; the 127 failures are
+everything after the allowance ran out.
+
+### Configured cadence, and whether topics ran independently
+
+`DEFAULT_TOPICS` seeded four enabled topics with nine enabled queries:
+
+| Topic | Interval | Queries | Searches/hour |
+|---|---|---|---|
+| `ai_infrastructure` | 20 min | 3 | 9 |
+| `semiconductors` | 30 min | 2 | 4 |
+| `power_grid` | 30 min | 2 | 4 |
+| `defence` | 30 min | 2 | 4 |
+| | | **9** | **21/hour → 504/day** |
+
+Each *query* had its own `last_run_at`, so yes: they ran independently, and the
+scheduler's one-minute tick enqueued whichever were due. The eligibility check
+was `now - last_run_at < interval`, recomputed on every tick.
+
+### Whether a restart could trigger searches early
+
+**Yes, and this is half the incident.** `Scheduler._loop` calls `task.run()`
+*immediately* on start, before its first sleep. Every enabled query whose
+`last_run_at` was older than its interval — which, after any outage longer than
+20 minutes, is all of them — was enqueued at once. That is the nine calls inside
+23 seconds at 04:59:16.
+
+### Whether duplicate jobs could queue, or two schedulers run
+
+Duplicate jobs: **no.** `uq_jobs_dedupe_key_active` on `firecrawl:{query_id}`
+allowed one outstanding job per query. Two scheduler instances: nothing
+*prevented* it, but the dedupe key would have collapsed their enqueues, and the
+observed timing is consistent with one loop. Not the cause.
+
+### Search parameters, and the actual cost
+
+| Parameter | Phase 2 value |
+|---|---|
+| `limit` | **10** — and it is documented as **per source** |
+| `sources` | `[{"type":"web"},{"type":"news"}]` → **two** |
+| Billed results per search | up to **20** |
+| `scrapeOptions` | **supplied on every search** |
+
+`DiscoveryQuerySpec.scrape_content` defaulted to `True`, and
+`handle_firecrawl_topic_search` never overrode it. **This is the single largest
+contributor.**
+
+*Does `/v2/search` scrape automatically?* No. Verified against
+<https://docs.firecrawl.dev/api-reference/endpoint/search>: without
+`scrapeOptions` a result carries title, description/snippet, URL and date. The
+scraping was requested, not implicit. StockBrain made **no** separate scrape
+calls — consistent with the log containing only `search` rows.
+
+Hard evidence that the scraping happened, from the database:
+
+```
+sources WHERE provider='FIRECRAWL':          143 rows
+  ... with metadata.has_scraped_markdown:    117
+  average length(raw_content):            33,367 bytes
+  maximum length(raw_content):         1,130,025 bytes
+```
+
+A 1.1 MB body is not a search snippet.
+
+### Billing
+
+Verified 2026-09-05 against <https://docs.firecrawl.dev/billing> and
+<https://www.firecrawl.dev/pricing>:
+
+| Operation | Cost |
+|---|---|
+| `/v2/search` | **2 credits per 10 results**, rounded up per 10 (the docs' own example: 11 results = 4 credits) |
+| `/v2/scrape` | **1 credit per page** |
+| `scrapeOptions` on a search | the per-page charge, for **every** result |
+| JSON extraction / prompt-injection check | +4 credits/page each (never requested) |
+| Failed requests | **billed** — "Credits are charged whenever Firecrawl's infrastructure processes a request, even if the target site returns an HTTP error status code" |
+| Free allowance | 1,000 credits/month |
+
+So one Phase 2 search cost **≈24 credits**: 4 for a 20-result search plus up to
+20 for the scraped pages.
+
+| | Phase 2 | Phase 9 default |
+|---|---|---|
+| Searches/day | 504 | 10 (capped at 12) |
+| Credits/search | ~24 | **2** |
+| Scrapes/day | 0 separate (20/search) | ≤6, one credit each |
+| **Credits/day** | **~12,000** | **≤30** |
+| Credits/month | ~363,000 | **≤900** |
+
+The CSV's 29 searches therefore represent roughly **550–700 credits in 62
+minutes** — the whole free allowance, and then HTTP 402.
+
+### Retry behaviour, and whether it multiplied the spend
+
+Two independent retry layers stacked:
+
+* `FirecrawlClient.search` passed `retry_safe=True, max_attempts=3` — up to
+  three HTTP calls per handler invocation, on 408/425/429/5xx.
+* The job used the queue's default `max_attempts=3`.
+
+Up to **nine billable requests per scheduled search** on a transient failure.
+The 402s themselves are an entitlement rejection and are unlikely to have been
+processed (and so unlikely to have been billed), but the amplification factor
+was real and is now removed: no HTTP retry, `max_attempts=1` on the job, and a
+durable failure cooldown instead.
+
+### Root cause
+
+Three faults, in order of contribution:
+
+1. **`scrape_content` defaulted to `True` and nothing overrode it**, so every
+   broad thematic search fetched every result page. A 20× cost multiplier on
+   the most frequent paid call in the system.
+2. **The cadence treated Firecrawl as a fast-news path.** 20- and 30-minute
+   intervals across nine queries is 504 searches/day for a provider whose job
+   is thematic drift — work Alpaca news and SEC EDGAR already do, unmetered.
+3. **There was no ceiling of any kind.** Credit accounting was
+   `self.last_credits_used` on the client object plus a Prometheus counter.
+   Neither survives a restart and neither can refuse a call, so nothing in the
+   system was capable of stopping it. Compounding faults: the start-up sweep
+   re-ran everything on every restart, and two retry layers multiplied each
+   failure by up to nine.
+
+**No live Firecrawl call was made during this investigation.** The
+reconstruction is entirely from the CSV, the job history, the `sources` table
+and the committed Phase 2 code.
+
+## Firecrawl `/v2/scrape`
+
+Verified 2026-09-05 against
+<https://docs.firecrawl.dev/api-reference/endpoint/scrape>:
+
+| Detail | Finding |
+|---|---|
+| Path | `POST /v2/scrape` |
+| Response | `{"success", "data": {"markdown", "metadata": {...}}}` |
+| `creditsUsed` | **not returned** — unlike `/v2/search`. The reservation stands as the charge. |
+| `metadata.title` / `.description` | documented as `string` **or** `string[]`; collapsed to the first string rather than stringified, so a two-element array does not become `"['a', 'b']"` in a headline |
+| `maxAge` | defaults to 2 days; a cache hit may cost less, which is not documented as a discount and is therefore not assumed |
+| Documented errors | 402, 429, 500 |
+
+## Alpaca forex — measured entitlement
+
+Sources: <https://docs.alpaca.markets/reference/latestrates-1>
+
+| Detail | Finding |
+|---|---|
+| Path | `GET https://data.alpaca.markets/v1beta1/forex/latest/rates` |
+| Parameter | `currency_pairs`, comma-separated market-convention pairs (`GBPUSD`) |
+| Auth | the same `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` as the equity endpoints |
+| Response | `{"rates": {"GBPUSD": {"bp", "mp", "ap", "t"}}}` — bid, mid, ask, and an RFC 3339 instant with **nanosecond** precision |
+| **Entitlement, measured live 2026-09-05** | **HTTP 403 `{"message":"forbidden: insufficient grants"}`** |
+
+The credential that reads IEX equity data does **not** cover forex. This is a
+fact about the subscription, not about the key — which is exactly the
+distinction Phase 4's finding about Alpaca's ambiguous 403 was about, and the
+same `refine_error` hook tells them apart. `datetime.fromisoformat` accepts at
+most microseconds, so the nanosecond fraction is truncated rather than rejected:
+losing nanoseconds from a check measured in seconds is free, losing the rate is
+not.
+
+**Consequence:** on the current plan, cross-currency sizing needs another
+source, and an execution-grade FX feed for this account requires a paid Alpaca
+subscription (or an equivalent provider). This is a real remaining blocker, not
+a code gap.
+
+## Frankfurter — the reference-grade fallback
+
+Sources: <https://frankfurter.dev/>, and a live read on 2026-09-05.
+
+| Detail | Finding |
+|---|---|
+| Path | `GET https://api.frankfurter.dev/v2/rates?base=GBP&quotes=USD` |
+| Auth | **none**. "No API key required." |
+| Quota | "There are no quotas. Requests are rate-limited to prevent abuse, but there are no monthly or daily caps." |
+| Response | a JSON **array**: `[{"date":"2026-09-05","base":"GBP","quote":"USD","rate":1.3521}]` |
+| v1 vs v2 | v1 returns `{"amount","base","date","rates":{...}}`. A client written against v1 finds no `rates` key on v2 at all. |
+| Data | "daily exchange rates from 84 central banks", ECB included; 201 currencies |
+| Suitability | its own documentation states it **"is not for live trading"** |
+
+Two consequences encoded in the adapter:
+
+* **Grade.** `FxRateGrade.REFERENCE`, and a reference-grade rate may size a
+  trade only with `FX_ALLOW_REFERENCE_GRADE=true`. Honouring the provider's own
+  statement is the difference between using a fixing knowingly and mistaking it
+  for a dealable quote.
+* **Timestamp precision.** The response carries a *date* and no time, so the
+  provider timestamp is taken as **00:00 UTC on that date**. That over-states
+  the age, which can only make a freshness check stricter. Central banks do not
+  publish at weekends, so a Monday-morning rate is dated the previous Friday and
+  cross-currency sizing blocks until the next fixing — when equity markets are
+  closed anyway.
+
+## Bugs found by the Phase 9 work
+
+### 22. `RISK_REQUIRE_SAME_CURRENCY=false` silently mis-sized
+
+Phase 6's `currency_alignment` returned **`WARN`** when the operator permitted a
+currency mismatch, and nothing else blocked. Sizing then divided an
+account-currency ceiling by an instrument-currency price:
+`max_notional / reference_price` with a GBP numerator and a USD denominator. The
+quantity that came out was wrong by the exchange rate — about 35% too small on
+GBP/USD, and in the unsafe direction for the inverse pair — with only a warning
+nobody had to act on.
+
+The rule is now split in two: `currency_alignment` is the *policy* ("may these
+differ?") and `fx_available` / `fx_freshness` are the *capability* ("is there a
+verified rate?"). There is no configuration in which a mismatch is permitted and
+unpriced, and the pairing of `RISK_REQUIRE_SAME_CURRENCY=false` with
+`FX_PROVIDER=none` is refused at startup.
+
+### 23. A stale quote destroyed authorized proposals
+
+`price_source_execution_grade` reported `quote.provider_blockers`, and
+`quote_blockers` includes the *age*. So a quote one minute stale blocked a rule
+that Phase 8's send-time preflight classifies as "a statement about the trade" —
+non-transient — and the authorized proposal was **invalidated**. A market-data
+provider running slightly behind would have retired every authorized proposal it
+touched.
+
+`provider_grade_blockers` now returns entitlement and provenance only; age
+belongs to `quote_freshness` and width to `spread_ceiling`, each with its own
+numbers. This is Phase 4's bug #9 (the capability probe conflating entitlement
+with freshness) and Phase 8's bug #21 (`_TRANSIENT_RULE_IDS` too naive) at a
+third layer.
+
+### 24. `authorization_envelope` reported a side change on a blocked decision
+
+A blocked decision deliberately carries no size — `RiskEngine.evaluate` does not
+call `size_trade` at all — so `sizing.side` is `None`, and the envelope check
+reported "the deterministic side changed since generation (BUY → none)". That
+reads as a statement about the trade and retires the proposal, and *any* block
+produced it: a stale quote, a provider outage, a missing account snapshot.
+
+It now records `WARN` on a blocked decision: a rule that could not run. The
+rules that actually blocked are in the list, and their own transient/permanent
+classification is the verdict.
+
+### 25. `broker_max_open_quantity` was denominated in the wrong currency
+
+Every other notional cap is computed from the account snapshot and is in the
+account currency. This one is `remaining_quantity × mid` — an
+*instrument*-currency number — sitting in a list whose minimum is taken. Phase 6
+could ignore it because the two currencies were required to match; with FX in
+play it is 35% too small on a GBP/USD pair and silently becomes the binding cap.
+It is now converted, and omitted entirely rather than guessed when no usable
+rate exists.

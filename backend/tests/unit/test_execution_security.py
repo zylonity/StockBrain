@@ -248,10 +248,14 @@ def test_the_provider_interface_offers_no_arbitrary_request_method() -> None:
         if not name.startswith("_")
     }
     # `broker` is a class-level annotation rather than a member, so it does not
-    # appear here; the four operations plus `environment` are the whole surface.
+    # appear here; the five operations plus `environment` are the whole surface.
+    # `count_pending` joined in Phase 9 to enforce Trading 212's documented
+    # 50-pending-orders-per-ticker limit; it is a *read*, and adding it did not
+    # add a mutation.
     assert members == {
         "environment",
         "reserve_slot",
+        "count_pending",
         "submit",
         "fetch_order",
         "find_candidates",

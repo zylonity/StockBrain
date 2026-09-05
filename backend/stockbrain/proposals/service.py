@@ -80,6 +80,8 @@ from stockbrain.errors import (
     ProposalInvalidated,
     RiskBlocked,
 )
+from stockbrain.fx.base import normalize_currency
+from stockbrain.fx.service import FxService
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
 from stockbrain.market_data.base import MarketDataProvider
@@ -96,6 +98,7 @@ from stockbrain.risk.engine import RiskEngine
 from stockbrain.risk.models import (
     ZERO,
     AccountState,
+    FxSnapshot,
     InstrumentIdentity,
     QuoteSnapshot,
     ReservedExposure,
@@ -103,7 +106,12 @@ from stockbrain.risk.models import (
     RiskInputs,
     RuleResult,
 )
-from stockbrain.risk.rules import action_is_executable, proposal_ttl, reference_price_drift
+from stockbrain.risk.rules import (
+    action_is_executable,
+    fx_rate_drift,
+    proposal_ttl,
+    reference_price_drift,
+)
 
 __all__ = ["AuthorizationResult", "GenerationResult", "ProposalService", "Revalidation"]
 
@@ -154,6 +162,7 @@ class Revalidation:
     rules: tuple[RuleResult, ...]
     quote: QuoteSnapshot | None
     account: AccountState | None
+    fx: FxSnapshot | None = None
     quote_reason: str | None = None
     account_reason: str | None = None
 
@@ -182,6 +191,7 @@ class Revalidation:
             "snapshot_hash": self.decision.snapshot_hash(),
             "quote_missing_reason": self.quote_reason,
             "account_missing_reason": self.account_reason,
+            "fx": self.fx.as_dict() if self.fx else None,
         }
 
 
@@ -221,6 +231,7 @@ class ProposalService:
         risk_config: RiskConfig,
         account_state: AccountStateService,
         market_data: MarketDataProvider | None,
+        fx: FxService | None = None,
         broker: Broker = Broker.TRADING212,
         engine: RiskEngine | None = None,
         control: ControlStateService | None = None,
@@ -230,6 +241,10 @@ class ProposalService:
         self.config = risk_config
         self.account_state = account_state
         self.quotes = QuoteFetcher(market_data)
+        # Optional so a same-currency deployment (and a unit test) needs no FX
+        # source at all. Absent, `_fx_snapshot` reports "no provider" for a
+        # cross-currency pair, which blocks -- it never falls back to parity.
+        self.fx = fx or FxService(settings, provider=None)
         self.broker = broker
         self.engine = engine or RiskEngine()
         self.queue = JobQueue()
@@ -268,6 +283,50 @@ class ProposalService:
                 "signed it off. No broker order has been sent; order transmission is Phase 8."
             ),
         }
+
+    async def _fx_snapshot(
+        self,
+        *,
+        account: AccountState | None,
+        instrument_currency: str | None,
+        now: dt.datetime,
+    ) -> FxSnapshot | None:
+        """Assemble the FX facts for one account/instrument pair.
+
+        ``None`` only when the currencies themselves are unknown -- at which
+        point ``currency_alignment`` blocks on that, and reporting a snapshot
+        would imply more was known than is.
+
+        No caching and no fallback, exactly as with quotes: a rate is fetched
+        when it is needed, and there is no second source to quietly substitute.
+        """
+        account_currency = normalize_currency(account.currency if account else None)
+        listing_currency = normalize_currency(instrument_currency)
+        if not account_currency or not listing_currency:
+            return None
+        if account_currency == listing_currency:
+            return FxSnapshot.same_currency_snapshot(account_currency)
+
+        resolution = await self.fx.resolve(
+            from_currency=account_currency, to_currency=listing_currency, now=now
+        )
+        rate = resolution.rate
+        return FxSnapshot(
+            account_currency=account_currency,
+            instrument_currency=listing_currency,
+            same_currency=False,
+            blockers=resolution.blockers,
+            rate=rate.rate if rate else None,
+            base_currency=rate.base_currency if rate else None,
+            quote_currency=rate.quote_currency if rate else None,
+            provider=rate.provider if rate else resolution.provider,
+            grade=rate.grade if rate else None,
+            rate_type=rate.rate_type if rate else None,
+            provider_timestamp=rate.provider_timestamp if rate else None,
+            received_at=rate.received_at if rate else None,
+            age_seconds=rate.age_seconds(now) if rate else None,
+            provider_timestamp_precision=(rate.provider_timestamp_precision if rate else None),
+        )
 
     async def control_blockers(self) -> list[str]:
         """Every durable reason proposal work is currently halted.
@@ -351,6 +410,11 @@ class ProposalService:
                     session, candidate.instrument, self.config, now=moment
                 )
 
+        fx = await self._fx_snapshot(
+            account=account,
+            instrument_currency=candidate.identity.currency,
+            now=moment,
+        )
         account_id = account.account_id if account else DEFAULT_ACCOUNT_ID
 
         async with self.database.transaction() as session:
@@ -372,6 +436,7 @@ class ProposalService:
                     quote=quote,
                     reserved=reserved,
                     now=moment,
+                    fx=fx,
                     account_state_missing_reason=account_reason,
                     quote_missing_reason=quote_reason,
                 ),
@@ -425,6 +490,7 @@ class ProposalService:
                 decision=decision,
                 quote=quote,
                 account=account,
+                fx=fx,
                 now=moment,
             )
             session.add(proposal)
@@ -597,6 +663,15 @@ class ProposalService:
                     session, instrument, self.config, now=moment
                 )
 
+        # Re-resolved here, not carried from generation. An authorization that
+        # trusted the rate the proposal was drafted with would be authorizing a
+        # size derived from a number that may be hours old.
+        fx = await self._fx_snapshot(
+            account=account,
+            instrument_currency=instrument.currency if instrument else None,
+            now=moment,
+        )
+
         refusal: RiskBlocked | None = None
         async with self.database.transaction() as session:
             await self._lock_account(session, account_id)
@@ -634,12 +709,17 @@ class ProposalService:
                     quote=quote,
                     reserved=reserved,
                     now=moment,
+                    fx=fx,
+                    authorized_fx_rate=locked.fx_rate,
                     account_state_missing_reason=account_reason,
                     quote_missing_reason=quote_reason,
                 ),
                 now=moment,
             )
-            rules = (*decision.rules, *self._authorization_rules(locked, decision, quote, moment))
+            rules = (
+                *decision.rules,
+                *self._authorization_rules(locked, decision, quote, fx, moment),
+            )
             blocked = [rule for rule in rules if rule.outcome is RuleOutcome.BLOCK]
             outcome = RiskOutcome.BLOCK if blocked else decision.outcome
 
@@ -807,6 +887,12 @@ class ProposalService:
                     session, instrument, self.config, now=moment
                 )
 
+        fx = await self._fx_snapshot(
+            account=account,
+            instrument_currency=instrument.currency if instrument else None,
+            now=moment,
+        )
+
         async with self.database.session() as session:
             fresh = await session.get(TradeProposal, proposal_id)
             if fresh is None:  # pragma: no cover - selected a moment ago
@@ -825,6 +911,8 @@ class ProposalService:
                     quote=quote,
                     reserved=reserved,
                     now=moment,
+                    fx=fx,
+                    authorized_fx_rate=fresh.fx_rate,
                     account_state_missing_reason=account_reason,
                     quote_missing_reason=quote_reason,
                 ),
@@ -832,7 +920,7 @@ class ProposalService:
             )
             rules = (
                 *decision.rules,
-                *self._authorization_rules(fresh, decision, quote, moment),
+                *self._authorization_rules(fresh, decision, quote, fx, moment),
             )
         return Revalidation(
             proposal_id=proposal_id,
@@ -840,6 +928,7 @@ class ProposalService:
             rules=rules,
             quote=quote,
             account=account,
+            fx=fx,
             quote_reason=quote_reason,
             account_reason=account_reason,
         )
@@ -1087,6 +1176,17 @@ class ProposalService:
                 for proposal in proposals
             }
 
+        account, _ = await self.account_state.load(
+            max_age_seconds=self.config.max_account_state_age_seconds, now=now
+        )
+        # One rate per currency pair per sweep pass, not one per proposal. Every
+        # proposal in this pass is judged against the same `now`, so they would
+        # all receive the same rate; asking a free public API five times a minute
+        # for the same number is impolite rather than safer. The memo is local
+        # to this call and dies with it -- it is not a cache across sweeps,
+        # which is what would let a stale rate be reused.
+        fx_by_pair: dict[tuple[str, str], FxSnapshot | None] = {}
+
         count = 0
         for proposal in proposals:
             instrument = instruments.get(proposal.id)
@@ -1096,7 +1196,20 @@ class ProposalService:
                 quote, quote_reason = await self.quotes.fetch(
                     session, instrument, self.config, now=now
                 )
-            failure = self._market_failure(proposal, quote, quote_reason, now)
+            fx: FxSnapshot | None = None
+            if proposal.fx_required:
+                pair_key = (
+                    normalize_currency(account.currency if account else None),
+                    normalize_currency(instrument.currency),
+                )
+                if pair_key not in fx_by_pair:
+                    fx_by_pair[pair_key] = await self._fx_snapshot(
+                        account=account,
+                        instrument_currency=instrument.currency,
+                        now=now,
+                    )
+                fx = fx_by_pair[pair_key]
+            failure = self._market_failure(proposal, quote, quote_reason, fx, now)
             if failure is None:
                 continue
             async with self.database.transaction() as session:
@@ -1138,6 +1251,7 @@ class ProposalService:
         proposal: TradeProposal,
         quote: QuoteSnapshot | None,
         quote_reason: str | None,
+        fx: FxSnapshot | None,
         now: dt.datetime,
     ) -> str | None:
         """Whether the market has moved out from under a live proposal.
@@ -1147,7 +1261,19 @@ class ProposalService:
         would make an outage destructive rather than merely degrading.  A quote
         that arrives and is bad -- too wide, or too far from the reference
         price -- is a real change and does invalidate.
+
+        The exchange rate is treated exactly the same way, and for the same
+        reason: on a GBP account holding a USD listing, the account-currency
+        size the operator is looking at is the product of the price *and* the
+        rate.  A missing rate degrades; a rate that arrived and has moved past
+        the envelope invalidates.
         """
+        if proposal.fx_required and fx is not None and fx.usable:
+            drift_fx = fx_rate_drift(
+                proposal.fx_rate, fx, max_drift_pct=self.settings.fx_max_rate_drift_pct
+            )
+            if drift_fx.outcome is RuleOutcome.BLOCK:
+                return drift_fx.reason
         if quote is None:
             log.debug(
                 "proposal_revalidation_skipped",
@@ -1448,6 +1574,7 @@ class ProposalService:
         decision: RiskDecision,
         quote: QuoteSnapshot,
         account: AccountState,
+        fx: FxSnapshot | None,
         now: dt.datetime,
     ) -> TradeProposal:
         sizing = decision.sizing
@@ -1471,6 +1598,7 @@ class ProposalService:
             quote_timestamp=quote.provider_timestamp,
             quote_age_ms=quote.age_ms,
             estimated_notional=sizing.target_notional,
+            estimated_notional_account_currency=sizing.notional_account_currency,
             account_currency=account.currency,
             max_quantity=sizing.max_quantity,
             max_notional=sizing.max_notional,
@@ -1489,7 +1617,30 @@ class ProposalService:
             dedupe_key=self._dedupe_key(candidate.thesis.id, identity.broker_ticker),
         )
         self._apply_quote(proposal, quote)
+        self._apply_fx(proposal, fx)
         return proposal
+
+    @staticmethod
+    def _apply_fx(proposal: TradeProposal, fx: FxSnapshot | None) -> None:
+        """Record the exchange rate the size was derived from.
+
+        A same-currency proposal records ``fx_required=False`` and no rate,
+        which is a different fact from a rate of 1.0 and is stored as such.
+        """
+        if fx is None or fx.same_currency:
+            proposal.fx_required = False
+            return
+        proposal.fx_required = True
+        proposal.fx_rate = fx.rate
+        proposal.fx_base_currency = fx.base_currency
+        proposal.fx_quote_currency = fx.quote_currency
+        proposal.fx_direction = fx.direction().value
+        proposal.fx_provider = fx.provider
+        proposal.fx_rate_grade = fx.grade.value if fx.grade else None
+        proposal.fx_rate_type = fx.rate_type
+        proposal.fx_provider_timestamp = fx.provider_timestamp
+        proposal.fx_received_at = fx.received_at
+        proposal.fx_age_seconds = fx.age_seconds
 
     def _dedupe_key(self, thesis_id: uuid.UUID, broker_ticker: str) -> str:
         return hashlib.sha256(
@@ -1519,6 +1670,7 @@ class ProposalService:
         proposal: TradeProposal,
         decision: RiskDecision,
         quote: QuoteSnapshot | None,
+        fx: FxSnapshot | None,
         now: dt.datetime,
     ) -> list[RuleResult]:
         """The checks that only exist because a proposal already exists."""
@@ -1528,6 +1680,15 @@ class ProposalService:
                 proposal.reference_price,
                 quote.mid if quote else None,
                 max_drift_pct=self.config.max_reference_price_drift_pct,
+            ),
+            # The FX analogue, and load-bearing on a GBP account holding USD
+            # listings: a one percent move in the pair moves the trade's
+            # account-currency notional by one percent, straight through the
+            # per-trade cap, the cash reserve and the concentration limit.
+            fx_rate_drift(
+                proposal.fx_rate,
+                fx,
+                max_drift_pct=self.settings.fx_max_rate_drift_pct,
             ),
             _policy_version_unchanged(proposal, self.config.version),
             _envelope_still_covers(proposal, decision),
@@ -1679,12 +1840,40 @@ def _envelope_still_covers(proposal: TradeProposal, decision: RiskDecision) -> R
     Not "re-size to whatever fits now": a quantity that changes between the
     screen and the click is a quantity nobody approved.  If the envelope
     shrank, the proposal is invalidated and a new analysis is required.
+
+    **A blocked decision carries no envelope to compare against**, and saying
+    so is the whole subtlety of this function.  A blocked decision deliberately
+    produces no size at all -- ``RiskEngine.evaluate`` does not even call
+    ``size_trade`` -- so ``sizing.side`` is ``None`` and a naive comparison
+    reports "the side changed from BUY to none".  That reads as a statement
+    about the trade, which retires the proposal; and a *stale quote* is enough
+    to produce it.  A market-data provider running a minute behind would
+    therefore destroy every authorized proposal it touched.
+
+    So a blocked decision records ``WARN`` here: a rule that could not run.
+    The rules that actually blocked are already in the list, and it is their
+    own transient/permanent classification (see
+    :mod:`stockbrain.execution.preflight`) that decides whether the proposal
+    survives.  Found in Phase 9; it is the same class of mistake as Phase 8's
+    bug 21, one layer up.
     """
     sizing = decision.sizing
+    if decision.outcome is RiskOutcome.BLOCK:
+        return RuleResult(
+            rule_id="authorization_envelope",
+            rule_version=2,
+            outcome=RuleOutcome.WARN,
+            reason=(
+                "the fresh risk envelope could not be recomputed because deterministic "
+                "risk blocked before sizing; the blocking rules are the verdict"
+            ),
+            observed=None,
+            threshold=str(proposal.proposed_quantity),
+        )
     if sizing.side is not proposal.side:
         return RuleResult(
             rule_id="authorization_envelope",
-            rule_version=1,
+            rule_version=2,
             outcome=RuleOutcome.BLOCK,
             reason=(
                 "the deterministic side changed since generation "
@@ -1696,7 +1885,7 @@ def _envelope_still_covers(proposal: TradeProposal, decision: RiskDecision) -> R
     covered = sizing.max_quantity >= proposal.proposed_quantity
     return RuleResult(
         rule_id="authorization_envelope",
-        rule_version=1,
+        rule_version=2,
         outcome=RuleOutcome.PASS if covered else RuleOutcome.BLOCK,
         reason=(
             f"the fresh risk envelope still permits {proposal.proposed_quantity} share(s) "

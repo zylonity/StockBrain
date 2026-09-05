@@ -24,8 +24,10 @@ from stockbrain.api.schemas import (
     ControlFlagResponse,
     ControlStateResponse,
     ExecutionStatusResponse,
+    FxStatusResponse,
     KillSwitchRequest,
     TelegramStatusResponse,
+    WebSecurityResponse,
 )
 from stockbrain.control.state import ControlSnapshot, ControlState, ControlStateService
 from stockbrain.enums import ProviderStatus
@@ -33,11 +35,12 @@ from stockbrain.observability.metrics import METRICS
 
 router = APIRouter(tags=["system"])
 
-#: The web is a single-operator LAN surface until the authentication phase
-#: lands, so every web-originated control change is attributed to that operator.
-#: A server-side constant on purpose: an actor a client could choose would be an
-#: audit trail a client could forge.
-WEB_ACTOR = "web:local-operator"
+#: Every web-originated control change is attributed to the owner's account.
+#: A server-side constant on purpose: an actor a client could *choose* would be
+#: an audit trail a client could forge. Phase 9 added authentication in front of
+#: these routes, and since there is exactly one account the constant remains the
+#: honest attribution -- it names the only identity that can reach here.
+WEB_ACTOR = "web:owner"
 
 _CONTROL_NOTICE = (
     "Pausing and the kill switch stop new proposals and every authorization path. They "
@@ -73,6 +76,96 @@ async def execution_status(settings: SettingsDep) -> ExecutionStatusResponse:
         broker_credentials_configured=settings.broker_credentials_present,
         blockers=settings.execution_blockers,
         notice=_LIVE_NOTICE if permitted else _DEMO_NOTICE,
+    )
+
+
+@router.get(
+    "/api/v1/system/fx",
+    response_model=FxStatusResponse,
+    summary="Foreign-exchange source and freshness",
+)
+async def fx_status(services: ServicesDep, settings: SettingsDep) -> FxStatusResponse:
+    """What can currently size a cross-currency trade, and how fresh it is.
+
+    Makes one probe request for the configured pair, which is the only honest
+    way to answer "is the entitlement there" -- Alpaca's forex endpoint answers
+    HTTP 403 on a plan that covers IEX equities, and that is a fact about the
+    subscription rather than about the credential.
+    """
+    probe_pair = f"{settings.fx_probe_base_currency}{settings.fx_probe_quote_currency}"
+    base = FxStatusResponse(
+        provider=settings.fx_provider.value,
+        grade=None,
+        configured=settings.fx_configured,
+        available=False,
+        blockers=settings.fx_blockers,
+        max_age_seconds=settings.fx_max_age_seconds,
+        reference_max_age_seconds=settings.fx_reference_max_age_seconds,
+        allow_reference_grade=settings.fx_allow_reference_grade,
+        max_rate_drift_pct=settings.fx_max_rate_drift_pct,
+        probe_pair=probe_pair,
+    )
+    if services is None:
+        return base.model_copy(
+            update={"blockers": [*base.blockers, "the service container is not running"]}
+        )
+
+    capability = await services.fx.capability()
+    resolution = await services.fx.resolve(
+        from_currency=settings.fx_probe_base_currency,
+        to_currency=settings.fx_probe_quote_currency,
+    )
+    rate = resolution.rate
+    # Both sets -- configuration reasons and this-moment reasons -- because a
+    # panel showing only one would say "available" while the rate it would have
+    # used was four days old. Deduplicated with order preserved: the three
+    # sources overlap when the reason is the same, and one blocker printed
+    # three times reads as three problems.
+    blockers = list(dict.fromkeys([*base.blockers, *capability.blockers, *resolution.blockers]))
+    return base.model_copy(
+        update={
+            "grade": capability.grade.value if capability.grade else None,
+            "available": capability.available and resolution.usable,
+            "blockers": blockers,
+            "detail": capability.detail,
+            "probe_rate": rate.rate if rate else None,
+            "probe_age_seconds": rate.age_seconds(resolution.resolved_at) if rate else None,
+            "probe_provider_timestamp": rate.provider_timestamp if rate else None,
+        }
+    )
+
+
+@router.get(
+    "/api/v1/system/web-security",
+    response_model=WebSecurityResponse,
+    summary="Web authentication and CSRF posture",
+)
+async def web_security(settings: SettingsDep) -> WebSecurityResponse:
+    """Whether this deployment's HTTP surface is actually protected.
+
+    Reported, not assumed. A deployment relying on network trust is a supported
+    configuration; a deployment that *thinks* it has authentication and does not
+    is the failure this endpoint exists to make visible.
+    """
+    from stockbrain.api.auth import (
+        CSRF_HEADER_NAME,
+        PUBLIC_PATHS,
+        cookie_secure,
+        web_auth_blockers,
+    )
+
+    blockers = web_auth_blockers(settings)
+    return WebSecurityResponse(
+        auth_enabled=settings.web_auth_enabled,
+        auth_effective=not blockers,
+        blockers=blockers,
+        trusted_network_acknowledged=settings.web_trusted_network_acknowledged,
+        session_ttl_seconds=settings.web_session_ttl_seconds,
+        cookie_secure=cookie_secure(settings),
+        cookie_samesite="strict",
+        csrf_header=CSRF_HEADER_NAME,
+        public_paths=sorted(PUBLIC_PATHS),
+        cors_allow_origins=list(settings.cors_allow_origins),
     )
 
 

@@ -20,9 +20,11 @@ from stockbrain.enums import (
     ResolutionStatus,
     ThesisAction,
 )
+from stockbrain.fx.base import FxRateGrade
 from stockbrain.risk.config import RiskConfig
 from stockbrain.risk.models import (
     AccountState,
+    FxSnapshot,
     InstrumentIdentity,
     PositionState,
     QuoteSnapshot,
@@ -141,6 +143,48 @@ def position(
     )
 
 
+def fx_snapshot(
+    *,
+    account_currency: str = "GBP",
+    instrument_currency: str = "USD",
+    rate: Decimal = Decimal("1.35"),
+    provider: str = "test_fx",
+    grade: FxRateGrade = FxRateGrade.EXECUTION,
+    age_seconds: Decimal = Decimal("5"),
+    blockers: tuple[str, ...] = (),
+    invert: bool = False,
+) -> FxSnapshot:
+    """A cross-currency FX snapshot for the GBP-account / USD-listing case.
+
+    ``invert`` measures the pair the other way round, which is what a provider
+    publishing market convention actually does; the snapshot inverts it
+    arithmetically. Both directions have to be exercised, because getting the
+    direction wrong is a silent factor-of-rate-squared error.
+    """
+    base, quote_ccy = (
+        (instrument_currency, account_currency)
+        if invert
+        else (account_currency, instrument_currency)
+    )
+    effective = Decimal(1) / rate if invert else rate
+    return FxSnapshot(
+        account_currency=account_currency,
+        instrument_currency=instrument_currency,
+        same_currency=False,
+        blockers=blockers,
+        rate=effective,
+        base_currency=base,
+        quote_currency=quote_ccy,
+        provider=provider,
+        grade=grade,
+        rate_type="mid",
+        provider_timestamp=NOW - dt.timedelta(seconds=float(age_seconds)),
+        received_at=NOW,
+        age_seconds=age_seconds,
+        provider_timestamp_precision="instant",
+    )
+
+
 def inputs(
     *,
     action: ThesisAction = ThesisAction.BUY,
@@ -151,18 +195,36 @@ def inputs(
     snapshot: QuoteSnapshot | None = UNSET,
     reserved: ReservedExposure | None = None,
     now: dt.datetime = NOW,
+    fx: FxSnapshot | None = UNSET,
+    authorized_fx_rate: Decimal | None = None,
     account_state_missing_reason: str | None = None,
     quote_missing_reason: str | None = None,
 ) -> RiskInputs:
+    identity_value = instrument or identity()
+    account_value = account() if state is UNSET else state
+    if fx is UNSET:
+        # Default to the honest answer for the currencies actually in play:
+        # a same-currency snapshot when they agree, and *nothing* when they do
+        # not. Defaulting a cross-currency case to a usable rate would let a
+        # test pass because the helper invented one.
+        instrument_currency = (identity_value.currency or "").upper()
+        account_currency = (account_value.currency or "").upper() if account_value else ""
+        fx = (
+            FxSnapshot.same_currency_snapshot(account_currency)
+            if account_currency and account_currency == instrument_currency
+            else None
+        )
     return RiskInputs(
         config=risk_config or config(),
         action=action,
         confidence=confidence,
-        identity=instrument or identity(),
-        account=account() if state is UNSET else state,
+        identity=identity_value,
+        account=account_value,
         quote=quote() if snapshot is UNSET else snapshot,
         reserved=reserved or ReservedExposure(),
         now=now,
+        fx=fx,
+        authorized_fx_rate=authorized_fx_rate,
         account_state_missing_reason=account_state_missing_reason,
         quote_missing_reason=quote_missing_reason,
     )

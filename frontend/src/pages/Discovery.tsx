@@ -161,6 +161,186 @@ export function Discovery() {
         </div>
       )}
 
+      {status.data?.queue && (
+        <div className="card">
+          <h2>Job queue</h2>
+          <p className="metric-note">
+            The queue <em>is</em> the audit trail, which only helps if somebody
+            can read it. The number that matters is the age of the oldest
+            pending job: a stopped pipeline looks identical to a healthy one
+            from every other angle.
+          </p>
+          <table>
+            <tbody>
+              <tr>
+                <td>Pending / running</td>
+                <td className="mono">
+                  {status.data.queue.pending} / {status.data.queue.running}
+                </td>
+              </tr>
+              <tr>
+                <td>Oldest pending</td>
+                <td className="mono">
+                  {status.data.queue.oldest_pending_age_seconds === null
+                    ? "—"
+                    : `${Math.round(status.data.queue.oldest_pending_age_seconds)}s`}
+                  {status.data.queue.oldest_pending_job_type && (
+                    <span className="detail"> {status.data.queue.oldest_pending_job_type}</span>
+                  )}
+                </td>
+              </tr>
+              <tr>
+                <td>Stuck past the claim timeout</td>
+                <td className="mono">
+                  {status.data.queue.stuck}
+                  {status.data.queue.stuck_job_types.length > 0 && (
+                    <span className="detail">
+                      {" "}
+                      {status.data.queue.stuck_job_types.join(", ")}
+                    </span>
+                  )}
+                </td>
+              </tr>
+              <tr>
+                <td>Dead (no attempts left)</td>
+                <td className="mono">{status.data.queue.dead}</td>
+              </tr>
+            </tbody>
+          </table>
+          {Object.keys(status.data.queue.counts_by_type).length > 0 && (
+            <table>
+              <thead>
+                <tr>
+                  <th>Job type</th>
+                  <th>Count</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(status.data.queue.counts_by_type)
+                  .sort(([, a], [, b]) => b - a)
+                  .map(([name, count]) => (
+                    <tr key={name}>
+                      <td className="mono">{name}</td>
+                      <td className="mono">{count}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {status.data?.firecrawl && (
+        <div className="card">
+          <h2>Firecrawl budget</h2>
+          {status.data.firecrawl.blockers.length > 0 && (
+            <ul className="reason-list">
+              {status.data.firecrawl.blockers.map((blocker) => (
+                <li key={blocker} className="muted">
+                  {blocker}
+                </li>
+              ))}
+            </ul>
+          )}
+          {status.data.firecrawl.exhausted_reasons.map((reason) => (
+            <p key={reason} className="banner banner-warn">
+              {reason}
+            </p>
+          ))}
+          <p className="metric-note">
+            Search costs 2 credits per 10 results and a content fetch costs 1
+            per page, so the caps below are the real spending limit. Budget
+            exhaustion degrades Firecrawl alone — Alpaca news, SEC EDGAR,
+            classification, research and broker reconciliation all continue.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Window</th>
+                <th>Used</th>
+                <th>Cap</th>
+                <th>Remaining</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Searches today</td>
+                <td className="mono">{status.data.firecrawl.today.searches}</td>
+                <td className="mono detail">{status.data.firecrawl.max_searches_per_day}</td>
+                <td className="mono detail">
+                  {status.data.firecrawl.searches_remaining_today}
+                </td>
+              </tr>
+              <tr>
+                <td>Content fetches today</td>
+                <td className="mono">{status.data.firecrawl.today.scrapes}</td>
+                <td className="mono detail">{status.data.firecrawl.max_scrapes_per_day}</td>
+                <td className="mono detail">{status.data.firecrawl.scrapes_remaining_today}</td>
+              </tr>
+              <tr>
+                <td>Credits today</td>
+                <td className="mono">{status.data.firecrawl.today.estimated_credits}</td>
+                <td className="mono detail">{status.data.firecrawl.daily_credit_cap}</td>
+                <td className="mono detail">{status.data.firecrawl.daily_credits_remaining}</td>
+              </tr>
+              <tr>
+                <td>Credits this month</td>
+                <td className="mono">{status.data.firecrawl.month.estimated_credits}</td>
+                <td className="mono detail">{status.data.firecrawl.monthly_credit_cap}</td>
+                <td className="mono detail">{status.data.firecrawl.monthly_credits_remaining}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p className="metric-note">
+            Cadence floor {status.data.firecrawl.min_topic_interval_minutes} min ·
+            limit {status.data.firecrawl.search_result_limit} per source ×{" "}
+            {status.data.firecrawl.search_sources.join(", ")} · content fetches{" "}
+            {status.data.firecrawl.scrape_enabled ? "on" : "off"} · last success{" "}
+            {formatRelative(status.data.firecrawl.last_successful_call_at)} ·{" "}
+            {status.data.firecrawl.today.provider_reported_credits} of today&apos;s credits
+            confirmed by the provider
+          </p>
+          {status.data.firecrawl.per_topic.length > 0 && (
+            <table>
+              <thead>
+                <tr>
+                  <th>Topic</th>
+                  <th>Query</th>
+                  <th>Last success</th>
+                  <th>Next eligible</th>
+                  <th>Interval</th>
+                  <th>Fails</th>
+                  <th>Credits</th>
+                </tr>
+              </thead>
+              <tbody>
+                {status.data.firecrawl.per_topic.map((row) => (
+                  <tr key={`${row.topic}:${row.query}`} className={row.enabled ? "" : "muted"}>
+                    <td className="mono">{row.topic}</td>
+                    <td>{row.query}</td>
+                    <td className="mono">
+                      {row.last_success_at
+                        ? new Date(row.last_success_at).toLocaleString()
+                        : "—"}
+                    </td>
+                    <td className="mono">
+                      {row.enabled
+                        ? row.next_eligible_at
+                          ? new Date(row.next_eligible_at).toLocaleString()
+                          : "now"
+                        : "disabled"}
+                    </td>
+                    <td className="mono">{row.effective_interval_minutes}m</td>
+                    <td className="mono">{row.consecutive_failures}</td>
+                    <td className="mono">{row.credits_used}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
       <div className="grid">
         <div className="card">
           <h2>Sources by provider</h2>

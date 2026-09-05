@@ -60,7 +60,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | 6 | Risk engine, proposals, web approval | **done** |
 | 7 | Telegram control, approvals and durable pause/kill switch | **done** |
 | 8 | Trading 212 demo execution and reconciliation | **done** |
-| 9 | Live readiness | not started |
+| 9 | Production hardening: cost control, FX, web auth, backups, alerts | **done** |
 
 ## Architecture
 
@@ -93,9 +93,15 @@ cp .env.example .env
 #   python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+
+# Set the owner's password. Until you do, the container is healthy and every
+# route except the two health probes answers 503 with that exact reason.
+docker compose exec stockbrain python -m stockbrain.hash_password
+# paste the printed WEB_OWNER_PASSWORD_HASH=... line into .env, then
+docker compose up -d
 ```
 
-Then open <http://127.0.0.1:8080>.
+Then open <http://127.0.0.1:8080> and sign in.
 
 Verify:
 
@@ -108,6 +114,15 @@ curl -s localhost:8080/api/v1/system/execution-status | python3 -m json.tool
 A fresh install reports `DEGRADED` overall with most providers `DISABLED`. That
 is correct: nothing is configured yet, and `DISABLED` is not a fault. Only
 PostgreSQL being unavailable makes the application report `DOWN`.
+
+Three things are **off by default** and each is a deliberate refusal rather
+than an oversight:
+
+| Default | Why |
+|---|---|
+| `FIRECRAWL_ENABLED=false` | The only provider that can spend real money on a schedule with nobody watching. In Phase 2 it emptied a credit allowance in about an hour. Read the budget in `.env.example` before enabling it. |
+| `FX_PROVIDER=none` | Cross-currency sizing stays blocked. An invented exchange rate is a wrong position size, silently. |
+| `T212_EXECUTION_ENABLED=false` | Nothing transmits to a broker, demo included, until an operator says so. |
 
 The compose file publishes the GUI on `127.0.0.1` only. Expose it on the LAN or
 over Tailscale deliberately; never publish it to the public internet. PostgreSQL
@@ -220,6 +235,24 @@ advice.
 
 ## Security
 
+* **The HTTP surface is deny-by-default.** Web authentication is on out of the
+  box (specification section 19: *"If accessed only over LAN/Tailscale, still
+  require auth"*). One account, one scrypt-hashed password held as a hash and
+  never as a password, an HMAC-signed `HttpOnly` `SameSite=Strict` session
+  cookie, and three independent CSRF defences on every state-changing route —
+  `SameSite`, a double-submit token echoed in `X-StockBrain-CSRF`, and an
+  `Origin` check. Enforcement is middleware with a five-path public allow-list
+  (two health probes and the login flow), so a route added without a thought
+  about authentication is protected rather than open, and a test enumerates the
+  route table to prove it. Running without it needs
+  `WEB_AUTH_ENABLED=false` *and* `WEB_TRUSTED_NETWORK_ACKNOWLEDGED=true`, which
+  is refused in production without the acknowledgement.
+* **Paid providers cannot run away.** Firecrawl calls are reserved against a
+  durable PostgreSQL ledger *before* the request leaves, so a restart cannot
+  forget what today already cost and two workers cannot spend the last credit
+  twice. Hard caps on searches, content fetches and estimated credits, per day
+  and per month, plus a floor on how often a topic may run. Nothing retries a
+  paid call.
 * Secrets come from the environment or mounted files; `.env` is git-ignored and
   never baked into an image layer.
 * Two independent log-redaction layers scrub credential-shaped keys and any

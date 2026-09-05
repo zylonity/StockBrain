@@ -63,6 +63,13 @@ _EXPECTED_MUTATIONS = {
     "POST /api/v1/system/resume",
     "POST /api/v1/system/kill-switch",
     "POST /api/v1/execution/attempts/{attempt_id}/reconcile",
+    # Phase 9's web authentication. These change *session* state and nothing
+    # else: neither can name a proposal, a ticker, a side or a quantity, and
+    # neither touches the database. They are listed here because the point of
+    # this set is that every mutation is accounted for -- not that mutations
+    # are rare.
+    "POST /api/v1/auth/login",
+    "POST /api/v1/auth/logout",
 }
 
 #: Route path fragments that would name a *resend*.  None may ever appear.
@@ -83,7 +90,7 @@ _T212_MUTATION_PATHS = (
 
 
 def _settings() -> Settings:
-    return Settings(app_env="test", stockbrain_secret_key="not-a-real-key")
+    return Settings(app_env="test", stockbrain_secret_key="not-a-real-key", web_auth_enabled=False)
 
 
 def _api_routes() -> list[APIRoute]:

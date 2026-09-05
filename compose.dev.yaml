@@ -2,7 +2,14 @@
 #   docker compose -f compose.yaml -f compose.dev.yaml up
 #
 # Publishes PostgreSQL on localhost so tests and psql can reach it from macOS.
-# Never use this overlay on TrueNAS.
+# **Never use this overlay on TrueNAS.** `make verify` applies it, which is why
+# `make verify` is a development command; production is `compose.yaml` alone.
+#
+# It does not disable web authentication. A development deployment reachable
+# without a password is a habit that follows you to production, and the login
+# takes one command to set up:
+#
+#   docker compose exec stockbrain python -m stockbrain.hash_password
 
 services:
   postgres:

@@ -83,6 +83,12 @@ __all__ = ["ExecutionResult", "ExecutionService"]
 
 log = get_logger(__name__)
 
+#: Outcomes that mean "an order we transmitted might still be queued at the
+#: broker".  ``PENDING`` is an attempt whose result was never recorded, and
+#: ``AMBIGUOUS`` is one whose result is unknown; both have to be counted against
+#: the per-ticker pending limit, because both may correspond to a real order.
+_UNRESOLVED_OUTCOMES = (ExecutionOutcome.PENDING, ExecutionOutcome.AMBIGUOUS)
+
 #: Broker order statuses that mean the order is finished and the position (or
 #: the lack of one) is now the account's truth.
 _FILLED_STATUSES: frozenset[str] = frozenset({"FILLED"})
@@ -169,6 +175,15 @@ class ExecutionService:
         if outcome.refusal is not None:
             return await self._record_refusal(
                 proposal_id, command, outcome.refusal, outcome, moment
+            )
+
+        # The broker's per-ticker pending-order limit, checked before anything
+        # is reserved. A read, and a refusal by default: see
+        # `_pending_order_refusal`.
+        pending_refusal = await self._pending_order_refusal(command, moment)
+        if pending_refusal is not None:
+            return await self._record_refusal(
+                proposal_id, command, pending_refusal, outcome, moment
             )
 
         # Before the send transaction, so a denial is provably pre-send.
@@ -894,6 +909,104 @@ class ExecutionService:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    async def _pending_order_refusal(
+        self, command: ExecutionCommand, now: dt.datetime
+    ) -> PreflightRefusal | None:
+        """Refuse the send if the broker's per-ticker order queue is full.
+
+        Trading 212 documents a functional limit of **50 pending orders per
+        ticker per account**, and Phase 8's live test proved orders really do
+        queue: a market order placed while the market was closed came back HTTP
+        200 with status ``NEW``.  The fifty-first submission would be rejected
+        by the broker, and provoking a rejection from a non-idempotent endpoint
+        is a worse outcome than declining to call it.
+
+        The count comes from **two** independent sources and the larger wins:
+
+        * what the broker says is pending for the ticker, which is the number
+          the limit is actually measured against and the only one that includes
+          orders the operator queued by hand in the app;
+        * what StockBrain's own ledger says it has transmitted and not yet
+          resolved for that ticker in this environment, which covers the window
+          between a successful POST and the broker's list catching up, and
+          covers an attempt whose outcome is still ambiguous.
+
+        A read that failed is **not** a count of zero.  ``read_ok=False``
+        refuses, because an unknown standing between us and a non-idempotent
+        POST resolves against sending.
+
+        The refusal does not invalidate the proposal: a full queue is a
+        condition of the moment, and the operator's authorization is still good
+        once it drains.
+        """
+        limit = self.settings.t212_max_pending_orders_per_ticker
+        headroom = self.settings.t212_pending_order_headroom
+        ceiling = max(0, limit - headroom)
+
+        broker_count = await self.provider.count_pending(command.broker_ticker)
+        local_count = await self._unresolved_sent_for_ticker(command.broker_ticker)
+        observed = max(broker_count.pending, local_count)
+
+        if not broker_count.read_ok:
+            return PreflightRefusal(
+                category=ExecutionFailure.PENDING_ORDER_LIMIT,
+                reasons=(
+                    f"the broker's pending-order list for {command.broker_ticker} could not "
+                    f"be read ({broker_count.error_category or 'unknown error'}), so the "
+                    f"{limit}-per-ticker limit cannot be checked; the order was not "
+                    f"transmitted",
+                ),
+                invalidates=False,
+            )
+
+        if observed + 1 > ceiling:
+            log.warning(
+                "pending_order_limit_reached",
+                broker_ticker=command.broker_ticker,
+                broker_pending=broker_count.pending,
+                api_initiated=broker_count.api_initiated,
+                local_unresolved=local_count,
+                ceiling=ceiling,
+                documented_limit=limit,
+            )
+            METRICS.inc(
+                "stockbrain_execution_pending_limit_refusals_total",
+                labels={"broker_ticker": command.broker_ticker},
+            )
+            return PreflightRefusal(
+                category=ExecutionFailure.PENDING_ORDER_LIMIT,
+                reasons=(
+                    f"{observed} order(s) are already pending for {command.broker_ticker} "
+                    f"({broker_count.pending} at the broker, {local_count} unresolved here); "
+                    f"one more would pass the {ceiling} ceiling StockBrain keeps below the "
+                    f"broker's documented {limit}-per-ticker limit",
+                ),
+                invalidates=False,
+            )
+        return None
+
+    async def _unresolved_sent_for_ticker(self, broker_ticker: str) -> int:
+        """Attempts this deployment transmitted for a ticker and has not resolved.
+
+        Counted from ``execution_attempts`` rather than from ``broker_orders``,
+        because the question is "what might be queued because of us", and an
+        attempt whose outcome is ``PENDING`` or ``AMBIGUOUS`` might be.
+        Environment-scoped: a demo attempt says nothing about the live queue.
+        """
+        async with self.database.session() as session:
+            count = await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(ExecutionAttempt)
+                .join(TradeProposal, TradeProposal.id == ExecutionAttempt.proposal_id)
+                .where(
+                    ExecutionAttempt.sent_to_broker.is_(True),
+                    ExecutionAttempt.outcome.in_(_UNRESOLVED_OUTCOMES),
+                    ExecutionAttempt.broker_environment == self.settings.t212_env.value,
+                    TradeProposal.broker_ticker == broker_ticker,
+                )
+            )
+        return int(count or 0)
+
     async def _lock_proposal(self, session: AsyncSession, proposal_id: uuid.UUID) -> None:
         key = f"stockbrain:execution:{self.broker.value}:{proposal_id}"
         await session.execute(

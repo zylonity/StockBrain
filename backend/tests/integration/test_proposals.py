@@ -223,11 +223,19 @@ async def test_the_symbol_always_comes_from_the_resolved_listing(clean_tables: D
 async def test_a_cross_currency_listing_is_refused_rather_than_converted(
     clean_tables: Database,
 ) -> None:
-    await ph.seed(clean_tables, currency="GBP")
-    await ph.fund(clean_tables, currency="USD")
+    """With ``RISK_REQUIRE_SAME_CURRENCY`` set, a mismatch never reaches sizing.
+
+    The default posture, and the one the live GBP account ran under through
+    Phase 8. Phase 9 can lift it, but only by configuring a verified FX source
+    *and* saying so -- see the cross-currency generation tests.
+    """
+    # A USD listing on a GBP account, priced in USD: exactly what Phase 6
+    # measured on 14 of 14 live positions.
+    await ph.seed(clean_tables, currency="USD")
+    await ph.fund(clean_tables, currency="GBP")
     result = await ph.service(clean_tables).generate(ph.THESIS_ID)
     assert not result.created
-    assert any("FX rate source" in reason for reason in result.blocks)
+    assert any("RISK_REQUIRE_SAME_CURRENCY" in reason for reason in result.blocks)
 
 
 async def test_market_data_failure_blocks_rather_than_falling_back(

@@ -439,7 +439,12 @@ async def test_job_pipeline_and_research_inspection(clean_tables: Database) -> N
     assert await runner._run_one("research-test-worker")
     assert engine.calls == 1
     app = create_app(
-        Settings(app_env="test", stockbrain_secret_key="test", discovery_enabled=False)
+        Settings(
+            app_env="test",
+            stockbrain_secret_key="test",
+            discovery_enabled=False,
+            web_auth_enabled=False,
+        )
     )
     app.state.database = clean_tables
     app.state.services = None

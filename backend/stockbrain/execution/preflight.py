@@ -53,13 +53,26 @@ __all__ = ["ExecutionPreflight", "PreflightOutcome"]
 #: against -- so the verdict says nothing about the trade and the proposal must
 #: survive it.  Failing every authorized proposal whenever a market-data
 #: provider blinks would make an outage destructive rather than degrading.
-_MISSING_INPUT_RULE_IDS: frozenset[str] = frozenset({"quote_available", "account_state_available"})
+#:
+#: ``fx_available`` joins them in Phase 9 for exactly the same reason: an FX
+#: source that stopped answering says nothing about whether the trade is still
+#: a good one, and it blocks every cap mechanically because no ceiling can be
+#: converted.  The send is refused either way -- what this set controls is
+#: whether the proposal is destroyed along with it.
+_MISSING_INPUT_RULE_IDS: frozenset[str] = frozenset(
+    {"quote_available", "account_state_available", "fx_available"}
+)
 
-#: Rules whose failure means a *provider is behind*.  A stale quote or a stale
-#: account snapshot is a StockBrain problem that the next sweep may not have, so
-#: it defers -- but only when nothing else blocked, because a stale quote must
-#: never mask a genuine drift or spread refusal sitting beside it.
-_STALE_INPUT_RULE_IDS: frozenset[str] = frozenset({"quote_freshness", "account_state_freshness"})
+#: Rules whose failure means a *provider is behind*.  A stale quote, a stale
+#: account snapshot or a stale exchange rate is a StockBrain problem that the
+#: next sweep may not have, so it defers -- but only when nothing else blocked,
+#: because a stale input must never mask a genuine drift or spread refusal
+#: sitting beside it.  Note that ``fx_rate_drift`` is deliberately *not* here:
+#: a rate that moved is a statement about the trade, and it retires the
+#: proposal exactly as a price that moved does.
+_STALE_INPUT_RULE_IDS: frozenset[str] = frozenset(
+    {"quote_freshness", "account_state_freshness", "fx_freshness"}
+)
 
 
 def _is_transient(blocked_rule_ids: frozenset[str]) -> bool:

@@ -142,7 +142,7 @@ def test_firecrawl_parses_web_and_news_result_shapes_separately() -> None:
     """Web results carry ``description``; news results carry ``snippet``/``date``."""
     client = _firecrawl()
     spec = DiscoveryQuerySpec(query="datacentre power")
-    documents = client.parse_response(
+    outcome = client.parse_response(
         {
             "success": True,
             "creditsUsed": 3,
@@ -168,22 +168,34 @@ def test_firecrawl_parses_web_and_news_result_shapes_separately() -> None:
         spec,
     )
 
-    assert len(documents) == 2
-    web, news = documents
+    assert len(outcome.documents) == 2
+    web, news = outcome.documents
     assert web.body == "# Scraped body"
     assert web.metadata["firecrawl_source_type"] == "web"
     assert news.body == "News snippet"
     assert news.published_at == dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
     assert client.last_credits_used == 3
+    # The provider's own accounting is returned rather than left on the client,
+    # because the durable budget has to record what the call cost in the same
+    # place it recorded that the call happened.
+    assert outcome.credits_reported == 3
+    assert outcome.results_returned == 2
+    assert outcome.scraped_pages == 1
 
 
 def test_firecrawl_drops_results_without_a_url() -> None:
-    """No URL means no provenance and no dedupe identity."""
-    documents = _firecrawl().parse_response(
+    """No URL means no provenance and no dedupe identity.
+
+    The result is still *counted*: Firecrawl billed for returning it, and a
+    budget that only counted the results StockBrain could use would under-state
+    the spend.
+    """
+    outcome = _firecrawl().parse_response(
         {"success": True, "data": {"web": [{"title": "no url"}]}},
         DiscoveryQuerySpec(query="q"),
     )
-    assert documents == []
+    assert outcome.documents == ()
+    assert outcome.results_returned == 1
 
 
 def test_firecrawl_reports_an_explicit_failure() -> None:

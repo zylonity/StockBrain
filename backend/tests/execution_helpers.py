@@ -1,33 +1,52 @@
-"""Doubles for the broker execution surface.
+"""Doubles and world builders for the broker execution surface.
 
 Destructive and error-path testing must never be done by making a real broker
-fail, so the seam is the four-operation
+fail, so the seam is the five-operation
 :class:`~stockbrain.execution.base.BrokerExecutionProvider`.  :class:`FakeProvider`
-implements it and can be told to answer, to refuse, to time out, or to accept an
-order and then be unreadable -- every shape the real client can produce.
+implements it and can be told to answer, to refuse, to time out, to report a
+full pending-order queue, or to accept an order and then be unreadable -- every
+shape the real client can produce.
 
 :func:`order_view` builds a canonical broker order the way the Trading 212
 adapter would, so reconciliation tests exercise the same matching rules the real
-adapter feeds.
+adapter feeds.  :func:`build` and :func:`authorized` assemble a funded, resolved,
+authorized world; they live here rather than in one test module so a second
+module does not have to import a test file to get at them.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from stockbrain.config import Settings
+from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
-from stockbrain.enums import Broker
+from stockbrain.db.session import Database
+from stockbrain.enums import AuthorizationSource, Broker, ThesisAction
 from stockbrain.execution.models import (
     BrokerAcknowledgement,
     BrokerOrderView,
     CandidateSearch,
     ExecutionCommand,
+    PendingOrderCount,
 )
+from stockbrain.execution.service import ExecutionService
+from stockbrain.proposals.service import ProposalService
+from tests import proposal_helpers as helpers
 
-__all__ = ["FakeProvider", "acknowledgement_for", "order_view"]
+__all__ = [
+    "WEB_ACTOR",
+    "FakeProvider",
+    "acknowledgement_for",
+    "authorized",
+    "build",
+    "execution_settings",
+    "order_view",
+]
 
 
 def order_view(
@@ -85,10 +104,17 @@ class FakeProvider:
     orders: dict[str, BrokerOrderView] = field(default_factory=dict)
     fetch_error: Exception | None = None
 
+    #: What ``count_pending`` reports for any ticker. Zero pending and a
+    #: successful read is the ordinary world; a test that cares sets these.
+    pending_orders: int = 0
+    pending_read_ok: bool = True
+    pending_api_initiated: int = 0
+
     submitted: int = 0
     commands: list[ExecutionCommand] = field(default_factory=list)
     slot_requests: int = 0
     searches: int = 0
+    pending_counts: int = 0
 
     @property
     def environment(self) -> str:
@@ -100,6 +126,16 @@ class FakeProvider:
     async def reserve_slot(self) -> bool:
         self.slot_requests += 1
         return self.slot_available
+
+    async def count_pending(self, broker_ticker: str) -> PendingOrderCount:
+        self.pending_counts += 1
+        return PendingOrderCount(
+            broker_ticker=broker_ticker,
+            pending=self.pending_orders,
+            read_ok=self.pending_read_ok,
+            api_initiated=self.pending_api_initiated,
+            error_category=None if self.pending_read_ok else "ProviderUnavailable",
+        )
 
     async def submit(self, command: ExecutionCommand) -> BrokerAcknowledgement:
         # Recorded before any raise, so a test can prove a transmission was
@@ -140,3 +176,74 @@ def acknowledgement_for(
         payload=payload or {"id": int(order.broker_order_id), "status": order.status},
         rate_limit={},
     )
+
+
+# ---------------------------------------------------------------------------
+# World builders
+#
+# Shared between `test_execution.py`, `test_execution_concurrency.py` and
+# `test_pending_order_limit.py`. Kept here rather than in one of them so a
+# second module does not have to import a test file to get at them.
+# ---------------------------------------------------------------------------
+WEB_ACTOR = "web:local-operator"
+
+
+def execution_settings(**overrides: object) -> Settings:
+    base: dict[str, object] = {
+        # The master switch. Default false, so a deployment does not start
+        # sending the moment Phase 8 lands; every test that expects a
+        # transmission turns it on deliberately.
+        "t212_execution_enabled": True,
+    }
+    base.update(overrides)
+    return helpers.settings(**base)
+
+
+def build(
+    database: Database,
+    settings: Settings,
+    *,
+    provider: FakeProvider | None = None,
+    market_data: helpers.StubMarketData | None = None,
+) -> tuple[ProposalService, ExecutionService, FakeProvider]:
+    control = ControlStateService(database)
+    proposals = helpers.service_with(database, settings, market_data=market_data, control=control)
+    broker = provider or FakeProvider(_environment=settings.t212_env.value)
+    execution = ExecutionService(
+        database,
+        settings,
+        proposals=proposals,
+        provider=broker,
+        control=control,
+        broker=Broker.TRADING212,
+    )
+    return proposals, execution, broker
+
+
+async def authorized(
+    database: Database,
+    settings: Settings,
+    *,
+    provider: FakeProvider | None = None,
+    market_data: helpers.StubMarketData | None = None,
+    source: AuthorizationSource = AuthorizationSource.HUMAN_WEB,
+    positions: dict[str, tuple[Decimal, Decimal]] | None = None,
+    action: ThesisAction = ThesisAction.BUY,
+) -> tuple[ProposalService, ExecutionService, FakeProvider, uuid.UUID]:
+    """Seed a world and drive one proposal all the way to APPROVED."""
+    proposals, execution, broker = build(
+        database, settings, provider=provider, market_data=market_data
+    )
+    await helpers.seed(database, action=action)
+    # The account snapshot has to come from the environment under test, or
+    # `account_state_available` blocks before anything interesting happens.
+    await helpers.fund(database, positions=positions, environment=settings.t212_env.value)
+    generated = await proposals.generate(helpers.THESIS_ID)
+    assert generated.proposal_id is not None, generated.reason
+    if not generated.authorized:
+        await proposals.authorize(
+            generated.proposal_id,
+            source=source,
+            actor=WEB_ACTOR if source is AuthorizationSource.HUMAN_WEB else "telegram:4242",
+        )
+    return proposals, execution, broker, generated.proposal_id

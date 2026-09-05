@@ -2,9 +2,10 @@
  * Thin typed fetch wrapper.
  *
  * Same-origin by default so the session cookie works with SameSite=Strict.
- * State-changing calls will carry a CSRF token once authentication lands; the
- * helper is written to make that a single change here rather than at every call
- * site.
+ * Every state-changing call carries the CSRF token from the `sb_csrf` cookie in
+ * the `X-StockBrain-CSRF` header; the server rejects a POST without it. The
+ * token is read from the cookie on each call rather than cached, so a session
+ * that was re-established in another tab keeps working.
  */
 
 import type {
@@ -36,7 +37,10 @@ import type {
   Resolution,
   ResolutionListResponse,
   ResolutionStatus,
+  SessionView,
   TelegramStatusResponse,
+  FxStatus,
+  WebSecurityStatus,
 } from "./types";
 
 export class ApiError extends Error {
@@ -57,10 +61,22 @@ export class ApiError extends Error {
  * under lock: a client that could name a quantity would be a client that could
  * size a trade.
  */
+/** Read the readable half of the double-submit CSRF pair. */
+export function csrfToken(): string {
+  const match = /(?:^|;\s*)sb_csrf=([^;]*)/.exec(document.cookie);
+  const value = match?.[1];
+  return value ? decodeURIComponent(value) : "";
+}
+
 async function post<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
   return request<T>(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      // Present on every state-changing call. A cross-site attacker can cause
+      // the cookie to be sent but cannot read it to build this header.
+      "X-StockBrain-CSRF": csrfToken(),
+    },
     body: JSON.stringify(body),
   });
 }
@@ -103,6 +119,10 @@ function eventQuery(filters: EventFilters): string {
 }
 
 export const api = {
+  session: () => request<SessionView>("/api/v1/auth/session"),
+  login: (username: string, password: string) =>
+    post<SessionView>("/api/v1/auth/login", { username, password }),
+  logout: () => post<SessionView>("/api/v1/auth/logout"),
   research: (eventId?: string) => request<ResearchRun[]>(`/api/v1/research${eventId ? `?event_id=${encodeURIComponent(eventId)}` : ""}`),
   researchRun: (id: string) => request<ResearchRun>(`/api/v1/research/${encodeURIComponent(id)}`),
   health: () => request<HealthResponse>("/api/health"),
@@ -113,6 +133,8 @@ export const api = {
   controlState: () => request<ControlStateResponse>("/api/v1/system/control"),
   telegramStatus: () =>
     request<TelegramStatusResponse>("/api/v1/system/telegram"),
+  fxStatus: () => request<FxStatus>("/api/v1/system/fx"),
+  webSecurity: () => request<WebSecurityStatus>("/api/v1/system/web-security"),
   // Control changes carry a free-text reason and nothing else. Like the
   // proposal routes, they cannot name a ticker, a side, a quantity or a price.
   pauseTrading: (reason?: string) =>

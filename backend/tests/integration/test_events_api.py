@@ -28,6 +28,8 @@ pytestmark = pytest.mark.integration
 async def client(clean_tables: Database) -> AsyncIterator[httpx.AsyncClient]:
     settings = Settings(
         app_env="test",
+        # These tests exercise the read API, not the login flow.
+        web_auth_enabled=False,
         log_level="CRITICAL",
         database_url=str(clean_tables.engine.url.render_as_string(hide_password=False)),
         stockbrain_secret_key="test-key",

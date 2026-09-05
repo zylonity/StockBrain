@@ -277,6 +277,15 @@ td.detail {
 
 .banner-safe { border-left-color: var(--ok); }
 .banner-warn { border-left-color: var(--warn); }
+
+/* A list of reasons something is unavailable. Rendered as text, never as a
+   single joined sentence: an operator acts on one blocker at a time. */
+.reason-list {
+  margin: 0 0 0.6rem;
+  padding-left: 1.1rem;
+  font-size: 12px;
+  line-height: 1.6;
+}
 .banner-live { border-left-color: var(--bad); }
 
 .banner-title {
@@ -655,3 +664,77 @@ select:focus {
 .research-prose { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
 .research-prose pre, pre.research-prose { max-height: 32rem; overflow: auto; }
 details.card summary { cursor: pointer; font-weight: 600; padding: .4rem 0; }
+
+/* --- Login gate --------------------------------------------------------- */
+/* Rendered before anything else when the browser holds no session. Kept plain:
+   the login screen is the one page an unauthenticated visitor can reach, so it
+   carries no data and no navigation. */
+.auth-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem;
+}
+
+.auth-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: min(24rem, 100%);
+  padding: 1.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.auth-card h1 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.auth-card label {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.auth-card input {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-inset);
+  color: inherit;
+  font: inherit;
+}
+
+.auth-card button {
+  margin-top: 1rem;
+  padding: 0.6rem 0.9rem;
+  border: 0;
+  border-radius: 6px;
+  background: var(--info);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.auth-card button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.auth-error {
+  margin: 0.5rem 0 0;
+  color: var(--bad);
+  font-size: 0.9rem;
+}
+
+.auth-blockers {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--warn);
+  font-size: 0.85rem;
+}

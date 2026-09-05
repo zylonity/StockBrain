@@ -55,22 +55,26 @@ stockbrain/
   errors.py          exception hierarchy; separates definite from ambiguous failure
   startup.py         startup checks and provider capability detection
   main.py            app factory, lifespan, middleware, SPA mount
+  hash_password.py   CLI: generate WEB_OWNER_PASSWORD_HASH
 
   api/               FastAPI routers, dependencies, response schemas
+  api/auth.py        session cookie, CSRF double-submit, deny-by-default gate
   db/                declarative base, session/transaction helpers, models
   proposals/         proposal state machine (approval and execution to follow)
-  observability/     provider health registry, metrics registry
+  observability/     provider health registry, metrics registry, alert scan
 
   httpclient.py      shared provider HTTP: classified errors, opt-in retries
   services.py        runtime container; owns workers, scheduler, news stream
 
   ingestion/         providers, normalisation, dedupe, the ingest entry point
+  ingestion/firecrawl_budget.py  durable Firecrawl call/credit ledger
   jobs/              PostgreSQL queue, worker pool, scheduler, handlers
 
   llm/               provider interface, DeepSeek client, pricing, budget, telemetry
   intelligence/      classifier, semantic dedupe, prompts, classification service
   instruments/       resolution ladder, curated aliases, resolve service
   market_data/       provider protocol, Alpaca adapter, sessions, price reaction
+  fx/                typed FX rates, freshness/grade policy, two providers
   broker/            read-only T212 metadata, account state, automation policy
   risk/              deterministic engine, rules, sizing, spread, versioned config
   proposals/         state machine, generation, authorization, expiry, quotes
@@ -1266,24 +1270,230 @@ would be two experiments at once. No generic retry, no retry middleware, and
 exactly one HTTP `POST` to a broker anywhere in the codebase. No real-money
 order: the single live verification was one share on the paper account.
 
-### The Phase 9 live-readiness boundary
+### The live-readiness boundary
 
-What must be true before `T212_ENV=live` is set deliberately:
+What must be true before `T212_ENV=live` is set deliberately. Phase 9 closed the
+first two and reduced the third to a subscription decision; the rest are acts
+only a person can perform.
 
-* the **50 pending orders per ticker per account** functional limit, which
-  nothing enforces yet and which only matters once orders actually queue;
-* IP-restricted API credentials, which Trading 212 supports from account
-  settings;
-* the `orders:execute` scope granted knowingly on a live key, and the read-only
-  key kept for everything else;
-* written consent recorded in `T212_WRITTEN_CONSENT_CONFIRMED`, and
-  `T212_AUTOMATED_TRADING_CONSENT_CONFIRMED` only if automatic authorization is
-  actually wanted live;
-* the currency gap resolved: the account is GBP and the priced universe is USD,
-  so `currency_alignment` blocks every proposal this account can price. Either a
-  GBP-denominated listing Alpaca can quote, or a verified FX source, or an
-  accepted limitation — never an inferred rate;
-* one tiny manual live order, placed by a human in the app, before any automated
-  one.
+| Requirement | State after Phase 9 |
+|---|---|
+| The **50 pending orders per ticker** functional limit | **enforced** — counted from the broker's list *and* the local ledger, larger wins, failed read refuses |
+| The currency gap | **implemented** — typed FX, freshness and grade policy, drift envelope. Alpaca forex is **not entitled** on the current plan (measured HTTP 403), so an execution-grade rate needs a paid subscription or the reference-grade opt-in |
+| Web authentication in front of the approval routes | **implemented**, on by default |
+| IP-restricted API credentials | operator action, in the Trading 212 account settings |
+| `orders:execute` granted knowingly on a **live** key, read-only key kept for everything else | operator action |
+| `T212_WRITTEN_CONSENT_CONFIRMED` with consent actually obtained | operator action; the process refuses to start if the flag disagrees with the other gates |
+| `T212_AUTOMATED_TRADING_CONSENT_CONFIRMED`, only if automatic authorization is genuinely wanted live | operator action |
+| One tiny manual live order, placed by a human in the app first | operator action |
+| Backup taken **and restored** | `scripts/backup.sh` + `scripts/restore-test.sh` |
+| Zero unresolved ambiguous executions | query it; going live with an unknown order outstanding means a new position is indistinguishable from an old one |
+
+The full list, in the order it is cheapest to fail, is
+`docs/operations.md` → "Pre-live checklist".
 
 No code flips from demo to live on its own, and none should be added that could.
+
+---
+
+## Phase 9 production hardening
+
+Phase 9 adds no new capability to the trading pipeline. Everything in it exists
+because something could cost money, lose an order, or be reached by somebody who
+should not have reached it.
+
+### The durable-ledger pattern, generalised
+
+Phase 8 established one: `execution_attempts.sent_to_broker` is committed
+**before** the HTTP request, so the row means "bytes may have left" rather than
+"bytes left", and a process that dies mid-call leaves a pessimistic record
+rather than an absent one.
+
+Phase 9 applies the same shape to the other thing that spends real money.
+`firecrawl_calls` is written and committed before each paid Firecrawl request,
+carrying the worst-case cost computed from the published billing model, and is
+reconciled afterwards against the provider's own `creditsUsed`. Three properties
+follow that a counter cannot have:
+
+* it survives a restart — the Phase 2 counter was an attribute on a client
+  object, which is why nothing could stop 21 searches an hour;
+* it can **refuse**, because the check and the insert happen in one transaction
+  behind a transaction-scoped advisory lock, so two workers cannot both spend
+  the last credit;
+* an unreconciled row is *charged*, not forgiven. A call whose process vanished
+  has committed the operator's money as far as anyone here can tell.
+
+`credits_charged` is the single column the caps are compared against, so the
+estimate→actual reconciliation happens in exactly one place. The daily and
+monthly windows are computed by **PostgreSQL**, so a container with a drifting
+system clock cannot hand itself a fresh day.
+
+### Firecrawl is two stages, not one
+
+A broad thematic search now asks for metadata only. That is enough for the
+layers that are free: URL and content-hash deduplication, the deterministic
+source-category table, and the cheap DeepSeek classifier that already scores
+importance, confidence and materiality. Full article content is a *separate*
+call, made only for a source whose event the classifier promoted to `CANDIDATE`,
+and separately budgeted.
+
+The alternative — `scrapeOptions` on the search — is what turned a 4-credit
+search into a 24-credit one. Reusing the existing dedupe and the existing
+classifier as the triage means no new crawler, no second dedupe implementation
+and no additional LLM spend: the classification was going to happen anyway.
+
+`sources.content_fetched_at` makes "do we already have the body" a fact on the
+row rather than a guess from the length of `raw_content`, and the enrichment job
+is idempotent against it — a redelivered job cannot pay twice for one page.
+
+### Eligibility is a column
+
+`discovery_queries.next_eligible_at` replaces `now - last_run_at < interval`
+recomputed at read time. Three failures that arithmetic could not survive:
+
+* **A restart re-ran everything.** `Scheduler._loop` runs each task once
+  immediately on start, so every query whose last run predated its interval was
+  enqueued at once. That is nine searches inside 23 seconds in the incident log,
+  and ten restarts would have been ten sweeps.
+* **A failure needs a different cooldown from a success.** Firecrawl bills a
+  request it processed even when the answer was an error, so a failing query
+  retried on the success cadence is a failing query that costs money.
+* **The interval floor has to bind wherever the interval is used.** A topic row
+  asking for twenty minutes gets `FIRECRAWL_MIN_TOPIC_INTERVAL_MINUTES`
+  instead, so a restored backup or a hand-written `UPDATE` cannot reintroduce
+  the Phase 2 cadence.
+
+The scheduler claims the slot at enqueue time and the handler rewrites it on
+completion, so two scheduler loops cannot queue one query twice even before
+`uq_jobs_dedupe_key_active` is consulted.
+
+### Foreign exchange: a rate is a measurement
+
+`FxRate` carries base and quote currencies, the rate, the provider, the
+provider's own timestamp, the receipt instant, and a **grade**. No function in
+`stockbrain.fx` accepts or returns a bare `Decimal`, because a bare number
+cannot be checked for freshness, attributed to a source, or audited afterwards.
+
+Four rules make cross-currency sizing safe rather than merely possible:
+
+* **Direction is explicit.** `rate` is units of `quote` per one unit of `base`.
+  Conversion refuses any pair the rate was not measured for, and inverts
+  arithmetically for the other direction — `amount / rate`, never
+  `amount * (1/rate)`, so the round trip stays exact and a converted cap can be
+  compared against the cap it came from.
+* **No multi-hop.** GBP/USD plus EUR/USD does not become GBP/EUR. Two published
+  rates multiplied together produce a number no source published and no
+  counterparty will honour.
+* **Grade is a property of the provider.** A live dealable quote and a daily
+  central-bank fixing are both "the exchange rate" and are not interchangeable.
+  Frankfurter's own documentation says it "is not for live trading";
+  `FX_ALLOW_REFERENCE_GRADE` is how an operator says they have read that.
+* **`FxSnapshot` cannot represent a silent 1.0.** Same-currency is its own
+  state — `same_currency=True`, no rate, direction `IDENTITY`. There is no path
+  through the type that converts two different currencies at parity.
+
+**The caps move to the price, never the price to the caps.** Every `RISK_*` money
+limit is denominated in the account currency and every price in the instrument's.
+Converting the ceiling into the instrument's currency and dividing there is the
+arithmetic that is defined; dividing a GBP ceiling by a USD ask is what Phase 6
+refused to do and what `RISK_REQUIRE_SAME_CURRENCY=false` used to permit with
+only a warning (bug 22).
+
+FX is re-resolved and re-judged at generation, at authorization and again
+immediately before transmission, and `fx_rate_drift` is the envelope: on a GBP
+account buying USD, a one percent move in the pair moves the account-currency
+notional by one percent — straight through the per-trade cap, the cash reserve
+and the concentration limit, none of which were re-derived. Past the envelope the
+proposal is invalidated and re-derived, **never silently resized**.
+
+`fx_available` and `fx_freshness` are deliberately two rules, because the
+send-time preflight treats a *missing* input as transient (the proposal survives
+a provider outage) and a *stale* one as a deferral. `fx_rate_drift` is neither:
+a rate that moved is a statement about the trade and retires the proposal, just
+as a price that moved does.
+
+### The pending-order limit is counted twice
+
+Trading 212 documents 50 pending orders per ticker per account, and Phase 8's
+live test proved orders really do queue. The count before every send is the
+**larger** of the broker's own pending list for that ticker — the number the
+limit is measured against, and the only one that includes orders the operator
+queued by hand in the app — and StockBrain's own transmitted-but-unresolved
+attempts for that ticker in that environment, which covers the window between a
+successful POST and the broker's list catching up.
+
+A read that failed is not a count of zero. `read_ok=False` refuses, for the same
+reason reconciliation will not conclude "not placed" from one failed read: an
+unknown standing in front of a non-idempotent POST resolves against sending.
+
+`PENDING_ORDER_LIMIT` is its own failure category rather than a generic
+preflight refusal, because the remedy is different — nothing about the trade is
+wrong and the authorization is still good; the queue has to drain. It does not
+invalidate the proposal.
+
+### Deny by default at the HTTP edge
+
+Specification section 19 required web authentication from the beginning and
+Phase 8 shipped without it: seven state-changing routes, one of which transmits
+a real broker order, reachable by anything that could open a socket.
+
+The gate is **middleware with an explicit public allow-list**, not a dependency
+on each route. A dependency has to be remembered on every new route; a
+middleware has to be *un*-remembered, and the failure mode of forgetting is a
+401 rather than an open door. A test enumerates the route table and asserts
+every path is either allow-listed or behind the gate.
+
+One account, one password (scrypt, from the standard library, parameters stored
+with the hash), an HMAC-signed stateless session cookie, and three independent
+CSRF defences — `SameSite=Strict`, a double-submit token the SPA echoes in a
+header, and an `Origin` check. Three, for one reason: what is behind these
+routes is an irreversible broker order, and each mechanism fails closed on its
+own.
+
+There is no session table, no registration, no password reset, no roles and no
+token endpoint. Revocation is rotating `STOCKBRAIN_SECRET_KEY`, which is the
+only mechanism a stateless design has and is documented as such.
+
+A missing password hash is **not** a startup failure — it is a blocker, the same
+shape as an empty Telegram allowlist. The process comes up, serves its liveness
+and readiness probes, answers 503 with the reason on everything else, and grants
+access to nothing. Refusing to start would leave an operator with no way to read
+why.
+
+### Alerts are rows, and silence is a feature
+
+The alert scanner reads state and writes `Notification` rows; delivery is a job,
+exactly as it is for a proposal transition. It imports no risk engine, no broker
+client and no execution service — an alerting bug must not become a trading bug,
+and a test asserts the import list.
+
+Suppression is the `notifications.dedupe_key` unique index carrying a window
+stamp, so a provider down for six hours produces one message rather than three
+hundred and sixty, two workers cannot both announce, and a restart cannot
+re-announce. A cleared condition sends one "resolved" message so the last thing
+in the channel is the current state.
+
+**A deliberately disabled provider is never an alert.** `DISABLED` is a
+configuration statement and `DEGRADED` is the designed response to a provider
+having a bad minute. Alerting on either would train the operator to ignore the
+channel — which is the worst outcome available, because an ignored alert stream
+looks like coverage.
+
+### What Phase 9 deliberately did not do
+
+* **No FX cache.** A rate is fetched when it is needed. Caching is how a stale
+  number gets used after the check that would have rejected it. The one
+  exception is a memo scoped to a single invalidation sweep, where every
+  proposal is judged against the same instant anyway.
+* **No FX fallback provider.** One configured source. Silently substituting a
+  daily fixing when a live feed is down would change what a proposal means
+  without changing anything a reader can see.
+* **No cancel path, still.** Not for the kill switch, not for a full pending
+  queue, not for expiry. Cancelling races a fill, and a kill switch that
+  cancelled would be making a trading decision rather than stopping one.
+* **No resend, retry or force path for an execution attempt.** Unchanged from
+  Phase 8, and the pending-order check added a broker *read* in front of the
+  send without adding a mutation.
+* **No live Firecrawl call during the investigation.** The reconstruction is
+  from `firecrawl_activity_logs.csv`, the job history, the `sources` table and
+  the committed Phase 2 code.

@@ -95,7 +95,55 @@ class TradeProposal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     quote_age_ms: Mapped[int] = mapped_column(sa.Integer, nullable=False)
 
     estimated_notional: Mapped[Decimal] = mapped_column(sa.Numeric(24, 4), nullable=False)
+    """The trade's notional in ``reference_currency`` -- the *instrument's*
+    currency, which is what a broker would recognise.
+
+    Equal to ``estimated_notional_account_currency`` whenever the instrument and
+    the account agree, which was every row before Phase 9 made cross-currency
+    sizing possible."""
+
     account_currency: Mapped[str] = mapped_column(sa.String(3), nullable=False)
+
+    # ------------------------------------------------------------------
+    # Foreign exchange (Phase 9)
+    #
+    # A converted number without its rate, that rate's source and that rate's
+    # age is a number nobody can audit. All of it is persisted, and it is
+    # re-read and re-checked at authorization and again immediately before
+    # transmission.
+    # ------------------------------------------------------------------
+    estimated_notional_account_currency: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 4))
+    """``estimated_notional`` converted into ``account_currency``.
+
+    This is the number every ``RISK_*`` money limit, the cash reserve and the
+    concentration percentages were actually compared against."""
+
+    fx_required: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
+    """Whether this trade needed a conversion at all.  False means the
+    instrument and the account are the same currency and no rate was used --
+    which is a different fact from "converted at 1.0" and is recorded as such."""
+
+    fx_rate: Mapped[Decimal | None] = mapped_column(sa.Numeric(28, 12))
+    """Units of ``fx_quote_currency`` per one unit of ``fx_base_currency``."""
+
+    fx_base_currency: Mapped[str | None] = mapped_column(sa.String(3))
+    fx_quote_currency: Mapped[str | None] = mapped_column(sa.String(3))
+    fx_direction: Mapped[str | None] = mapped_column(sa.Text)
+    """``DIRECT``, ``INVERTED`` or ``IDENTITY``: which way the sizing conversion
+    used the measured pair.  Stored because inverting is exact but not
+    symmetric to read, and a reader checking the arithmetic needs to know which
+    operation was performed."""
+
+    fx_provider: Mapped[str | None] = mapped_column(sa.Text)
+    fx_rate_grade: Mapped[str | None] = mapped_column(sa.Text)
+    """``EXECUTION`` or ``REFERENCE``.  A daily central-bank fixing and a live
+    dealable quote are both "the exchange rate"; which one sized a trade is part
+    of the record."""
+
+    fx_rate_type: Mapped[str | None] = mapped_column(sa.Text)
+    fx_provider_timestamp: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    fx_received_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    fx_age_seconds: Mapped[Decimal | None] = mapped_column(sa.Numeric(18, 3))
 
     risk_snapshot: Mapped[JSONDict] = mapped_column(
         nullable=False, server_default=sa.text("'{}'::jsonb")

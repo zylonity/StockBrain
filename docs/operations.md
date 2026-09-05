@@ -98,21 +98,291 @@ Trading 212 DOWN                       → execution unavailable, research healt
 PostgreSQL DOWN                        → application DOWN / not ready
 ```
 
+## Web authentication
+
+Specification section 19: *"do not expose the UI unauthenticated"*, *"secure
+cookies"*, *"CSRF protection for state-changing operations"*, *"SameSite cookie
+settings"*, and — the sentence that matters most here — *"If accessed only over
+LAN/Tailscale, still require auth."*
+
+`WEB_AUTH_ENABLED=true` by default. Set the owner's password once, inside the
+container so the hash is produced by the same scrypt parameters that will verify
+it:
+
+```bash
+docker compose exec stockbrain python -m stockbrain.hash_password
+# paste the printed WEB_OWNER_PASSWORD_HASH=... line into .env, then
+docker compose up -d
+```
+
+With no hash set the process still starts and still answers `/api/health/live`
+and `/api/health/ready`; **every other route answers 503** naming the missing
+hash. That is deliberate: a fresh deployment must come up so an operator can
+read the reason, and must grant access to nothing while it waits.
+
+| Property | Value |
+|---|---|
+| Session | HMAC-signed cookie `sb_session`, `HttpOnly`, `SameSite=Strict`, 12h |
+| CSRF | readable cookie `sb_csrf`, echoed in `X-StockBrain-CSRF` on every POST |
+| Origin | a state-changing request with a foreign `Origin`/`Referer` is refused |
+| Public paths | `/api/health/live`, `/api/health/ready`, and the three `/api/v1/auth/*` routes. Nothing else. |
+| Revocation | rotate `STOCKBRAIN_SECRET_KEY` — it invalidates every outstanding session |
+
+Three independent CSRF defences (`SameSite`, double-submit token, origin check)
+for one reason: what is behind these routes is an irreversible broker order.
+
+`GET /api/v1/system/web-security` reports the posture rather than assuming it. A
+deployment that *thinks* it has authentication and does not is the failure that
+endpoint exists to make visible.
+
+**Running without it.** Supported, and only as a recorded decision: set
+`WEB_AUTH_ENABLED=false` *and* `WEB_TRUSTED_NETWORK_ACKNOWLEDGED=true`. In
+production the second is required — the process refuses to start otherwise —
+because "we have an authenticating reverse proxy" and "nobody ever set a
+password" look identical from the code's side. Every start logs
+`web_authentication_not_protecting` with the reason.
+
+## Firecrawl cost control
+
+Firecrawl is the only provider that can spend real money on a schedule with
+nobody watching, and in Phase 2 it did. See `docs/sources.md` for the full
+incident reconstruction; the operational summary:
+
+* **29 searches in 62 minutes** on 2026-09-05 (`firecrawl_activity_logs.csv`),
+  then HTTP 402 for 127 consecutive jobs.
+* Steady state under that configuration was **21 searches/hour → 504/day**, at
+  roughly **24 credits each** (4 for a 20-result search plus 1 per scraped
+  page) — about **12,000 credits/day** against a 1,000-credit monthly allowance.
+* Nothing in the system could have stopped it: the only accounting was an
+  integer on a client object and a Prometheus counter.
+
+What protects it now:
+
+| Control | Default | Where it lives |
+|---|---|---|
+| `FIRECRAWL_ENABLED` | **false** | a fresh deployment discovers via Alpaca + SEC |
+| Per-topic interval floor | 720 min | applied where the interval is *used*, so a topic row cannot go faster |
+| Searches/day | 12 | durable ledger, not a process counter |
+| Scrapes/day | 6 | second stage only, for results that survived triage |
+| Credits/day | 30 | estimated, then reconciled against the provider's `creditsUsed` |
+| Credits/month | 900 | the allowance is monthly; a daily cap alone cannot hold it |
+| Search `limit` | 5 **per source** | 5 × 2 sources = 10 results = exactly one 2-credit block |
+| Retries | none | a retry is a second *paid* call; the durable cooldown is the retry |
+
+**The two-stage model.** A search asks for metadata only — title, URL, snippet,
+date. That is enough for URL deduplication, the deterministic source-category
+rules and the cheap DeepSeek classifier. Full article content is fetched
+separately, one page at a time, and only for a source whose event the classifier
+promoted to `CANDIDATE`. Passing `scrapeOptions` to a broad search was the single
+largest contributor to the incident: it turned a 4-credit search into a
+24-credit one.
+
+**Budget exhaustion is not a failure.** Firecrawl reports degraded, Alpaca news
+continues, SEC EDGAR continues, already-ingested events keep being classified,
+research and broker reconciliation keep running. The daily window resets at UTC
+midnight on the **database** clock.
+
+Read the state:
+
+```bash
+curl -s localhost:8080/api/v1/discovery/status | python3 -m json.tool | sed -n '/firecrawl/,/^  }/p'
+```
+
+It reports searches and credits used today and this month, the caps, remaining
+headroom, the last successful call, and per query: last run, last success,
+`next_eligible_at`, consecutive failures and lifetime credits. No API key.
+
+## Foreign exchange
+
+The account is **GBP**; the priced universe is **USD**. Phase 6 measured 14 of
+14 live positions in another currency, so `currency_alignment` blocked
+everything StockBrain could price. Phase 9 lifts that block only behind a
+verified rate — never by inferring one.
+
+| `FX_PROVIDER` | Grade | Notes |
+|---|---|---|
+| `none` *(default)* | — | cross-currency sizing stays blocked. Safe, and the Phase 6 behaviour. |
+| `alpaca` | execution | `/v1beta1/forex/latest/rates`, live bid/mid/ask, instant timestamps. **Measured 2026-09-05: HTTP 403 `insufficient grants`** on the plan that covers IEX equity data. |
+| `frankfurter` | reference | central-bank fixings, no key, no quota. Its own docs say it "is not for live trading", so it requires `FX_ALLOW_REFERENCE_GRADE=true`. |
+
+Enabling cross-currency sizing needs **two** settings —
+`RISK_REQUIRE_SAME_CURRENCY=false` and a real `FX_PROVIDER`. The pairing of
+`false` with `none` is refused at startup: through Phase 8 it produced a warning
+and a quantity computed by dividing a GBP cap by a USD ask.
+
+Every proposal records the pair, the rate, the direction it was applied in, the
+provider, the grade, the provider's timestamp and the age. The rate is
+re-resolved and re-judged at **generation**, at **authorization** and again
+**immediately before transmission**; missing, stale, wrong-pair or
+untrusted-grade all block. `FX_MAX_RATE_DRIFT_PCT` is the envelope: past it the
+proposal is invalidated and re-derived, never silently resized.
+
+```bash
+curl -s localhost:8080/api/v1/system/fx | python3 -m json.tool
+```
+
+Central banks do not publish at weekends, so a reference rate is dated the
+previous Friday on a Monday morning and cross-currency sizing blocks until the
+next fixing. Equity markets are closed then anyway.
+
+## Trading 212 pending-order limit
+
+Trading 212 documents a functional limit of **50 pending orders per ticker per
+account**, and the Phase 8 demo verification made it reachable: a market order
+placed while the market was closed returned HTTP 200 with status `NEW` and sat
+in the queue.
+
+Before every send, StockBrain takes the **larger** of two counts:
+
+1. the broker's own pending list for that ticker — the number the limit is
+   actually measured against, and the only one that includes orders queued by
+   hand in the app;
+2. its own transmitted-but-unresolved attempts for that ticker in that
+   environment — the window between a successful POST and the broker's list
+   catching up, plus anything ambiguous.
+
+At or past `50 − T212_PENDING_ORDER_HEADROOM` (45 by default) the send is
+refused with `PENDING_ORDER_LIMIT`. **A failed read is not a count of zero** and
+also refuses: an unknown in front of a non-idempotent POST resolves against
+sending. The refusal does not invalidate the proposal — a full queue is a
+condition of the moment, and the authorization is still good once it drains.
+
 ## Backups
 
-The database holds the entire research and execution audit trail. Container
-volumes alone are not a backup.
+The database is the entire audit trail: every event, every classification, every
+research run, every risk evaluation, every authorization and — the part that
+cannot be reconstructed from anywhere — **every execution attempt and its
+outcome**. A ZFS snapshot of a running PostgreSQL data directory is a
+crash-consistent copy; it is usually recoverable and it is not a backup.
 
 ```bash
-docker compose exec -T postgres pg_dump -U stockbrain -Fc stockbrain > stockbrain-$(date +%F).dump
+scripts/backup.sh                     # -> ./backups/stockbrain-<UTC>.dump
+scripts/restore-test.sh backups/stockbrain-20260905T204514Z.dump
 ```
 
-Run nightly, keep a retention policy, combine with TrueNAS dataset snapshots,
-and test a restore periodically:
+`backup.sh` runs `pg_dump -Fc` *inside* the container (so the host needs no
+PostgreSQL client and the database stays unpublished), writes to a `.partial`
+file and renames only on a clean exit, verifies the archive is listable, and
+prunes dumps older than `BACKUP_RETAIN_DAYS` (14).
+
+`restore-test.sh` restores into a throwaway database, reports the schema
+revision against the code's head, counts the tables that matter, **checks that
+the critical unique indexes survived the round trip** — a restore that silently
+dropped `uq_execution_attempts_sent_once` would look fine and would permit a
+second transmitted attempt for one proposal — and reports how many ambiguous or
+unresolved execution attempts the backup contains. It drops the database on exit,
+including on failure.
+
+Schedule it on the host, not in the container:
+
+```cron
+# 03:17 UTC daily. Staggered off the hour so it does not collide with anything.
+17 3 * * * cd /mnt/tank/apps/stockbrain && ./scripts/backup.sh >> /var/log/stockbrain-backup.log 2>&1
+# Weekly proof that the newest dump is restorable.
+41 4 * * 0 cd /mnt/tank/apps/stockbrain && ./scripts/restore-test.sh "$(ls -t backups/*.dump | head -1)" >> /var/log/stockbrain-backup.log 2>&1
+```
+
+Retention: 14 daily dumps on the host, plus TrueNAS dataset snapshots of the
+`backups` dataset for longer history. `./backups/` is git-ignored — a directory
+of dumps is the audit trail in plain form and must never reach a commit.
+
+## Disaster recovery
+
+The ordering below is the whole point. **Reconcile before you enable
+execution**, every time.
+
+### Application or container failure
+
+`restart: unless-stopped` brings it back. On start it restores the durable pause
+and kill switch (a process that crashed while halted comes back halted and says
+so at WARNING), and sweeps execution attempts stranded mid-flight: an attempt
+recorded as sent with no result becomes `EXECUTION_AMBIGUOUS` and is queued for
+reconciliation. **It is never resent.**
+
+Nothing in a restart re-runs a paid provider call. Firecrawl eligibility is a
+committed `discovery_queries.next_eligible_at` column, so ten restarts in a row
+spend nothing; the Firecrawl budget is a table, so a restart does not forget
+what today already cost.
+
+### Host restart
+
+Same as above; compose brings both containers up in dependency order and the
+entrypoint waits for PostgreSQL before migrating.
+
+### Database failure
+
+`/api/health/live` stays 200 and `/api/health/ready` returns 503. The
+application keeps serving health so the reason is readable. Nothing is proposed,
+authorized or transmitted without a database — account state fails closed, and
+the risk engine blocks on `account_state_available`.
+
+### Restoring a backup
+
+1. **Stop the application** — not just the database. A running process against a
+   restored database will act on it.
+   ```bash
+   docker compose stop stockbrain
+   ```
+2. Restore into a fresh database, never over the live one:
+   ```bash
+   docker compose exec -T postgres psql -U stockbrain -d postgres \
+     -c 'ALTER DATABASE stockbrain RENAME TO stockbrain_before_restore;'
+   docker compose exec -T postgres psql -U stockbrain -d postgres \
+     -c 'CREATE DATABASE stockbrain OWNER stockbrain;'
+   docker compose exec -T postgres pg_restore -U stockbrain -d stockbrain \
+     --no-owner --no-privileges --exit-on-error < backups/<dump>
+   ```
+3. **Bring it up with execution off.** `T212_EXECUTION_ENABLED=false` in `.env`
+   before starting. This is the step that matters.
+4. Start it. The entrypoint runs `alembic upgrade head`, so a dump older than
+   the image is migrated forward.
+5. **Reconcile against the broker before anything else.** A restored database is
+   a database that has forgotten anything that happened after the dump.
+
+### The restore-point problem
+
+A restored database is **behind reality**, and the two dangerous shapes are:
+
+* **An order the broker has and the database does not.** Placed after the dump.
+  StockBrain will not know about it, so its exposure is unreserved and a fresh
+  proposal for the same listing could double the position. *Check the Trading
+  212 app's order history for anything after the dump timestamp before enabling
+  execution.*
+* **An attempt the database has and the broker does not.** Recorded as sent
+  before the dump, resolved after it. It comes back `AMBIGUOUS` and
+  reconciliation resolves it by reading — which is safe, and is why
+  reconciliation never sends.
 
 ```bash
-docker compose exec -T postgres pg_restore -U stockbrain -d stockbrain_restore_test < backup.dump
+# What the restored database thinks is unresolved:
+curl -s localhost:8080/api/v1/execution/attempts?ambiguous_only=true | python3 -m json.tool
+# Ask the broker again, per attempt. This endpoint only READS the broker.
+curl -sX POST localhost:8080/api/v1/execution/attempts/<id>/reconcile \
+     -H 'content-type: application/json' -d '{}'
 ```
+
+Re-enable `T212_EXECUTION_ENABLED` only once every attempt is resolved and the
+broker's order history after the dump timestamp is accounted for.
+
+### Stale Telegram callbacks after a restore
+
+Approval tokens live in `approval_actions`, so a restore brings back tokens that
+were consumed after the dump. A button pressed now resolves against the restored
+row and may find it unconsumed.
+
+Two things limit the damage, and neither is sufficient alone: a token is clamped
+to its proposal's own expiry (`RISK_PROPOSAL_TTL_MINUTES`, 30 by default), and
+approval only *authorizes* — transmission is separately gated and re-validates
+the quote, the account, the exposure and the FX rate at send time. Still, after a
+restore:
+
+```bash
+docker compose exec -T postgres psql -U stockbrain -d stockbrain \
+  -c "UPDATE approval_actions SET consumed_at = now() WHERE consumed_at IS NULL;"
+```
+
+Pending updates are dropped at Telegram startup anyway, so a queued `/resume`
+of unknown age is never replayed.
 
 ## Runbooks
 
@@ -259,6 +529,223 @@ At the soft limit, low-priority thematic searches and research are reduced and
 the user is warned. At the hard limit, new deep research stops while ingestion,
 deduplication, broker reconciliation and portfolio safety alerts continue.
 Broker-state monitoring is never stopped by an LLM budget.
+
+## Job queue
+
+The queue *is* the audit trail, which is only a virtue if somebody can read it.
+Phase 6's bug 12 is the case in point: 144 events sat unclassified for hours,
+`/api/health` was green, and the queue recorded every job as **succeeded**.
+
+```bash
+curl -s localhost:8080/api/v1/discovery/status | python3 -m json.tool | sed -n '/"queue"/,/^  }/p'
+```
+
+| Field | The question it answers |
+|---|---|
+| `pending` / `running` | depth |
+| `oldest_pending_age_seconds` / `_job_type` | *has something stopped?* — the single most useful number here |
+| `stuck` / `stuck_job_types` | `RUNNING` past `JOB_CLAIM_TIMEOUT_SECONDS`: a dead worker or a hanging handler |
+| `dead` | exhausted its retries; terminal, and will not run again without you |
+| `failed` | includes jobs merely between retries |
+| `counts_by_type` / `counts_by_status` | the whole distribution |
+
+A stale claim is reclaimed automatically, subject to the same `max_attempts`
+budget so a job that reliably kills its worker cannot loop for ever. A job with
+no attempts left is marked `FAILED` rather than retried — which is why a
+Firecrawl search job carries `max_attempts=1`: reclaiming it would be a second
+billable request.
+
+## Operational alerts
+
+Uses the Phase 7 Telegram path. Alerts are `Notification` rows first, delivered
+by a job, so an alert that already happened does not fail because Telegram is
+unreachable — and a failed send is recorded and **never** auto-resent.
+
+| Condition | Class | Repeat |
+|---|---|---|
+| `EXECUTION_AMBIGUOUS` | critical | 1h |
+| `DATABASE_UNHEALTHY` | critical | 1h |
+| `BROKER_AUTH_FAILING` | critical | 4h |
+| `RECONCILIATION_UNRESOLVED` | critical | 6h |
+| `QUEUE_STUCK` | warning | 2h |
+| `QUEUE_BACKLOG`, `PROVIDER_DOWN` | warning | 6h |
+| `DEAD_JOBS`, `TRADING_HALTED`, `FX_UNAVAILABLE`, `LLM_BUDGET_EXHAUSTED`, `FIRECRAWL_BUDGET_EXHAUSTED` | warning | 12h |
+
+Suppression is the `notifications.dedupe_key` unique index carrying a window
+stamp — not a timestamp comparison in Python — so two workers cannot both
+announce and a restart cannot re-announce. A condition that clears sends one
+"resolved" message, so the last thing in the channel is the current state rather
+than the worst state.
+
+**A deliberately disabled provider is never an alert.** `DISABLED` is a
+configuration statement. Neither is `DEGRADED`: degradation is the designed
+response to a provider having a bad minute. An alert stream nobody reads is
+worse than no alerts, because it looks like coverage.
+
+## Pre-live checklist
+
+Every line is a thing to *confirm*, not to assume. Nothing here is optional, and
+the order is roughly the order in which failing one is cheapest to discover.
+
+**The system**
+
+- [ ] `make check` green: pytest, ruff, mypy `--strict`, Alembic drift, frontend
+      lint/typecheck/build, pip-audit, npm audit.
+- [ ] `docker compose exec stockbrain check-config` prints the posture with no
+      unexpected blocker.
+- [ ] `/api/health/ready` is 200 with `schema_current: true`.
+- [ ] `/api/health/providers` — every provider you rely on is `HEALTHY`;
+      everything else is `DISABLED` **on purpose** and you can say why.
+- [ ] Queue: `stuck: 0`, `dead: 0`, `oldest_pending_age_seconds` not growing.
+
+**Backups**
+
+- [ ] `scripts/backup.sh` has run and produced a dump.
+- [ ] `scripts/restore-test.sh <newest dump>` prints `restore verified`.
+- [ ] The cron entries exist on the host and have actually fired at least once.
+
+**Execution safety**
+
+- [ ] **Zero unresolved ambiguous executions.**
+      `/api/v1/execution/attempts?ambiguous_only=true` is empty. This is a hard
+      gate: going live with an unknown order outstanding means you cannot tell a
+      new position from an old one.
+- [ ] A full **demo end-to-end run** has succeeded: event → thesis →
+      resolution → quote/account/FX → risk → proposal → authorization →
+      execution → reconciliation, with **exactly one** broker POST.
+- [ ] The kill switch has been engaged and released, and you watched it block an
+      authorization.
+- [ ] If you rely on Telegram: `/status` answers, a proposal notification
+      arrived, and an Approve button worked end to end.
+
+**Prices and rates**
+
+- [ ] Quote freshness: `/api/v1/market-data/health` shows the feed entitled and
+      a probe age you understand. Outside market hours the "latest" quote is the
+      closing print — a live probe measured $33 of spread on a $321.80 AAPL mid,
+      7.67 hours old. Both gates fire on that, correctly.
+- [ ] FX, **only if trading a currency other than the account's**:
+      `/api/v1/system/fx` reports `available: true`, and you have read which
+      *grade* of rate is sizing your trades. A reference fixing is not a dealing
+      rate.
+- [ ] Account snapshot age is inside `RISK_MAX_ACCOUNT_STATE_AGE_SECONDS`.
+
+**Cost**
+
+- [ ] Firecrawl: enabled or not — decide deliberately. If enabled, the caps and
+      the cadence in `/api/v1/discovery/status` are numbers you are willing to
+      pay every day for a month.
+- [ ] LLM budgets reflect what you will actually accept
+      (`LLM_DAILY_HARD_USD`, `LLM_MONTHLY_HARD_USD`).
+
+**Broker**
+
+- [ ] `T212_ENV=live` and the API key is a **live** key. A key from the wrong
+      environment returns HTTP 401 with an empty body; it does not fail
+      helpfully.
+- [ ] The live key has the `orders:execute` scope, granted knowingly, and is
+      **IP-restricted** in the Trading 212 account settings.
+- [ ] A separate read-only key is used for metadata and account reads.
+- [ ] `T212_WRITTEN_CONSENT_CONFIRMED=true` — and you have actually obtained
+      Trading 212's prior written consent. API Terms 6.6/6.7.
+- [ ] For automatic authorization live only:
+      `T212_AUTOMATED_TRADING_CONSENT_CONFIRMED=true`, and you have actually
+      obtained consent for it. API Terms 4.2(a) prohibits Algorithmic Trading
+      without it.
+- [ ] **One tiny order placed by hand in the Trading 212 app first**, so the
+      account, the instrument and the scope are known to work before software
+      places one.
+- [ ] `RISK_*` limits reviewed against the **real** account balance, not the
+      demo one. Every one of them is a limit, not a recommendation.
+- [ ] Account currency behaviour verified: you know whether the listings you
+      intend to trade are in the account's currency, and if not, that FX is
+      configured, fresh and of a grade you accept.
+
+**Access**
+
+- [ ] `/api/v1/system/web-security` reports `auth_effective: true`, or
+      `WEB_TRUSTED_NETWORK_ACKNOWLEDGED=true` with a reverse proxy you can name.
+- [ ] The GUI is not reachable from the public internet. Loopback binding plus
+      Tailscale or a LAN-only reverse proxy.
+- [ ] PostgreSQL is unpublished (`compose.yaml` only; never the dev overlay).
+- [ ] `.env` is `chmod 600` and owned by root on the host.
+
+**Then, and only then**
+
+- [ ] Set `T212_LIVE_EXECUTION_ENABLED=true` and restart. The process refuses to
+      start if any of the four gates disagree, which is the last line of
+      defence rather than the first.
+
+## Live execution gate truth table
+
+Four independent gates, all required. Exactly 1 of 16 combinations permits live
+transmission, and there is an exhaustive test.
+
+| `T212_ENV` | `LIVE_EXECUTION_ENABLED` | `WRITTEN_CONSENT_CONFIRMED` | `EXECUTION_MODE` | Live? |
+|---|---|---|---|---|
+| live | true | true | manual_approval | **yes** |
+| live | true | true | research_only | no |
+| live | true | false | *any* | no — *and the process refuses to start* |
+| live | false | *any* | *any* | no |
+| demo | *any* | *any* | *any* | no |
+
+Beside them, and deliberately **not** among them:
+
+| Setting | Gates | Why it is separate |
+|---|---|---|
+| `T212_EXECUTION_ENABLED` | *any* transmission, demo included | So deploying execution does not, by itself, start sending. Default false. |
+| `T212_AUTOMATED_TRADING_CONSENT_CONFIRMED` | live *automatic authorization* | Authorizing and transmitting are different permissions. Re-checked at send time. |
+| `EXECUTION_POLICY` | who authorizes | A different axis from `EXECUTION_MODE`; conflating them would let one be granted by satisfying the other. |
+| kill switch / pause | everything | Durable, in PostgreSQL, re-read inside the send transaction. |
+
+A contradictory combination is a startup failure with exit code 78, not a
+warning. `live_execution_permitted` is defined as "no blockers remain", so the
+flag and the blocker list can never disagree.
+
+## Update and rollback
+
+```bash
+# Update
+scripts/backup.sh                                   # always first
+git pull && docker compose build stockbrain
+docker compose up -d stockbrain                     # entrypoint migrates
+curl -sf localhost:8080/api/health/ready | python3 -m json.tool
+```
+
+Rollback is the asymmetric case. Migrations run **forward** on start, so an
+older image against a newer schema reports `schema_current: false` and 503s
+rather than guessing.
+
+```bash
+git checkout <previous tag> && docker compose build stockbrain
+docker compose up -d stockbrain
+# If readiness reports schema_current: false, the schema is ahead of the image.
+cd backend && alembic downgrade <that image's head>
+```
+
+Never edit `alembic_version` by hand. Every migration in this repository has a
+tested downgrade and the round trip is part of `make check`.
+
+## Emergency shutdown
+
+In order of severity, and knowing what each one does *not* do:
+
+1. **Kill switch** — `/kill` in Telegram, or
+   `POST /api/v1/system/kill-switch {"engaged": true}`. Durable. Stops new
+   proposals, every authorization path and every transmission. Takes effect
+   inside the send transaction, so an order being prepared right now is stopped.
+2. **Stop transmission only** — `T212_EXECUTION_ENABLED=false`, restart.
+   Proposals still generate and can still be authorized; nothing is sent.
+3. **Stop the container** — `docker compose stop stockbrain`. 30 seconds of
+   grace to drain workers and close the Telegram poller.
+4. **Revoke the API key** in the Trading 212 app. The only measure that does not
+   depend on StockBrain behaving correctly, and therefore the right one if you
+   are unsure.
+
+**None of these closes a position or cancels an order.** There is no order,
+cancel, amend or modify path anywhere in this process — a test scans every
+module to keep it that way — and cancelling races a fill. To exit a position,
+use the Trading 212 app.
 
 ## Log hygiene
 
