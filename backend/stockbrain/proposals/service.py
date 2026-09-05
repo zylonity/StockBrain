@@ -39,6 +39,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -49,9 +50,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from stockbrain.broker.account_state import DEFAULT_ACCOUNT_ID, AccountStateService
 from stockbrain.broker.automation import BrokerAutomationCapability, automation_capability
 from stockbrain.config import Settings
+from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, EventCompanyImpact
-from stockbrain.db.models.proposals import RiskEvaluation, TradeProposal
+from stockbrain.db.models.proposals import ApprovalAction, RiskEvaluation, TradeProposal
 from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.models.system import AuditLog
 from stockbrain.db.session import Database
@@ -61,6 +63,7 @@ from stockbrain.enums import (
     Broker,
     ExecutionPolicy,
     JobType,
+    NotificationEvent,
     OrderSide,
     OrderType,
     ProposalStatus,
@@ -173,6 +176,7 @@ class ProposalService:
         market_data: MarketDataProvider | None,
         broker: Broker = Broker.TRADING212,
         engine: RiskEngine | None = None,
+        control: ControlStateService | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -182,6 +186,10 @@ class ProposalService:
         self.broker = broker
         self.engine = engine or RiskEngine()
         self.queue = JobQueue()
+        # Durable pause / kill switch. Optional so a unit test can build the
+        # service without one; absent, nothing is halted, which is the same
+        # answer an empty table gives.
+        self.control = control or ControlStateService(database)
 
     # ------------------------------------------------------------------
     # Policy
@@ -214,6 +222,29 @@ class ProposalService:
             ),
         }
 
+    async def control_blockers(self) -> list[str]:
+        """Every durable reason proposal work is currently halted.
+
+        Read from PostgreSQL on every call rather than cached: a pause set from
+        Telegram must take effect for the job worker in the same process and
+        for any other process reading the same database, and a cache is exactly
+        what would let those disagree.
+        """
+        return (await self.control.snapshot()).blockers
+
+    async def _assert_not_halted(self) -> None:
+        """Refuse authorization while paused or killed.
+
+        Enforced *here* rather than in each client so the web, Telegram and the
+        automatic path cannot diverge: there is one authorization function and
+        it is the one that checks. ``AuthorizationNotPermitted`` rather than
+        ``ExecutionNotPermitted`` because what is being refused is the
+        authorization -- transmission is Phase 8's separate permission and its
+        own gate.
+        """
+        if blockers := await self.control_blockers():
+            raise AuthorizationNotPermitted("authorization is halted: " + "; ".join(blockers))
+
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
@@ -222,6 +253,14 @@ class ProposalService:
     ) -> GenerationResult:
         """Evaluate one published thesis and, if risk allows, persist a proposal."""
         moment = now or utcnow()
+
+        # A pause stops *new* proposals. Ingestion, classification, research and
+        # broker reconciliation deliberately keep running (spec section 20), so
+        # the work already in flight is not lost -- it simply waits.
+        if blockers := await self.control_blockers():
+            reason = "proposal generation is halted: " + "; ".join(blockers)
+            log.info("proposal_generation_halted", thesis_id=str(thesis_id), blockers=blockers)
+            return GenerationResult(thesis_id=thesis_id, created=False, reason=reason)
 
         async with self.database.session() as session:
             candidate = await self._load_candidate(session, thesis_id)
@@ -383,6 +422,11 @@ class ProposalService:
                     },
                 )
             )
+            if proposal.execution_policy is ExecutionPolicy.MANUAL:
+                # An AUTOMATIC proposal is announced only once its authorization
+                # has been attempted, so the message can state what actually
+                # happened rather than what was about to be tried.
+                await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_MANUAL)
             proposal_id = proposal.id
             evaluation_id = evaluation.id
 
@@ -417,6 +461,10 @@ class ProposalService:
                     actor="system:automatic",
                 )
                 result.authorized = True
+                async with self.database.transaction() as session:
+                    await self._notify(
+                        session, proposal_id, NotificationEvent.PROPOSAL_AUTO_AUTHORIZED
+                    )
             except (
                 RiskBlocked,
                 ProposalExpired,
@@ -432,6 +480,13 @@ class ProposalService:
                     error_type=type(exc).__name__,
                     reason=str(exc)[:300],
                 )
+                async with self.database.transaction() as session:
+                    await self._notify(
+                        session,
+                        proposal_id,
+                        NotificationEvent.AUTHORIZATION_REFUSED,
+                        detail=str(exc),
+                    )
         return result
 
     # ------------------------------------------------------------------
@@ -463,6 +518,7 @@ class ProposalService:
         a refusal nobody can read afterwards is not a durable refusal.
         """
         moment = now or utcnow()
+        await self._assert_not_halted()
         if source is AuthorizationSource.SYSTEM_AUTOMATIC:
             self._assert_automation_permitted()
 
@@ -579,6 +635,15 @@ class ProposalService:
                     )
                 )
                 refusal = RiskBlocked(reason, rule_ids=tuple(rule.rule_id for rule in blocked))
+                # The proposal is now INVALIDATED, so every button that still
+                # points at it must stop working, whichever client drew it.
+                await self._retire_approval_actions(session, [locked.id], moment)
+                await self._notify(
+                    session,
+                    locked.id,
+                    NotificationEvent.AUTHORIZATION_REFUSED,
+                    detail=reason,
+                )
             else:
                 # The row is refreshed to the values authorization actually
                 # judged; the drift rule has already bounded how far they moved.
@@ -623,6 +688,11 @@ class ProposalService:
                         },
                     )
                 )
+            if refusal is None:
+                # APPROVED is not authorizable, so any outstanding approve or
+                # reject button is now meaningless. Consuming the rows is what
+                # makes a stale tap a refusal rather than a second decision.
+                await self._retire_approval_actions(session, [locked.id], moment)
             await session.flush()
             evaluation_id = evaluation.id
 
@@ -708,6 +778,9 @@ class ProposalService:
             if target is ProposalStatus.REJECTED:
                 proposal.rejected_at = now
                 proposal.rejected_by = actor
+            await self._retire_approval_actions(session, [proposal.id], now)
+            if target is ProposalStatus.REJECTED:
+                await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_REJECTED)
             session.add(
                 AuditLog(
                     actor_type=ActorType.USER,
@@ -759,7 +832,11 @@ class ProposalService:
                 )
                 .returning(TradeProposal.id)
             )
-            return len(list(result.scalars()))
+            expired = list(result.scalars())
+            await self._retire_approval_actions(session, expired, now)
+            for proposal_id in expired:
+                await self._notify(session, proposal_id, NotificationEvent.PROPOSAL_EXPIRED)
+            return len(expired)
 
     async def _invalidate_stale_preconditions(self, now: dt.datetime) -> int:
         """Invalidate proposals whose durable preconditions stopped holding.
@@ -787,6 +864,13 @@ class ProposalService:
                 if not _can_reach(proposal.status, ProposalStatus.INVALIDATED):
                     continue
                 self._invalidate(proposal, reason, now)
+                await self._retire_approval_actions(session, [proposal.id], now)
+                await self._notify(
+                    session,
+                    proposal.id,
+                    NotificationEvent.PROPOSAL_INVALIDATED,
+                    detail=reason,
+                )
                 session.add(
                     AuditLog(
                         actor_type=ActorType.SYSTEM,
@@ -907,6 +991,13 @@ class ProposalService:
                 if locked is None:
                     continue
                 self._invalidate(locked, failure, now)
+                await self._retire_approval_actions(session, [locked.id], now)
+                await self._notify(
+                    session,
+                    locked.id,
+                    NotificationEvent.PROPOSAL_INVALIDATED,
+                    detail=failure,
+                )
                 session.add(
                     AuditLog(
                         actor_type=ActorType.SYSTEM,
@@ -963,6 +1054,9 @@ class ProposalService:
         not from an in-memory list, and the dedupe key means re-enqueuing a
         thesis that already has a pending job is a no-op.
         """
+        if blockers := await self.control_blockers():
+            log.debug("proposal_backlog_skipped", blockers=blockers)
+            return 0
         enqueued = 0
         async with self.database.transaction() as session:
             thesis_ids = list(
@@ -1020,6 +1114,59 @@ class ProposalService:
                 priority=25,
             )
         return 1 if job_id is not None else 0
+
+    async def _notify(
+        self,
+        session: AsyncSession,
+        proposal_id: uuid.UUID,
+        event: NotificationEvent,
+        *,
+        detail: str | None = None,
+    ) -> None:
+        """Queue one outbound notification for a proposal transition.
+
+        Queued, never sent inline: a Telegram outage must not be able to fail an
+        authorization that has already happened, and a notification is derived
+        from database state rather than being the record of it.
+
+        Once-only by construction at two layers -- ``uq_jobs_dedupe_key_active``
+        stops a second *pending* job for the same transition, and the
+        notification row's own unique dedupe key stops a redelivered job or a
+        restarted process producing a second message.
+        """
+        await self.queue.enqueue(
+            session,
+            JobType.SEND_NOTIFICATION,
+            payload={
+                "proposal_id": str(proposal_id),
+                "event": event.value,
+                "detail": (detail or "")[:500] or None,
+            },
+            dedupe_key=f"notify:{proposal_id}:{event.value}",
+            priority=15,
+        )
+
+    @staticmethod
+    async def _retire_approval_actions(
+        session: AsyncSession, proposal_ids: Sequence[uuid.UUID], now: dt.datetime
+    ) -> None:
+        """Consume every outstanding approval token for these proposals.
+
+        Called on every transition that ends a proposal's authorizable life.
+        This -- not blanking a keyboard -- is what makes an old button inert: a
+        message can be forwarded, screenshotted, or edited by a client that
+        refuses the edit, and none of that reaches the row the token names.
+        """
+        if not proposal_ids:
+            return
+        await session.execute(
+            sa.update(ApprovalAction)
+            .where(
+                ApprovalAction.proposal_id.in_(list(proposal_ids)),
+                ApprovalAction.consumed_at.is_(None),
+            )
+            .values(consumed_at=now)
+        )
 
     # ------------------------------------------------------------------
     # Internals

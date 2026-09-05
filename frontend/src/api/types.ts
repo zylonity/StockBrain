@@ -681,3 +681,49 @@ export interface ExecutionPolicyResponse {
   broker_order_routes: string[];
   notice: string;
 }
+
+/**
+ * Durable execution control: the pause and the emergency kill switch.
+ *
+ * Both live in PostgreSQL rather than in the running process, so the banner
+ * shows the same state after a restart, and the same state Telegram shows.
+ * Neither closes a position or cancels a broker order — there is no
+ * order-submission path in this phase for one to reach.
+ */
+export interface ControlFlagState {
+  flag: string;
+  active: boolean;
+  changed_at: string | null;
+  actor: string | null;
+  source: string | null;
+  reason: string | null;
+}
+
+export interface ControlStateResponse {
+  trading_halted: boolean;
+  blockers: string[];
+  paused: ControlFlagState;
+  kill_switch: ControlFlagState;
+  notice: string;
+}
+
+/** Telegram bot health. Contains no token and no chat content. */
+export interface TelegramStatusResponse {
+  status: ProviderStatus;
+  bot_configured: boolean;
+  /** Whether getMe authenticated. Never the bot's numeric id: that is the half
+   *  of the token before the colon. */
+  bot_identified: boolean;
+  transport: string;
+  webhook_configured: boolean;
+  polling: boolean;
+  started_at: string | null;
+  last_contact_at: string | null;
+  last_error_category: string | null;
+  consecutive_failures: number;
+  authorized_users: number;
+  authorized_chats: number;
+  notification_targets: number;
+  group_chats_allowed: boolean;
+  blockers: string[];
+}

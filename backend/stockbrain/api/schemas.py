@@ -18,6 +18,9 @@ __all__ = [
     "AliasResponse",
     "BrokerInstrumentResponse",
     "CompanyImpactResponse",
+    "ControlChangeRequest",
+    "ControlFlagResponse",
+    "ControlStateResponse",
     "DiscoveryQueryResponse",
     "DiscoveryStatusResponse",
     "DiscoveryTopicResponse",
@@ -29,6 +32,7 @@ __all__ = [
     "IngestionStatsResponse",
     "InstrumentCandidateResponse",
     "InstrumentSyncStatusResponse",
+    "KillSwitchRequest",
     "LivenessResponse",
     "LlmBudgetResponse",
     "LlmCallResponse",
@@ -43,6 +47,7 @@ __all__ = [
     "ResolutionResponse",
     "SourceResponse",
     "SubsystemHealth",
+    "TelegramStatusResponse",
 ]
 
 
@@ -109,6 +114,72 @@ class ExecutionStatusResponse(ApiModel):
     broker_credentials_configured: bool
     blockers: list[str]
     notice: str
+
+
+class ControlFlagResponse(ApiModel):
+    """One durable execution-control flag and where its value came from."""
+
+    flag: str
+    active: bool
+    changed_at: dt.datetime | None = None
+    actor: str | None = None
+    source: str | None = None
+    reason: str | None = None
+
+
+class ControlStateResponse(ApiModel):
+    """The pause and kill-switch state, read from PostgreSQL.
+
+    ``trading_halted`` is defined as "there is at least one blocker", so the
+    banner and the explanation cannot disagree.  Neither flag closes a position
+    or cancels a broker order: no such path exists in this phase.
+    """
+
+    trading_halted: bool
+    blockers: list[str]
+    paused: ControlFlagResponse
+    kill_switch: ControlFlagResponse
+    notice: str
+
+
+class ControlChangeRequest(ApiModel):
+    """The complete input a control change accepts.
+
+    A reason and, for the kill switch, a direction.  Nothing here can influence
+    a proposal, a quantity or a price.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class KillSwitchRequest(ControlChangeRequest):
+    engaged: bool = True
+
+
+class TelegramStatusResponse(ApiModel):
+    """Bot health, containing no token and no chat content."""
+
+    status: ProviderStatus
+    bot_configured: bool
+    bot_identified: bool = False
+    """Whether ``getMe`` authenticated.  Deliberately a boolean: a bot's numeric
+    id is the part of its token before the colon, so publishing it would put half
+    the credential in a health response."""
+
+    transport: str
+    webhook_configured: bool
+    polling: bool
+    started_at: str | None = None
+    last_contact_at: str | None = None
+    last_error_category: str | None = None
+    consecutive_failures: int = 0
+    authorized_users: int = 0
+    authorized_chats: int = 0
+    notification_targets: int = 0
+    group_chats_allowed: bool = False
+    blockers: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

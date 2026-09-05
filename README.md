@@ -57,8 +57,8 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | 3 | DeepSeek event classifier, semantic dedupe, LLM telemetry and budgets | **done** |
 | 4 | Instrument resolution and market data | **done** |
 | 5 | Pinned TradingAgents research engine | **done** |
-| 6 | Risk engine, proposals, web approval | not started |
-| 7 | Telegram bot | not started |
+| 6 | Risk engine, proposals, web approval | **done** |
+| 7 | Telegram control, approvals and durable pause/kill switch | **done** |
 | 8 | Trading 212 demo execution and reconciliation | not started |
 | 9 | Live readiness | not started |
 
@@ -67,7 +67,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 A modular monolith plus PostgreSQL. Two containers, nothing else:
 
 ```
-stockbrain   FastAPI + job workers + scheduler + (later) Alpaca WS + Telegram
+stockbrain   FastAPI + job workers + scheduler + Alpaca news WS + Telegram polling
 postgres     source of truth for every stage
 ```
 
@@ -194,7 +194,10 @@ EXECUTION_MODE=manual_approval
 ```
 
 plus a two-stage human confirmation for that specific order, a fresh risk /
-broker / quote revalidation, and the kill switch being off.
+broker / quote revalidation, and the durable kill switch being off. The kill
+switch and the pause are stored in PostgreSQL, restored at startup, and stop
+every authorization path — web, Telegram and automatic — without ever closing a
+position or cancelling a broker order.
 
 Any contradictory combination — for example `T212_LIVE_EXECUTION_ENABLED=true`
 with `T212_ENV=demo` — makes the process **refuse to start**, with exit code 78
@@ -231,13 +234,21 @@ advice.
   filesystem access or arbitrary network capability. Final model decisions are
   validated against a Pydantic schema before anything acts on them.
 * Telegram authorises on numeric user IDs only — never usernames, which the
-  owner can change. An empty allowlist authorises nobody.
-* Approval tokens are opaque and stored only as SHA-256 hashes. Order parameters
+  owner can change, release, and let somebody else register. An empty allowlist
+  authorises nobody and the bot does not start. Group chats are refused unless
+  explicitly enabled *and* explicitly allowlisted.
+* Approval tokens are opaque and stored only as SHA-256 hashes. Callback data is
+  a 46-byte random reference carrying no proposal id, no order field and not even
+  which button it is — the action lives on the server-side row. Order parameters
   are never accepted from a callback; they are re-read from the database under
   lock.
-* There are **zero broker order or execution routes**. The three state-changing
-  HTTP routes that exist (approve, reject, cancel a proposal) mutate
-  StockBrain's own state and nothing else. No API path can reach a Trading 212
+* Telegram approval is two-stage, and stage two calls the *same*
+  `ProposalService.authorize` the web calls, with the same row lock, the same
+  compare-and-swap and the same full revalidation. There is no Telegram-specific
+  risk path to diverge from it, and a test asserts the package imports none.
+* There are **zero broker order or execution routes**. The six state-changing
+  HTTP routes that exist — approve, reject and cancel a proposal, and pause,
+  resume and the kill switch — mutate StockBrain's own state and nothing else. No API path can reach a Trading 212
   mutation, and no order, amend or cancel method exists anywhere in the process
   to be reached: the two Trading 212 clients read instrument metadata and
   account state. Tests enumerate the route table, the OpenAPI schema and every
@@ -246,6 +257,26 @@ advice.
   ticker, side, quantity, price and account are re-read from the proposal row
   under lock — a client that could name a quantity would be a client that could
   size a trade.
+
+### Phase 7 Telegram and execution control
+
+* The bot runs **long polling** inside the application process. No inbound port,
+  no public TLS endpoint and no reverse proxy: StockBrain is never exposed to
+  the internet to support Telegram. A webhook configured on the bot would
+  silently stop polling, so the opt-in live test asserts none is.
+* It never blocks anything else. A Telegram outage is supervised in its own
+  task, backs off, and reports DEGRADED/DOWN; FastAPI, the job workers and the
+  scheduler are unaffected. A missing token means the runtime is never built and
+  the provider reads DISABLED.
+* `/pause` and `/kill` are **durable**: they live in `app_settings`, are read
+  from PostgreSQL on every consultation, and are restored and logged at startup.
+  A process that crashed while halted comes back halted. Neither closes a
+  position or cancels a broker order — there is no path to do so.
+* `/resume` lifts a pause and deliberately does *not* release the kill switch;
+  releasing it is an explicit second act.
+* Untrusted text (company names, headlines, thesis sentences) is escaped for
+  HTML parse mode and length-bounded before escaping, so it cannot inject
+  formatting, links or buttons. Link previews are disabled.
 
 ### Phase 6 risk and proposals
 

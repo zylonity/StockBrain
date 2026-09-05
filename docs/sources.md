@@ -792,3 +792,149 @@ against the rule built for it: **both** gates fire independently. The age check
 alone caught it in Phase 4; the spread check is what would catch the same width
 during regular hours, when the age check would not. `Decimal` arithmetic
 throughout — 338.27 − 305.33 is exactly 32.94, and the mid is exactly 321.80.
+
+---
+
+## Phase 7 verified Telegram surface — 2026-09-05
+
+Checked against the current official documentation before any request schema
+was written, then measured against the live Bot API where a measurement was
+possible.
+
+* **Bot API** — <https://core.telegram.org/bots/api>
+* **python-telegram-bot** — <https://docs.python-telegram-bot.org/en/v22.8/>
+* **Library version** — `python-telegram-bot==22.8`, the current 22.x release,
+  which targets **Bot API 10.0** (`telegram.constants.BOT_API_VERSION`).
+
+### Library selection
+
+22.8 declares `httpx>=0.27,<0.29`, which the repository's existing
+`httpx>=0.28,<0.29` pin already satisfies, so the base install adds **no new
+transitive dependency at all**. No extras are installed:
+
+* `job-queue` (apscheduler) is deliberately omitted — spec section 4.8 says not
+  to use Telegram's JobQueue for StockBrain's schedules, and the application's
+  own PostgreSQL scheduler is authoritative. `ApplicationBuilder.job_queue(None)`
+  is passed explicitly rather than relying on the extra being absent.
+* `rate-limiter` (aiolimiter) is omitted because StockBrain's message volume is
+  a few messages an hour against Telegram's per-second limits, and every send is
+  a sequential `await`.
+
+### Facts verified in the documentation
+
+| Fact | Consequence in StockBrain |
+|---|---|
+| `InlineKeyboardButton.callback_data` is **"1-64 bytes"** | The payload is `sb:` + 43 url-safe characters = 46 bytes, asserted in a test. Exceeding it fails at *send* time, i.e. in production on the message that matters most. |
+| `sendMessage.text` is **"1-4096 characters after entities parsing"** | Messages are bounded by construction and chunked on line boundaries as a fallback. |
+| `answerCallbackQuery.text` is **"0-200 characters"** | `CallbackResult.short_alert` truncates to 200. |
+| "After the user presses a callback button, Telegram clients will display a progress bar until you call `answerCallbackQuery`" | The handler answers **before** any further API call, so a slow edit never leaves a spinner. |
+| `getUpdates` "will not work if an outgoing webhook is set up" | Long polling is the designed transport; the opt-in live test asserts `getWebhookInfo().url` is empty, because a webhook left configured would silently stop polling from receiving anything. |
+| `getUpdates.timeout` "Defaults to 0, i.e. usual short polling. Should be positive, short polling should be used for testing purposes only" | `TELEGRAM_POLL_TIMEOUT_SECONDS` defaults to 30. |
+| `getUpdates.allowed_updates` filters update types | Only `["message", "callback_query"]` are requested. |
+| MarkdownV2 requires escaping `_ * [ ] ( ) ~ ` > # + - = \| { } . !` with extra context-dependent rules inside links, code and custom emoji | **Not used.** |
+| HTML mode: "All `<`, `>` and `&` symbols that are not part of a tag or an HTML entity must be replaced with the corresponding HTML entities" | HTML is the parse mode; the escape is exactly three substitutions with no positional exceptions, which is what makes it total. |
+
+### Facts verified by reading the library source
+
+Neither is in the prose documentation, and both change how a failure behaves:
+
+* **`Updater.start_polling` retries network errors indefinitely.** The internal
+  `network_retry_loop` runs with `max_retries=-1` and `repeat_on_success=True`,
+  backing off `1.5×` up to a 30-second ceiling, honouring `RetryAfter`'s own
+  delay, and retrying `TimedOut` immediately. It **aborts on `InvalidToken`**.
+  StockBrain mirrors that judgement: a rejected credential is recorded DOWN and
+  not retried, exactly as `ProviderAuthError` is treated elsewhere.
+* **`error_callback` is not called for every error.** `RetryAfter`, `TimedOut`
+  and `InvalidToken` are handled inside the loop and bypass it; only other
+  `TelegramError`s reach it. So "the callback has not fired" is not evidence of
+  health, which is why the runtime additionally proves connectivity with a
+  periodic `getMe`.
+
+The library documents that `error_callback` "must not raise exceptions! If it
+does, the loop will be aborted" — StockBrain's callback only records health, and
+a test asserts it does not raise.
+
+### Manual application lifecycle
+
+`run_polling()` blocks the event loop and installs its own signal handlers, and
+the documentation says so explicitly: *"When combining python-telegram-bot with
+other asyncio based frameworks, using this method is likely not the best
+choice… Instead, you can manually call the methods listed below."* StockBrain
+uses the manual sequence inside its FastAPI lifespan:
+
+```
+initialize() → updater.start_polling() → start()
+   …
+updater.stop() → stop() → shutdown()
+```
+
+`drop_pending_updates=True` is passed at startup: an update queued while
+StockBrain was down is of unknown age, and replaying a control command of
+unknown age — `/resume` above all — is not a decision a restart should make.
+
+`bootstrap_retries=0` is passed deliberately, so a bootstrap failure surfaces to
+StockBrain's own supervisor (which backs off visibly and records health) rather
+than being retried invisibly inside the library.
+
+### Live verification — 2026-09-05
+
+Two read-only calls against the configured bot, no message sent, nothing
+written to the database. Reproduce with
+`pytest -m live -s tests/integration/test_phase7_live.py`.
+
+| Observation | Result |
+|---|---|
+| `getMe` authenticated | yes |
+| `is_bot` | `True` |
+| `can_join_groups` | `True` |
+| `can_read_all_group_messages` (privacy mode) | `False` |
+| `supports_inline_queries` | `False` |
+| `getWebhookInfo().url` | empty — no webhook configured, so `getUpdates` works |
+| `pending_update_count` | 0 |
+| Allowlisted destinations | **0** |
+
+**The bot token is configured but the allowlist is empty**, so
+`TELEGRAM_ALLOWED_USER_IDS` authorises nobody and the runtime would not start —
+which is the designed refusal, not a fault. The message-sending half of the live
+test skipped for exactly that reason, and additionally requires
+`TELEGRAM_LIVE_SEND=yes`: it never discovers a destination.
+
+`can_read_all_group_messages: False` is worth recording. With Telegram's default
+privacy mode a bot in a group receives only commands addressed to it, which is
+why group support is off by default and, when enabled, still requires the chat
+id to be allowlisted.
+
+### Polling lifecycle, measured — 2026-09-05
+
+The full manual lifecycle was run once against the real API with a placeholder
+allowlist, no message sent and no proposal touched:
+
+```
+initialize() -> getMe -> updater.start_polling() -> start()
+polling              : True
+provider health      : HEALTHY          (from UNKNOWN, in one transition)
+transport            : long_polling
+webhook configured   : False
+bot token in status  : absent
+updater.stop() -> stop() -> shutdown()
+polling after stop   : False
+```
+
+**A finding that only a live run could produce:** the first version of this
+runtime reported the bot's numeric id in its health payload and in its
+`telegram_started` log line. A Telegram bot id is the part of the token *before*
+the colon, so that published half the credential every time the process started.
+The unit test asserting "no secret in the status payload" passed only because a
+runtime that never launched has no id to report. The runtime now keeps a boolean
+(`bot_identified`), the log line carries no id, and the test sets the flag before
+asserting — so it now checks the case that actually occurs.
+
+### Bug found by the Phase 7 tests
+
+`uq_notifications_dedupe_key` is a **partial** unique index
+(`WHERE dedupe_key IS NOT NULL`), and PostgreSQL will only infer a partial index
+for `ON CONFLICT` when the predicate is restated in the statement. Without
+`index_where=`, the notification insert failed with *"there is no unique or
+exclusion constraint matching the ON CONFLICT specification"* — at the moment a
+proposal needed to be announced. Any future `ON CONFLICT` against a partial
+index in this codebase needs the same treatment.

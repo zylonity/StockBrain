@@ -43,10 +43,19 @@ _BROKER_ACTION_WORDS = ("order", "execute", "submit", "broker-order", "trade212"
 
 #: The complete set of state-changing routes this phase is allowed to have.
 #: New entries here are a decision, not an accident.
+#:
+#: Phase 7 adds three, and all three move in the *safe* direction: they halt
+#: proposal generation and authorization, or lift a halt. None of them touches a
+#: proposal, a quantity, a price or a broker; the kill switch in particular
+#: closes no position and cancels no order, which the module scan below proves
+#: structurally rather than by assertion of intent.
 _EXPECTED_MUTATIONS = {
     "POST /api/v1/proposals/{proposal_id}/approve",
     "POST /api/v1/proposals/{proposal_id}/reject",
     "POST /api/v1/proposals/{proposal_id}/cancel",
+    "POST /api/v1/system/pause",
+    "POST /api/v1/system/resume",
+    "POST /api/v1/system/kill-switch",
 }
 
 #: Every Trading 212 path that would change broker state.
@@ -96,7 +105,7 @@ def test_the_only_state_changing_routes_are_the_expected_internal_ones() -> None
     """Cross-checked against the OpenAPI schema.
 
     The route walk and the schema are independent views of the same surface, so
-    a fourth mutating route would have to hide from both.
+    a mutating route nobody declared here would have to hide from both.
     """
     schema = create_app(_settings()).openapi()
     documented = {
@@ -134,8 +143,9 @@ def test_no_api_path_can_reach_a_trading212_mutation() -> None:
     call site happens to use it today.
     """
     import stockbrain.api.routes.proposals as proposal_routes
+    import stockbrain.api.routes.system as system_routes
 
-    for module in (proposal_routes, instrument_routes):
+    for module in (proposal_routes, instrument_routes, system_routes):
         source = inspect.getsource(module)
         for path in _T212_MUTATION_PATHS:
             assert path not in source

@@ -180,17 +180,13 @@ def register_static_provider_states(settings: Settings, registry: ProviderHealth
         # universe cannot be synced and resolution reports NOT_FOUND honestly.
         registry.set_disabled(ProviderName.TRADING212, "Trading 212 credentials are not set")
 
-    if not settings.telegram_enabled:
-        registry.set_disabled(ProviderName.TELEGRAM, "TELEGRAM_ENABLED is false")
-    elif not settings.telegram_bot_token.get_secret_value():
-        registry.set_disabled(ProviderName.TELEGRAM, "TELEGRAM_BOT_TOKEN is not set")
-    elif not settings.telegram_allowed_user_ids:
-        # Refusing to run an allowlist-free bot is deliberate: an empty
-        # allowlist must never mean "everyone".
-        registry.set_disabled(
-            ProviderName.TELEGRAM,
-            "TELEGRAM_ALLOWED_USER_IDS is empty; an empty allowlist authorises nobody",
-        )
+    # One list, one wording: `telegram_blockers` is also what the bot's own
+    # health panel and `/status` render, so a disabled reason cannot drift
+    # between the startup log and the answer an operator reads in Telegram.
+    # Refusing to run an allowlist-free bot is deliberate: an empty allowlist
+    # must never mean "everyone".
+    if blockers := settings.telegram_blockers:
+        registry.set_disabled(ProviderName.TELEGRAM, "; ".join(blockers))
 
 
 def instance_identity() -> str:

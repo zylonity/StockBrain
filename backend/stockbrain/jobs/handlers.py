@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import Company
 from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic
-from stockbrain.enums import JobType, ProviderStatus
+from stockbrain.enums import JobType, NotificationEvent, NotificationStatus, ProviderStatus
 from stockbrain.errors import (
     ProviderAuthError,
     ProviderEntitlementError,
@@ -384,6 +384,56 @@ async def handle_generate_proposal(context: HandlerContext) -> None:
     )
 
 
+async def handle_send_notification(context: HandlerContext) -> None:
+    """Deliver one proposal notification to Telegram.
+
+    Delivery is a *job*, not an inline call, for two reasons. An authorization
+    that already happened must not fail because Telegram is unreachable; and a
+    job that is redelivered is harmless, because the notification row's unique
+    dedupe key -- not this handler's memory -- is what makes the message
+    once-only across workers and restarts.
+
+    Registered unconditionally. Proposal transitions enqueue this job whatever
+    the deployment looks like, so leaving it unregistered when Telegram is off
+    would fill the queue with work nothing can ever claim; with no bot running
+    the job simply succeeds having told nobody, which is the truth.
+    """
+    runtime = getattr(context.services, "telegram", None)
+    proposal_id = uuid.UUID(str(context.payload["proposal_id"]))
+    event = NotificationEvent(str(context.payload["event"]))
+    detail = context.payload.get("detail")
+    if runtime is None:
+        log.debug("notification_skipped", proposal_id=str(proposal_id), reason="telegram disabled")
+        return
+
+    result = await runtime.notifier.deliver(
+        proposal_id, event, detail=str(detail) if detail else None
+    )
+    if event in _TERMINAL_NOTIFICATIONS and result.status is not NotificationStatus.SUPPRESSED:
+        # Tidy the buttons on any message that still shows them. Cosmetic: the
+        # tokens behind them were consumed by the transition itself.
+        await runtime.notifier.blank_keyboards(proposal_id)
+    log.info(
+        "notification_job_complete",
+        proposal_id=str(proposal_id),
+        notification_event=event.value,
+        status=result.status.value,
+        delivered=result.delivered,
+    )
+
+
+#: Transitions after which no button on an existing message can still be valid.
+_TERMINAL_NOTIFICATIONS = frozenset(
+    {
+        NotificationEvent.PROPOSAL_AUTO_AUTHORIZED,
+        NotificationEvent.PROPOSAL_REJECTED,
+        NotificationEvent.PROPOSAL_INVALIDATED,
+        NotificationEvent.PROPOSAL_EXPIRED,
+        NotificationEvent.AUTHORIZATION_REFUSED,
+    }
+)
+
+
 def register_ingestion_handlers(
     registry: JobRegistry,
     *,
@@ -418,6 +468,10 @@ def register_ingestion_handlers(
         registry.register(JobType.BROKER_RECONCILE.value, handle_broker_account_refresh)
     if proposals_available:
         registry.register(JobType.GENERATE_PROPOSAL.value, handle_generate_proposal)
+    # Always registered. A proposal transition enqueues a notification whatever
+    # the deployment looks like, and an unregistered type would leave those jobs
+    # unclaimable rather than merely undelivered.
+    registry.register(JobType.SEND_NOTIFICATION.value, handle_send_notification)
 
 
 async def handle_run_research(context: HandlerContext) -> None:

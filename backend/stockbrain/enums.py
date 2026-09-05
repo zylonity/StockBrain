@@ -23,6 +23,7 @@ __all__ = [
     "BarTimeframe",
     "Broker",
     "CapabilityState",
+    "ControlFlag",
     "EventSourceRelationship",
     "EventStatus",
     "ExecutionOutcome",
@@ -33,6 +34,7 @@ __all__ = [
     "JobType",
     "MarketSession",
     "NotificationClass",
+    "NotificationEvent",
     "NotificationStatus",
     "OrderSide",
     "OrderType",
@@ -268,8 +270,28 @@ class ApprovalChannel(StrEnum):
 
 
 class ApprovalStage(StrEnum):
+    """What a single-use approval token permits its holder to ask for.
+
+    The stage is stored on the server-side ``approval_actions`` row, never in
+    the Telegram callback payload, so the *action* a button performs is decided
+    by the database rather than by the bytes Telegram hands back.
+    """
+
     APPROVE = "APPROVE"
+    """Stage one of the two-stage confirmation: opens a confirmation, authorizes
+    nothing."""
+
     CONFIRM = "CONFIRM"
+    """Stage two.  Must descend from an ``APPROVE`` action on the same proposal,
+    and is the only stage that reaches ``ProposalService.authorize``."""
+
+    REJECT = "REJECT"
+    """A durable refusal.  One stage, because refusing is the safe direction."""
+
+    DETAILS = "DETAILS"
+    """A read-only expansion of a proposal the holder may already list.  Still
+    single-use, still bound to a user and chat: a read token that outlived its
+    message would be one more thing to reason about for no benefit."""
 
 
 class ExecutionOutcome(StrEnum):
@@ -344,6 +366,40 @@ class NotificationStatus(StrEnum):
     SENT = "SENT"
     FAILED = "FAILED"
     SUPPRESSED = "SUPPRESSED"
+
+
+class NotificationEvent(StrEnum):
+    """The proposal transitions StockBrain announces.
+
+    One member per *transition*, not per message: the value is half of the
+    ``notifications.dedupe_key``, which is what makes "one notification per
+    proposal transition" a unique-index guarantee rather than a hopeful check
+    that a redelivered job or a restart could defeat.
+    """
+
+    PROPOSAL_MANUAL = "PROPOSAL_MANUAL"
+    """A proposal awaiting human authorization became available."""
+
+    PROPOSAL_AUTO_AUTHORIZED = "PROPOSAL_AUTO_AUTHORIZED"
+    """``SYSTEM_AUTOMATIC`` authorized a proposal.  Announced without an approve
+    button: offering one would imply a human decision that was never asked for."""
+
+    PROPOSAL_REJECTED = "PROPOSAL_REJECTED"
+    PROPOSAL_INVALIDATED = "PROPOSAL_INVALIDATED"
+    PROPOSAL_EXPIRED = "PROPOSAL_EXPIRED"
+    AUTHORIZATION_REFUSED = "AUTHORIZATION_REFUSED"
+    """A fresh risk revalidation refused an authorization somebody asked for."""
+
+
+class ControlFlag(StrEnum):
+    """Durable execution-control state, persisted in ``app_settings``.
+
+    Kept out of process memory on purpose: a kill switch that a restart clears
+    is not a kill switch.  See :mod:`stockbrain.control.state`.
+    """
+
+    TRADING_PAUSED = "control.trading_paused"
+    KILL_SWITCH = "control.kill_switch"
 
 
 class ResolutionStatus(StrEnum):

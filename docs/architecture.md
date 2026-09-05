@@ -69,7 +69,8 @@ stockbrain/
   broker/            read-only T212 metadata, account state, automation policy
   risk/              deterministic engine, rules, sizing, spread, versioned config
   proposals/         state machine, generation, authorization, expiry, quotes
-  telegram/          (phase 7)
+  control/           durable pause and kill switch, persisted in app_settings
+  telegram/          long polling, numeric-id auth, opaque tokens, two-stage confirm
   jobs/              (phase 2+)
 ```
 
@@ -110,6 +111,8 @@ schema therefore enforces:
 | `ck_trade_proposals_system_auth_requires_automatic_policy` | A `SYSTEM_AUTOMATIC` authorization is only legal on a proposal generated under the AUTOMATIC policy — so changing the policy cannot retroactively authorize existing work. |
 | `ck_trade_proposals_invalidated_requires_status` | An invalidation timestamp and the `INVALIDATED` status cannot disagree. |
 | `pg_advisory_xact_lock(broker, account)` | Exposure accounting is serialised across tasks, processes and restarts — which an in-memory lock is not. |
+| `uq_notifications_dedupe_key` — partial unique on `(dedupe_key) WHERE dedupe_key IS NOT NULL` | One notification per proposal transition, across a redelivered job, two workers and a restart. |
+| `approval_actions.consumed_at` under `SELECT … FOR UPDATE` | A callback token is redeemable at most once, whichever device taps first. |
 
 `sent_to_broker` is set in the transaction *before* the HTTP request, not after
 the response. That ordering is what makes the index meaningful: it records
@@ -711,6 +714,245 @@ balance. `quantityAvailableForTrading` is kept separate from `quantity` all the
 way to the engine, because shares inside a pie are owned but not individually
 tradable.
 
+## Phase 7 Telegram control and approvals
+
+### Where the trust boundary is
+
+Telegram supplies exactly three things: a numeric user id, a numeric chat id,
+and an opaque token. It supplies no ticker, no side, no quantity, no price, no
+account and no authorization source, and it receives no broker credential.
+`ProposalService.authorize` takes `(proposal_id, source, actor)` and re-reads
+everything else from the row under lock — so "Telegram cannot size a trade" is a
+property of a function signature rather than of a check somebody remembered.
+
+```
+Telegram update
+   ↓  numeric user id + numeric chat id           ← never a username
+authorizer (allowlists, chat policy)
+   ↓  opaque token                                 ← 46 of Telegram's 64 bytes
+approval_actions row (proposal, stage, user, chat, expiry, consumed_at)
+   ↓
+ProposalService.authorize(source=HUMAN_TELEGRAM, actor=<numeric id>)
+   ↓  the same lock, CAS, revalidation and provenance the web uses
+APPROVED — and still no broker order
+```
+
+There is deliberately **no Telegram-specific risk implementation**. A test
+asserts that no module in `stockbrain/telegram/` imports `RiskEngine`,
+`RiskInputs` or anything under `stockbrain.risk`, and that the only lifecycle
+calls it makes are `authorize` and `reject`. Two clients that each own a copy of
+the rules are two clients that will eventually disagree about what is permitted.
+
+### Why numeric ids, and why an empty allowlist authorises nobody
+
+A Telegram username is chosen by its owner, can be released, and can then be
+registered by somebody else. Authorizing a financial action on one would mean
+authorizing whoever holds that name today. `TelegramIdentity` therefore has
+three fields — `user_id`, `chat_id`, `chat_type` — and no field for a username
+or a display name, so there is nothing for a later change to start trusting.
+
+An empty `TELEGRAM_ALLOWED_USER_IDS` authorises nobody, never everybody, and the
+runtime is not constructed at all: the provider reads `DISABLED` with that exact
+reason. This is the configuration mistake most likely to be made by leaving a
+variable blank, so it fails closed and loudly.
+
+Chat policy is stated rather than inferred. A private chat's id *is* its user's
+id, so a message from one is trivially bound to one identity and is accepted.
+Any other chat — group, supergroup, channel — is refused unless
+`TELEGRAM_ALLOW_GROUP_CHATS=true` **and** the chat id appears in
+`TELEGRAM_ALLOWED_CHAT_IDS`. Two switches, because "may the bot be used outside
+a private chat" and "which group" are different decisions, and everyone who can
+read a group can read a trade proposal posted into it.
+
+A consequence worth stating: a proposal notification sent to a *group* carries
+no approval buttons. A token binds one numeric user, and a group has no single
+holder; minting a button for "whoever taps first" would make the user binding
+decorative. The message says to use `/proposals` in that chat instead, where the
+tokens are minted for the numeric user who actually asked.
+
+### Callback tokens
+
+`callback_data` is `sb:` plus 43 url-safe characters — 46 of the 64 bytes
+Telegram documents — and contains no proposal id, no order field, and **not even
+which button it is**. The stage lives on the server-side row, so the action a
+button performs is decided by the database rather than by the bytes Telegram
+hands back.
+
+Only the SHA-256 is stored. The raw value exists in one Telegram message and for
+the microseconds it takes to hash an incoming callback; it is never persisted,
+never logged and never put in an error message.
+
+Redemption checks five bindings before consuming, in order: proposal, stage,
+numeric user, numeric chat, expiry. The row is taken `FOR UPDATE`, so a double
+tap serialises and the second finds `consumed_at` set. A token presented by the
+wrong user or from the wrong chat is refused **without** being consumed — if a
+stranger's tap spent it, obtaining a forwarded copy of the message would be
+enough to disable the owner's real button.
+
+Every transition that ends a proposal's authorizable life — authorization,
+rejection, cancellation, expiry, invalidation — consumes every outstanding token
+for it, in the same transaction. *That* is what makes an old button inert.
+Blanking the keyboard is cosmetic and best-effort: a message can be forwarded,
+screenshotted, or edited by a client that refuses the edit, and none of that
+reaches the row the token names.
+
+### Two-stage confirmation
+
+Stage one consumes an `APPROVE` token, checks the proposal is still authorizable
+and that trading is not halted, and mints a short-lived `CONFIRM` token whose
+`parent_action_id` is the approve action. It authorizes nothing: a mis-tap opens
+a dialog, never a trade. Stage two consumes the `CONFIRM` token, verifies it
+descends from an `APPROVE` on the same proposal issued to the same user in the
+same chat, and only then calls the shared `authorize`.
+
+The confirmation names the side and the quantity, because the point of a second
+step is that the operator confirms what they actually read. "Back" retires the
+outstanding confirmation rather than leaving it live for the rest of its TTL — a
+retraction that only looks like one is worse than none.
+
+Refusals are reported by *cause*, not collapsed: "you already pressed this",
+"this expired", "this is not yours" and "this button is gone" need different
+answers, and burying a genuine authorization failure inside ordinary noise is
+how it goes unnoticed.
+
+### Concurrency
+
+Every race is settled by the Phase 6 mechanisms, exercised through the Telegram
+path rather than re-guarded:
+
+| Race | Outcome |
+|---|---|
+| Web approves while Telegram confirms | One winner; the loser sees a refusal. The web authorization also retires the Telegram token, so the later tap usually never reaches the proposal. |
+| Two Telegram devices, same button | `FOR UPDATE` on the token row; the second tap is `ApprovalActionConsumed`. |
+| Telegram approve versus Telegram reject | One terminal state; the loser is refused. |
+| Automatic authorization versus a Telegram tap | An AUTOMATIC proposal gets **no** approve button at all, stage one refuses one, and the `system_auth_requires_automatic_policy` check constraint stands behind both. |
+| Proposal expires mid-confirmation | `authorize` refuses under lock; the TTL is not advisory. |
+| Callback after invalidation | The invalidating transition already consumed the token. |
+| Stale confirmation token | Expired, or retired by "Back". |
+| Wrong user or wrong chat | Refused without consuming. |
+
+### Why HTML parse mode, not MarkdownV2
+
+Almost everything interesting in a message is untrusted: a company name, a
+headline, a sentence a model wrote about a document somebody else published.
+MarkdownV2 requires escaping eighteen characters with context-dependent extra
+rules inside links, code spans and custom emoji, and one missed escape is a
+`400 Bad Request` on the message that mattered most. HTML mode needs exactly
+three substitutions — `&` `<` `>` — with no positional exceptions, so the escape
+is total and reviewable in one function.
+
+Consequently: every untrusted value goes through `esc`/`trim`; the renderers
+build `<a href=…>` from literals only, so a headline containing a URL renders as
+its own characters and cannot be disguised as different text; link previews are
+disabled so Telegram cannot render a card for one; and values are length-bounded
+*before* escaping, because truncating escaped text can cut `&amp;` in half.
+
+### Long polling, and the runtime that supervises it
+
+Transport is `getUpdates`. A webhook would need an inbound port, a public TLS
+endpoint and a reverse proxy in front of a home NAS; the specification is
+explicit that StockBrain must not be exposed to the internet just to support
+Telegram. Telegram documents the two as mutually exclusive, so
+python-telegram-bot clears any configured webhook while bootstrapping — and the
+opt-in live test asserts none is configured, because a webhook left on the bot
+would silently stop polling from ever receiving an update.
+
+The bot runs in the application's own process, inside a supervisor task:
+
+* **it never blocks anything else.** If Telegram is unreachable at boot the
+  supervisor backs off and retries while FastAPI, the job workers, the scheduler
+  and the news stream come up normally;
+* **health is measured, not assumed.** A quiet bot receives no updates, so "we
+  have not crashed" proves nothing. A periodic `getMe` proves the process can
+  still reach Telegram, and drives HEALTHY / DEGRADED / DOWN;
+* **a bad token is not retried forever.** python-telegram-bot's polling loop
+  retries network errors indefinitely (1.5×, capped at 30s) but aborts on
+  `InvalidToken`; StockBrain mirrors that judgement, recording DOWN with a clear
+  reason — the same treatment `ProviderAuthError` gets everywhere else.
+
+Pending updates are dropped at startup. An update queued while StockBrain was
+down is of unknown age, and replaying a control command from an unknown time —
+`/resume` above all — is not a decision a restart should make on its own.
+
+Error text never reaches a log or a health record: a python-telegram-bot error
+message can contain the request URL, and the request URL contains the bot token.
+Only the exception's class name is recorded.
+
+### Notifications
+
+Telegram is a delivery channel, never the system of record. Every message
+corresponds to a `notifications` row inserted **first**, keyed
+`telegram:proposal:<id>:<event>` and protected by `uq_notifications_dedupe_key`.
+That index is what makes "one notification per transition" true across a
+redelivered job, two workers and a restart, rather than true only while one
+process happens to remember.
+
+Sending happens in a `SEND_NOTIFICATION` job rather than inline, so a Telegram
+outage cannot fail an authorization that already happened.
+
+A delivery failure is recorded `FAILED` and **not** retried on a later tick. An
+automatic resend cannot distinguish "the message never arrived" from "the message
+arrived and the status write did not", so it turns one transient network error
+into a duplicate trade alert. The failure is visible in the table, the log and
+the bot's health; the proposal is unaffected, because a notification is derived
+from state rather than being it.
+
+Anti-spam is a rule rather than a rate limiter: terminal announcements
+(rejected, invalidated, expired, refused) are sent only for proposals the
+operator was actually told about. A proposal that was born blocked, or expired
+before anyone saw it, produces no chatter.
+
+Manual and automatic proposals get different *text*, not the same text with
+different buttons. An automatically authorized proposal says `SYSTEM_AUTOMATIC`
+authorized it and that no human approval was requested; offering an approve
+button there would imply a decision that was never asked for.
+
+### Durable pause and kill switch
+
+Two flags, one row each in `app_settings`, read from PostgreSQL on every
+consultation. There is deliberately no in-memory cache: the value is read a
+handful of times a minute, and a cache is exactly what would let two workers, or
+two processes, disagree about whether trading is halted.
+
+| Flag | Command | Stops | Leaves running |
+|---|---|---|---|
+| `control.trading_paused` | `/pause`, `/resume` | new proposal generation; every authorization path (web, Telegram, automatic) | ingestion, classification, research, broker reconciliation, the expiry sweep |
+| `control.kill_switch` | `/kill` | everything a pause stops, plus any future order transmission | the same |
+
+Spec section 20 is explicit that a pause stops new trade proposals and *not*
+broker reconciliation; stopping discovery as well would mean a pause silently
+costs the operator the news that happened during it.
+
+Enforcement lives inside `ProposalService.authorize`, not in each client, so web,
+Telegram and the automatic path are covered by one check and cannot diverge. It
+raises `AuthorizationNotPermitted` — what is being refused is the
+*authorization*; transmission is Phase 8's separate permission with its own gate.
+
+`/resume` lifts a pause and **does not** release the kill switch. Releasing it is
+an explicit second act (the `/api/v1/system/kill-switch` route, or the GUI's
+release button), because if the routine control also cleared an emergency stop,
+the emergency stop would be one habitual tap away from being undone by somebody
+who only meant to restart normal work.
+
+Neither flag closes a position, cancels an order or touches the broker. That is
+structural rather than promised: no order, cancel or amend method exists in this
+process, a test scans every module for one, and a second test asserts the control
+module references no broker identifier at all. A kill switch that liquidated
+would turn a precautionary tap into the largest trade of the day.
+
+Startup reads and logs the persisted state before any worker can act. A process
+that comes back up halted says so; silently resuming risky behaviour after a
+crash is the failure this table exists to prevent.
+
+### What Phase 7 deliberately did not do
+
+No broker order, cancel or modify path — the capability audit still finds zero.
+No webhook, no inbound port, no public endpoint. No second risk implementation.
+No weakening of automatic authorization: `SYSTEM_AUTOMATIC` remains the source
+under `EXECUTION_POLICY=automatic`, and Telegram cannot convert an automatic
+proposal into a human-authorized one, because the check constraint that permits
+`SYSTEM_AUTOMATIC` only on an AUTOMATIC proposal also refuses the reverse.
+
 ### The Phase 8 execution boundary
 
 Phase 6 stops at authorization. What phase 8 must preserve when it adds
@@ -725,4 +967,7 @@ transmission:
 * `EXECUTION_AMBIGUOUS` and no blind retry;
 * `execution_policy` and `authorization_source` as the record of *who* permitted
   the trade, and the four live-execution gates as the separate record of whether
-  transmission is permitted at all.
+  transmission is permitted at all;
+* the durable kill switch and pause, checked again at *send* time and not only
+  at authorization — an `APPROVED` proposal that was authorized before an
+  emergency stop must not transmit after one.

@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 
 import { api } from "../api/client";
 import { EventStatusBadge, ProviderBadge } from "../components/Badges";
+import { ControlBanner } from "../components/ControlBanner";
 import { ExecutionBanner } from "../components/ExecutionBanner";
 import { StatusPill } from "../components/StatusPill";
 import { formatRelative } from "../components/formats";
@@ -16,6 +17,9 @@ export function Dashboard() {
   const health = usePolling(api.health, REFRESH_MS);
   const readiness = usePolling(api.readiness, REFRESH_MS);
   const execution = usePolling(api.executionStatus, 60_000);
+  // Polled faster than the execution posture: a halt can be engaged from
+  // Telegram at any moment, and a stale banner is the one that matters.
+  const control = usePolling(api.controlState, 15_000);
   const discovery = usePolling(api.discoveryStatus, REFRESH_MS);
   const latest = usePolling(recentEvents, REFRESH_MS);
 
@@ -30,6 +34,7 @@ export function Dashboard() {
       {execution.error && (
         <div className="error">Execution status unavailable: {execution.error}</div>
       )}
+      {control.data && <ControlBanner control={control.data} />}
       {execution.data && <ExecutionBanner status={execution.data} />}
 
       {health.error && <div className="error">Health unavailable: {health.error}</div>}

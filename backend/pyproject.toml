@@ -32,6 +32,11 @@ dependencies = [
     "yfinance>=1.4.1,<2",
     "stockstats>=0.6.5,<0.7",
     "pytz>=2025.2",
+    # Telegram long polling (spec section 4.8). No extras: StockBrain uses its
+    # own PostgreSQL scheduler rather than PTB's JobQueue (apscheduler), and its
+    # message volume is far below Telegram's flood limits, so neither the
+    # job-queue nor the rate-limiter extra earns its dependency.
+    "python-telegram-bot>=22.8,<23",
 ]
 
 [project.optional-dependencies]
@@ -104,6 +109,7 @@ ignore = [
 "tests/integration/test_phase4_live.py" = ["T201"]
 "tests/integration/test_research_live.py" = ["T201"]
 "tests/integration/test_phase6_live.py" = ["T201"]
+"tests/integration/test_phase7_live.py" = ["T201"]
 "alembic/versions/*" = ["E501"]
 
 [tool.ruff.lint.isort]

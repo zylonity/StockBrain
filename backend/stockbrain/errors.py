@@ -10,6 +10,10 @@ from __future__ import annotations
 __all__ = [
     "AccountStateUnavailable",
     "AmbiguousTransportFailure",
+    "ApprovalActionConsumed",
+    "ApprovalActionExpired",
+    "ApprovalActionForeign",
+    "ApprovalActionInvalid",
     "AuthorizationNotPermitted",
     "BrokerError",
     "ConfigurationError",
@@ -28,6 +32,7 @@ __all__ = [
     "ProviderUnavailable",
     "RiskBlocked",
     "StockBrainError",
+    "TelegramSendError",
 ]
 
 
@@ -140,6 +145,40 @@ class AccountStateUnavailable(StockBrainError):
     """
 
 
+class ApprovalActionInvalid(StockBrainError):
+    """A single-use approval token could not be redeemed.
+
+    Subclassed per cause rather than collapsed into one error because the causes
+    need different sentences in the chat and different weight in the log: "you
+    already pressed this" is ordinary, "this is not yours" is a security event.
+
+    ``user_message`` is the only text that ever reaches a chat.  ``str(exc)``
+    stays internal, and neither ever contains the raw token.
+    """
+
+    user_message = "This button is no longer valid. Use /proposals for the current state."
+
+
+class ApprovalActionConsumed(ApprovalActionInvalid):
+    """The token was already redeemed -- a double tap, or a second device."""
+
+    user_message = "This button has already been used."
+
+
+class ApprovalActionExpired(ApprovalActionInvalid):
+    user_message = "This button expired. Use /proposals to start again."
+
+
+class ApprovalActionForeign(ApprovalActionInvalid):
+    """Presented by a user, or from a chat, the token was not issued to.
+
+    Refused *without* consuming the token: a stranger holding a forwarded
+    message must not be able to burn the owner's real button by pressing it.
+    """
+
+    user_message = "This button was not issued to you."
+
+
 class AuthorizationNotPermitted(StockBrainError):
     """Authorization was attempted through a route this deployment forbids.
 
@@ -151,6 +190,19 @@ class AuthorizationNotPermitted(StockBrainError):
 
 class ExecutionNotPermitted(StockBrainError):
     """Execution is blocked by configuration, the kill switch, or risk."""
+
+
+class TelegramSendError(ProviderError):
+    """Telegram refused a send, or could not be reached.
+
+    Carries a short *category* rather than the provider's own message: a
+    python-telegram-bot error string can include the request URL, and the
+    request URL contains the bot token.
+    """
+
+    def __init__(self, category: str) -> None:
+        super().__init__(category)
+        self.category = category
 
 
 class BrokerError(ProviderError):

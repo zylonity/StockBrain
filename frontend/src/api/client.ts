@@ -8,6 +8,7 @@
  */
 
 import type {
+  ControlStateResponse,
   ExecutionPolicyResponse,
   Proposal,
   ProposalListResponse,
@@ -31,6 +32,7 @@ import type {
   Resolution,
   ResolutionListResponse,
   ResolutionStatus,
+  TelegramStatusResponse,
 } from "./types";
 
 export class ApiError extends Error {
@@ -104,6 +106,20 @@ export const api = {
   providers: () => request<ProvidersResponse>("/api/health/providers"),
   executionStatus: () =>
     request<ExecutionStatusResponse>("/api/v1/system/execution-status"),
+  controlState: () => request<ControlStateResponse>("/api/v1/system/control"),
+  telegramStatus: () =>
+    request<TelegramStatusResponse>("/api/v1/system/telegram"),
+  // Control changes carry a free-text reason and nothing else. Like the
+  // proposal routes, they cannot name a ticker, a side, a quantity or a price.
+  pauseTrading: (reason?: string) =>
+    post<ControlStateResponse>("/api/v1/system/pause", reason ? { reason } : {}),
+  resumeTrading: (reason?: string) =>
+    post<ControlStateResponse>("/api/v1/system/resume", reason ? { reason } : {}),
+  setKillSwitch: (engaged: boolean, reason?: string) =>
+    post<ControlStateResponse>("/api/v1/system/kill-switch", {
+      engaged,
+      ...(reason ? { reason } : {}),
+    }),
   events: (filters: EventFilters = {}) =>
     request<EventListResponse>(`/api/v1/events?${eventQuery(filters)}`),
   event: (id: string) =>

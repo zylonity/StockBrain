@@ -111,6 +111,9 @@ async def clean_tables(database: Database) -> AsyncIterator[Database]:
         "llm_calls",
         "notifications",
         "audit_log",
+        # Durable execution control (pause / kill switch) lives here. Leaving it
+        # behind would let one test's emergency stop halt the next one's world.
+        "app_settings",
     )
     async with database.transaction() as session:
         await session.execute(text(f"TRUNCATE {', '.join(tables)} RESTART IDENTITY CASCADE"))

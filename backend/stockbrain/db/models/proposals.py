@@ -319,7 +319,13 @@ class ApprovalAction(UUIDPrimaryKeyMixin, Base):
     from the client: they are re-read from the proposal row under lock.
 
     Only the SHA-256 of the token is stored, so a database leak does not yield
-    usable approval tokens.
+    usable approval tokens.  The raw token exists exactly twice: inside the
+    ``callback_data`` of one Telegram button, and for the microseconds it takes
+    to hash an incoming callback.  It is never persisted and never logged.
+
+    A row binds five things, and all five are checked before the token is
+    consumed: the proposal, the permitted :class:`~stockbrain.enums.ApprovalStage`,
+    the numeric Telegram user, the numeric Telegram chat, and an expiry.
     """
 
     __tablename__ = "approval_actions"
@@ -335,7 +341,16 @@ class ApprovalAction(UUIDPrimaryKeyMixin, Base):
     )
     opaque_token_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     user_identifier: Mapped[str] = mapped_column(sa.Text, nullable=False)
-    """Telegram numeric user id, or the web account id.  Never a username."""
+    """Telegram numeric user id, or the web account id.  Never a username: a
+    username is chosen by its owner and can be handed to somebody else."""
+
+    chat_identifier: Mapped[str | None] = mapped_column(sa.Text)
+    """Numeric Telegram chat id this token may be redeemed from, or ``NULL`` for
+    a channel where chat binding is meaningless (the web).
+
+    Authoritative, not decoration.  A token forwarded or copied into another
+    chat resolves to this row and is refused, so possession of the callback
+    bytes is not by itself possession of the action."""
 
     parent_action_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("approval_actions.id", ondelete="SET NULL")
@@ -355,6 +370,13 @@ class ApprovalAction(UUIDPrimaryKeyMixin, Base):
     __table_args__ = (
         sa.UniqueConstraint("opaque_token_hash", name="uq_approval_actions_opaque_token_hash"),
         sa.Index("ix_approval_actions_proposal_id", "proposal_id"),
+        # The sweep that retires every outstanding token for a proposal once it
+        # reaches a terminal state reads exactly this predicate.
+        sa.Index(
+            "ix_approval_actions_open",
+            "proposal_id",
+            postgresql_where=sa.text("consumed_at IS NULL"),
+        ),
     )
 
 

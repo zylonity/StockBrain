@@ -15,6 +15,7 @@ from typing import Any
 
 from stockbrain.broker.account_state import AccountStateService
 from stockbrain.config import Settings
+from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
 from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
@@ -137,14 +138,19 @@ def settings(**overrides: Any) -> Settings:
     return Settings(**base)
 
 
-def service(
+def service_with(
     database: Database,
+    resolved: Settings,
     *,
     market_data: StubMarketData | None = None,
     config: RiskConfig | None = None,
-    **setting_overrides: Any,
+    control: ControlStateService | None = None,
 ) -> ProposalService:
-    resolved = settings(**setting_overrides)
+    """Build a proposal service around an already-resolved ``Settings``.
+
+    The Phase 7 tests need the *same* settings object for the service and for
+    the Telegram side, so this takes one rather than building its own.
+    """
     return ProposalService(
         database,
         resolved,
@@ -154,6 +160,22 @@ def service(
         ),
         market_data=market_data or StubMarketData(),
         broker=Broker.TRADING212,
+        control=control or ControlStateService(database),
+    )
+
+
+def service(
+    database: Database,
+    *,
+    market_data: StubMarketData | None = None,
+    config: RiskConfig | None = None,
+    **setting_overrides: Any,
+) -> ProposalService:
+    return service_with(
+        database,
+        settings(**setting_overrides),
+        market_data=market_data,
+        config=config,
     )
 
 

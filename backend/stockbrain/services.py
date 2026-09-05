@@ -23,6 +23,7 @@ from stockbrain.broker.instrument_sync import InstrumentSyncService
 from stockbrain.broker.trading212_account import Trading212AccountClient
 from stockbrain.broker.trading212_metadata import Trading212MetadataClient
 from stockbrain.config import Settings
+from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, EventCompanyImpact
 from stockbrain.db.models.sources import Event
@@ -65,6 +66,7 @@ from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
 from stockbrain.proposals.service import ProposalService
 from stockbrain.risk.config import RiskConfig, risk_config_from_settings
+from stockbrain.telegram.runtime import TelegramRuntime
 
 __all__ = ["DISCOVERY_PAUSED_KEY", "ServiceContainer"]
 
@@ -117,12 +119,19 @@ class ServiceContainer:
     research_transport: ResearchTransport | None = field(default=None, init=False)
     fred: FredMacroProvider | None = field(default=None, init=False)
 
+    control: ControlStateService = field(init=False)
+    telegram: TelegramRuntime | None = field(default=None, init=False)
+
     _stream_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.queue = JobQueue()
         self.registry = JobRegistry()
         self.risk_config = risk_config_from_settings(self.settings)
+        # The durable pause / kill switch. Constructed unconditionally: an
+        # execution control that only exists when some optional provider is
+        # configured is not an execution control.
+        self.control = ControlStateService(self.database)
         self._build_providers()
         if self.settings.proposals_enabled:
             self.proposals = ProposalService(
@@ -132,6 +141,7 @@ class ServiceContainer:
                 account_state=self.account_state,
                 market_data=self.market_data,
                 broker=Broker.TRADING212,
+                control=self.control,
             )
             log.info(
                 "proposal_service_ready",
@@ -151,6 +161,20 @@ class ServiceContainer:
             # Only enqueue classification when something can actually run it.
             classification_enabled=self.classification is not None,
         )
+
+        # Built last, and only when it can actually run: enabled, a token, and a
+        # non-empty numeric user allowlist. Anything less and the provider stays
+        # DISABLED with nothing constructed -- there is no half-configured bot
+        # that might answer a stranger. It is built after the proposal service
+        # because it authorizes through that exact object, never its own copy.
+        if self.settings.telegram_available:
+            self.telegram = TelegramRuntime(
+                self.settings,
+                self.database,
+                health=self.health,
+                proposals=self.proposals,
+                control=self.control,
+            )
 
     # ------------------------------------------------------------------
     # Construction
@@ -299,6 +323,11 @@ class ServiceContainer:
             account_sync_available=self.t212_account is not None,
         )
 
+        # Before a worker or the scheduler can act, say out loud whether this
+        # process is coming back up halted. A crash while paused or killed must
+        # not silently resume risky behaviour.
+        await self.control.log_restored_state()
+
         async with self.database.transaction() as session:
             await seed_default_topics(session)
 
@@ -330,7 +359,15 @@ class ServiceContainer:
         else:
             log.info("alpaca_news_stream_not_started", reason="provider not configured")
 
+        # Spec section 23 step 16. Non-blocking by construction: if Telegram is
+        # unreachable the supervisor backs off in its own task while everything
+        # started above keeps running.
+        if self.telegram is not None:
+            await self.telegram.start()
+
     async def stop(self) -> None:
+        if self.telegram is not None:
+            await self.telegram.stop()
         if self._stream_task is not None:
             self._stream_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

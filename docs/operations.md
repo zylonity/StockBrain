@@ -59,7 +59,12 @@ The application then:
 2. checks PostgreSQL connectivity;
 3. compares the applied migration revision against the code's head;
 4. persists provider health;
-5. logs the live-execution posture and its blockers.
+5. logs the live-execution posture and its blockers;
+6. **restores and logs the durable control state.** A process that crashed while
+   paused or killed comes back paused or killed, and says so at WARNING. Silent
+   resumption after a crash is the failure that state exists to prevent;
+7. starts Telegram long polling, if it is configured, in a supervisor task —
+   never blocking the HTTP server or the job workers.
 
 ## Health
 
@@ -136,12 +141,55 @@ The only outcome that permits a new execution attempt is
 
 ### Emergency stop
 
-`/kill` in Telegram, or `POST /api/v1/system/kill-switch`, sets the persistent
-`TRADING_ENABLED=false` flag. It stops new executions. It does **not** liquidate
-positions, and it does not stop broker reconciliation — knowing the true account
-state matters most precisely when something has gone wrong.
+`/kill` in Telegram, or `POST /api/v1/system/kill-switch` with
+`{"engaged": true}`, writes the persistent `control.kill_switch` row in
+`app_settings`. It stops new proposal generation, every authorization path (web,
+Telegram and automatic) and any future order transmission.
 
-`/pause` stops new *proposals* while leaving reconciliation running.
+It does **not** liquidate positions and does **not** cancel or modify a broker
+order — there is no order, cancel or amend path anywhere in this process, and a
+test scans every module to keep it that way. It does not stop broker
+reconciliation either: knowing the true account state matters most precisely
+when something has gone wrong.
+
+`/pause` (`control.trading_paused`) stops new *proposals* and authorization while
+leaving ingestion, classification, research and reconciliation running.
+
+Both flags are durable and are restored at startup. Releasing them:
+
+| To lift | Telegram | HTTP |
+|---|---|---|
+| Pause | `/resume` | `POST /api/v1/system/resume` |
+| Kill switch | *not* `/resume` — it says so and refuses | `POST /api/v1/system/kill-switch` `{"engaged": false}`, or the release button on **System health** |
+
+`/resume` deliberately does not release the kill switch. If the routine control
+also cleared an emergency stop, the emergency stop would be one habitual action
+away from being undone by somebody who only meant to restart normal work.
+
+### Telegram
+
+The bot is long polling only: outbound HTTPS, no inbound port, no public TLS
+endpoint. If it stops working, check in this order:
+
+1. `GET /api/v1/system/telegram` — status, transport, whether a webhook is
+   configured, last successful contact, last error *category*, and how many
+   numeric ids are allowlisted. It contains no token and no chat content.
+2. `DISABLED` with blockers means it was never started: no `TELEGRAM_ENABLED`,
+   no token, or an empty `TELEGRAM_ALLOWED_USER_IDS`. An empty allowlist
+   authorises nobody by design.
+3. `DOWN` with `InvalidToken` means Telegram rejected the token. This is not
+   retried — like any provider auth failure — so fix the token and restart.
+4. A webhook showing as configured will stop `getUpdates` returning anything;
+   Telegram documents the two as mutually exclusive. Clear it with
+   `deleteWebhook`.
+5. Everything else degrades and retries on its own. python-telegram-bot backs
+   off internally (1.5x, capped at 30s) and StockBrain's supervisor rebuilds the
+   application after a run of failed health probes.
+
+A failed *notification* is recorded in `notifications` with status `FAILED` and
+is deliberately never resent: a resend cannot tell "never arrived" from "arrived
+but the status write failed", and the second reading produces a duplicate trade
+alert. Query the table to see what was missed.
 
 ### LLM budget exhausted
 

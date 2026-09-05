@@ -53,7 +53,7 @@ export function Layout() {
           order-submission path in this phase. No automatic retries on broker
           mutations.
         </span>
-        <span className="mono">phase 6 · risk and proposals</span>
+        <span className="mono">phase 7 · telegram control and approvals</span>
       </footer>
     </div>
   );

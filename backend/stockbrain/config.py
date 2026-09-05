@@ -321,6 +321,52 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_allowed_user_ids: CommaSeparatedInts
     telegram_allowed_chat_ids: CommaSeparatedInts
+    """Numeric ids only, both lists. A Telegram username is chosen by its owner
+    and can be released and re-registered by somebody else, so it is never an
+    authorization input (spec section 4.8). An empty user allowlist authorises
+    nobody -- it is never read as "everyone"."""
+
+    telegram_allow_group_chats: bool = False
+    """Whether the bot may be used from a non-private chat at all.
+
+    Stated as its own switch rather than inferred from a non-empty
+    ``TELEGRAM_ALLOWED_CHAT_IDS``, because "who may act" and "where they may act
+    from" are different questions. With this false, only a private chat between
+    the bot and an allowlisted user is accepted, whatever the chat allowlist
+    says. With it true, a non-private chat must *also* appear in
+    ``TELEGRAM_ALLOWED_CHAT_IDS``: everyone who can read a group can read a
+    proposal posted in it."""
+
+    telegram_poll_timeout_seconds: int = Field(default=30, ge=1, le=50)
+    """``getUpdates`` long-polling timeout. Telegram documents short polling
+    (timeout 0) as "for testing purposes only"."""
+
+    telegram_poll_interval_seconds: float = Field(default=0.0, ge=0.0, le=60.0)
+
+    telegram_health_interval_seconds: float = Field(default=60.0, ge=10.0, le=3600.0)
+    """How often the supervisor proves the bot can still reach Telegram. A quiet
+    bot receives no updates, so "we have not crashed" is not evidence of
+    connectivity; one ``getMe`` is."""
+
+    telegram_max_backoff_seconds: float = Field(default=300.0, ge=1.0, le=3600.0)
+    """Ceiling on the supervisor's reconnect backoff. python-telegram-bot retries
+    inside its own polling loop (1.5x, capped at 30s); this bounds the outer
+    loop that restarts polling after a bootstrap failure."""
+
+    telegram_action_ttl_seconds: int = Field(default=900, ge=30, le=86400)
+    """Lifetime of an Approve/Reject/Details callback token. Always additionally
+    clamped to the proposal's own expiry: a button may never outlive the trade
+    it refers to."""
+
+    telegram_confirm_ttl_seconds: int = Field(default=120, ge=15, le=3600)
+    """Lifetime of the stage-two confirmation token. Short on purpose: the
+    confirmation exists to prove the person is still there and still means it."""
+
+    telegram_notifications_enabled: bool = True
+    telegram_research_interval_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
+    """Minimum spacing between ``/research`` invocations per user (spec section
+    20: "manual research should be rate limited"). This command only reads a
+    stored thesis, but it is the command most likely to be repeated."""
 
     # ------------------------------------------------------------------
     # Subsystem toggles (env-level defaults; runtime flags live in PostgreSQL)
@@ -577,6 +623,46 @@ class Settings(BaseSettings):
             blockers.append("PROPOSALS_ENABLED is false")
         blockers.extend(automation_capability(self).blockers)
         return blockers
+
+    @property
+    def telegram_configured(self) -> bool:
+        return bool(self.telegram_enabled and self.telegram_bot_token.get_secret_value())
+
+    @property
+    def telegram_blockers(self) -> list[str]:
+        """Every reason the Telegram bot will not start, in GUI-ready wording.
+
+        Same shape as :attr:`execution_blockers`: the "is it available"
+        predicate is defined as "no blockers remain", so a health panel can
+        never show a blocker beside a green light.
+        """
+        blockers: list[str] = []
+        if not self.telegram_enabled:
+            blockers.append("TELEGRAM_ENABLED is false")
+        if not self.telegram_bot_token.get_secret_value():
+            blockers.append("TELEGRAM_BOT_TOKEN is not set")
+        if not self.telegram_allowed_user_ids:
+            blockers.append(
+                "TELEGRAM_ALLOWED_USER_IDS is empty; an empty allowlist authorises nobody"
+            )
+        return blockers
+
+    @property
+    def telegram_available(self) -> bool:
+        return not self.telegram_blockers
+
+    @property
+    def telegram_notification_targets(self) -> list[int]:
+        """Numeric chat ids a proposal notification is delivered to.
+
+        An explicit chat allowlist wins; otherwise each allowlisted user is
+        messaged in their own private chat, whose id equals their user id. The
+        bot never discovers a destination from an incoming message: a chat that
+        was never configured is never written to.
+        """
+        if self.telegram_allowed_chat_ids:
+            return list(dict.fromkeys(self.telegram_allowed_chat_ids))
+        return list(dict.fromkeys(self.telegram_allowed_user_ids))
 
     @property
     def automatic_authorization_permitted(self) -> bool:
