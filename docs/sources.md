@@ -9,7 +9,7 @@ first line of request-building code. Nothing here is guessed. Where a detail has
 not yet been checked in this repository, it is marked as carried from the
 specification and must be re-confirmed before use.
 
-Last verification pass: **2026-09-04** (Phase 4).
+Last verification pass: **2026-09-05** (Phase 5; upstream/live checks began September 4).
 
 ---
 
@@ -506,22 +506,6 @@ Sources: <https://www.sec.gov/search-filings/edgar-application-programming-inter
 
 ## Carried from the specification — verify before implementing
 
-### FRED (Phase 5)
-
-Macro context. API key required. To confirm: series-observation parameters and
-the v2 bearer-key resources.
-
-### TradingAgents (Phase 5)
-
-Pin a specific commit or release of `TauricResearch/TradingAgents`. Never
-install unpinned `main`.
-
-The pinned version must contain the dedicated DeepSeek client that preserves
-`reasoning_content` across turns — older versions break DeepSeek thinking mode
-in multi-turn tool calls. Do not substitute a generic `ChatOpenAI`. A manual
-pre-deployment integration test performing a real multi-turn DeepSeek tool call
-is required.
-
 ### Telegram (Phase 7)
 
 `python-telegram-bot` 22.x, long polling. `getUpdates` and `setWebhook` are
@@ -545,3 +529,125 @@ editorial scoring inside an LLM prompt.
 
 `UNKNOWN` sources must not independently trigger a high-confidence proposal
 without corroboration.
+
+## Phase 5 verified research integration — 2026-09-04
+
+### TradingAgents release selection and package boundary
+
+Official upstream: https://github.com/TauricResearch/TradingAgents.
+Pinned **v0.4.0**, peeled commit
+**2448d0a12576f9b2ddcd5980a0630833423d1e1b**, in
+`third_party/TradingAgents`. Reviewed releases v0.2.4 through v0.4.0,
+current main `9dee508c44662702281a8dbaad1f7b42179b5ba7`, package layout,
+provider registry, graph factories, structured fallback, tools, and persistence.
+
+Selected the released v0.4.0 rather than moving main: it includes DeepSeek
+reasoning round-trip (`7e9e7b8`), DeepSeek structured-output compatibility
+(`22bb91b`), output-token caps, graph-router fixes and point-in-time fixes for
+macro/social/memory data. The five later main commits include Reddit transport,
+FRED clock and manager-direction changes; StockBrain does not call those
+upstream providers and its own policy permits HOLD/NO_ACTION under uncertainty.
+
+Source references:
+- [Release](https://github.com/TauricResearch/TradingAgents/releases/tag/v0.4.0)
+- [Pinned DeepSeek client](https://github.com/TauricResearch/TradingAgents/blob/2448d0a12576f9b2ddcd5980a0630833423d1e1b/tradingagents/llm_clients/openai_client.py)
+- [Pinned graph setup](https://github.com/TauricResearch/TradingAgents/blob/2448d0a12576f9b2ddcd5980a0630833423d1e1b/tradingagents/graph/setup.py)
+- [Pinned packaging](https://github.com/TauricResearch/TradingAgents/blob/2448d0a12576f9b2ddcd5980a0630833423d1e1b/pyproject.toml)
+
+The ordinary package requires Redis, other LLM SDKs, backtrader, experimental
+LangChain and SQLite checkpointing. Therefore the preferred Git package route
+was rejected in favor of the permitted submodule route. StockBrain installs
+only the import/runtime subset in its existing compiled requirements files.
+The submodule's Python source digests are checked at load and Docker build;
+an unreviewed checkout cannot silently replace the pinned engine. **No upstream
+source patch.** StockBrain uses the upstream market/fundamentals analysts,
+bull/bear researchers, manager, state schema, and dedicated DeepSeek client.
+Its adapter constructs the bounded LangGraph, supplies sentiment from existing
+evidence, and replaces the sizing-oriented trader with its own research schema.
+
+The upstream sentiment node performs unconditional Yahoo/StockTwits/Reddit
+fetches, and the standard graph always includes risk roles and disk persistence.
+None is called by StockBrain. Upstream tool functions are never bound or executed;
+the single permitted tool reads the already assembled research packet. The
+`yfinance` and `stockstats` packages are required by upstream imports, but no
+Yahoo data access, cache mutation, or execution-price fallback is enabled.
+Alpaca and FRED are the only supplemental providers. Missing fundamentals or
+social observations remain explicit limitations of the supplied evidence.
+
+### DeepSeek research protocol and live verification
+
+Rechecked [thinking/tool continuity](https://api-docs.deepseek.com/guides/thinking_mode/)
+and [Chat Completions schema](https://api-docs.deepseek.com/api/create-chat-completion/).
+For a request carrying `tools`, reasoning_content from **all** prior assistant
+turns must be returned, even when a prior turn did not call a tool. With no
+tools, it is unnecessary. DeepSeek V4 thinking rejects forced `tool_choice`;
+StockBrain sends none. `thinking` is explicit in both modes.
+
+StockBrain invokes the pinned `DeepSeekChatOpenAI` payload serializer and response
+parser through its own HTTP transport. This preserves the upstream protocol
+behavior while keeping per-call telemetry, budgets, retry policy and secrets
+outside the graph. SDK HTTP methods, automatic SDK retries, external tracing,
+checkpointers and decision logs are not used. Reasoning stays in transient
+assistant messages only; saved reports, decisions, API output and telemetry
+contain no reasoning text or raw provider responses. A presence boolean and
+usage counts are permitted. No model receives broker/Telegram/database keys.
+
+Model routing is explicit: **Flash** (`deepseek-v4-flash`, thinking disabled)
+for market, fundamentals and sentiment; **Pro** (`deepseek-v4-pro`, thinking
+enabled) for bull, bear, research manager and final decision. All roles retain
+request IDs, usage/cache split, latency, finish/error class and estimated cost
+in the existing `llm_calls` accounting. Explicit capacity responses may receive
+one bounded retry, recorded separately. Auth, entitlement, rate limit, malformed,
+truncated and transport failures terminate visibly; a transport failure is not
+blindly replayed because spend may already have occurred.
+
+**Live PASS:** opt-in `tests/integration/test_research_live.py` performed exactly
+one Flash thinking-mode assistant/tool/assistant flow: **2 calls, 861 tokens,
+$0.000126 estimated**, request IDs present on both, finish reasons `tool_calls`
+then `stop`. The original hidden reasoning was echoed internally; only safe
+usage facts were printed. Pro shares the same tested transport and was verified
+with offline response contracts; no Pro-specific incompatibility appeared, so
+no paid Pro call or full research workflow was run. Normal pytest excludes live.
+
+### FRED observations, vintage and degradation
+
+Verified [observations](https://fred.stlouisfed.org/docs/api/fred/series_observations.html),
+[keys](https://fred.stlouisfed.org/docs/api/api_key.html),
+[errors](https://fred.stlouisfed.org/docs/api/fred/errors.html), and
+[v2 overview](https://fred.stlouisfed.org/docs/api/fred/v2/).
+The implementation uses **v1**, GET
+`https://api.stlouisfed.org/fred/series/observations`, with query `api_key`,
+`series_id`, `file_type=json`, `observation_start/end`, `realtime_start/end`,
+`units=lin`, `sort_order=desc`, and `limit=100`. No v2 bearer request or bulk
+release/catalogue download is needed. Only **DFF** (policy-rate context) and
+**DGS10** (long-term-rate context) are enabled.
+
+The response is an `observations` array with `date`, string `value`, and vintage
+bounds. `.` means unavailable, not zero. Decimal parsing rejects nonfinite or
+malformed values. Date filtering alone does not prevent revision look-ahead:
+the adapter also pins the vintage to the previous Chicago calendar day,
+conservatively excluding same-day later releases and avoiding the upstream
+UTC/FRED-clock mismatch. Historical bars likewise exclude incomplete periods;
+Phase 4's reaction calculator receives only completed minute bars at the cutoff,
+with a historical reference rather than a later live quote.
+
+Missing/invalid keys can be **HTTP 400**, not merely 401/403. The body names
+`api_key`; this becomes ProviderAuthError without persisting the echoed body.
+423 is locked/transient, 429 rate-limited, 500 unavailable, and malformed data
+is ProviderResponseError. Official guidance documents 429 and discretionary
+limits, but the checked pages specify no fixed numerical ceiling. StockBrain
+paces at one request/second with a bounded safe GET retry. Missing configuration
+or supplemental failure degrades research and leaves other subsystems running.
+
+**Live PASS:** one bounded DFF observations request using locally configured
+credentials. This supersedes the handoff's earlier statement that FRED was
+unconfigured. No key was printed and no broker endpoint was called.
+
+The September 5 container smoke check loaded the pinned engine and returned 200
+from research/provider health endpoints. Overall health remained DEGRADED:
+the existing configured Trading 212 **demo** metadata request returned 401.
+This does not supersede Phase 4's successful **live** read-only metadata check;
+no broker environment or execution gate was changed. Alpaca IEX access remained
+healthy, while the out-of-hours quote was explicitly stale and blocked for sizing.
+Research model/FRED health in the application remains UNKNOWN until an application
+run uses them; isolated opt-in smoke calls do not fabricate production telemetry.

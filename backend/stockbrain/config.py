@@ -148,6 +148,10 @@ class Settings(BaseSettings):
     deepseek_timeout_seconds: float = 120.0
     deepseek_max_attempts: int = 3
 
+    research_enabled: bool = True
+    research_timeout_seconds: float = Field(default=600, ge=30, le=3600)
+    research_max_output_tokens: int = Field(default=3000, ge=256, le=16000)
+
     # ------------------------------------------------------------------
     # Classification thresholds
     #

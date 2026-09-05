@@ -18,7 +18,8 @@ help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 setup: ## Create the backend venv and install frontend dependencies
-	cd $(BACKEND) && uv venv --python 3.12 && uv pip install -e ".[dev]"
+	git submodule update --init --recursive
+	cd $(BACKEND) && uv venv --python 3.12 && uv pip sync requirements-dev.txt && uv pip install --no-deps -e .
 	cd $(FRONTEND) && npm install
 
 up: ## Start the stack (with the development overlay)

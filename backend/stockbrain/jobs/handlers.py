@@ -313,6 +313,8 @@ async def handle_resolve_candidates(context: HandlerContext) -> None:
 
     event_id = uuid.UUID(str(context.payload["event_id"]))
     result = await resolution.resolve_event(event_id)
+    if getattr(services, "research", None) is not None:
+        await services.research.enqueue_event(event_id)
     log.info(
         "resolve_candidates_job_complete",
         event_id=str(event_id),
@@ -329,6 +331,7 @@ def register_ingestion_handlers(
     *,
     classifier_available: bool,
     instrument_sync_available: bool = False,
+    research_available: bool = False,
 ) -> None:
     """Register the handlers this deployment can actually run.
 
@@ -349,3 +352,13 @@ def register_ingestion_handlers(
     # so it is always registered. Without a sync it simply reports NOT_FOUND,
     # which is the honest answer rather than a job that cannot run.
     registry.register(JobType.RESOLVE_CANDIDATES.value, handle_resolve_candidates)
+    if research_available:
+        registry.register(JobType.RUN_RESEARCH.value, handle_run_research)
+
+
+async def handle_run_research(context: HandlerContext) -> None:
+    if context.services.research is None:
+        raise RuntimeError("research is not configured")
+    await context.services.research.run(
+        uuid.UUID(str(context.payload["run_id"])), job_id=context.job_id
+    )

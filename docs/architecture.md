@@ -381,3 +381,74 @@ Concretely, as of the ingestion phase:
 OpenBB, NautilusTrader, Redis, Celery, Kafka, Elasticsearch, a vector database
 and a self-hosted crawler are extension points, not initial dependencies. Each
 would be added only against a concrete blocker, and none has appeared.
+
+## Phase 5 research contract
+
+`ResearchEngine.analyze` accepts a frozen `ResearchPacket` and returns a validated
+`ResearchResult` containing StockBrain's `ResearchDecision`. Only the adapter
+knows TradingAgents/LangGraph. The packet preserves the resolved company/listing,
+trigger, impact path, timestamp, source references, bounded normalized excerpts,
+provider snapshots and degradation. Excerpt truncation is explicit; full sources
+remain in `sources`. It also accepts a previous thesis and records lineage,
+without implementing portfolio management.
+
+The classifier's text-only interface remains unchanged. Research has a separate
+capability boundary: only `read_research_context({})`, which reads the immutable
+packet. StockBrain prefetches the allowed Alpaca/FRED context deterministically.
+Models cannot choose a URL, symbol, filesystem path, provider or credential.
+Upstream templates containing interpolated evidence are demoted to escaped,
+fenced user data beneath StockBrain's fixed system policy. No shell, broker,
+search, file, optional risk agent, upstream disk log, or external tracing is
+constructed. The sentiment and final-decision nodes are StockBrain-specific;
+market/fundamentals, bull/bear and manager use pinned upstream factories.
+
+DeepSeek's original assistant messages retain reasoning_content during a tool
+exchange, including assistant messages without tool calls. Only public content
+and an explicit telemetry allowlist cross the persistence boundary. There is no
+graph checkpointer: it would persist hidden transport reasoning. Upstream's
+serializer/parser is used directly through StockBrain HTTP, avoiding generic
+ChatOpenAI behavior and SDK retries/tracing. Pro handles bull/bear/manager/final;
+Flash handles the three analyst roles. Both thinking settings are explicit.
+
+Research remains advisory. `ResearchDecision` contains action, confidence,
+horizon, thesis, bull/bear cases, catalysts, risks, invalidation conditions and
+validated evidence IDs. It has no quantity, allocation, broker payload or
+execution authorization. Unknown output fields are removed at normalization,
+and direct schema validation forbids extra fields. Reasoning payloads are
+rejected. The GUI renders public strings as text and exposes read-only routes.
+
+### Ownership, spend and recovery
+
+`research_runs.dedupe_key` uniquely identifies event/company/configuration plus
+an optional explicit rerun UUID and prior-thesis reference. The default request
+is stable across restarts; rerun UUIDs are themselves idempotent. RUN_RESEARCH
+uses the existing PostgreSQL queue and active-job dedupe index. A conditional
+PENDING→RUNNING update assigns a lease token before any LLM call. Concurrent
+workers cannot claim the same run. Identity is rechecked against the resolver
+before analysis; later ambiguity or listing changes fail visibly.
+
+Every call uses the Phase 3 BudgetGuard and LlmTelemetry. Research is optional
+at the soft limit and cannot start at the hard limit. Pending budget-blocked
+runs are swept and can resume after rollover. The guard is checked again before
+each call, and spend invalidates its cache. No ingestion or deterministic dedupe
+path consults it. As in Phase 3, limits are admission checks against recorded
+spend, not exact monetary reservations; already admitted concurrent calls can
+finish after a threshold is crossed.
+
+A provider request has no exactly-once billing protocol. Therefore abandoned,
+cancelled, timed-out or failed paid runs are terminal and require an explicit
+rerun, rather than automatically repeating potentially billed work. A sweep
+marks expired leases TIMED_OUT, recovers unstarted pending work, and cancels
+pending runs from superseded configurations. Old workers lose permission to
+start further calls or publish results. Safe reports and usage are stored in
+StockBrain PostgreSQL only; run/thesis publication is one locked transaction.
+This deliberately favors visible incomplete research over accidental duplicate
+spend. Transport failures can leave unknown provider spend, recorded as failures.
+
+Alpaca remains the market-data source; historical research snapshots never
+clear execution-grade quote checks. FRED uses only DFF/DGS10 with a prior-day
+Chicago vintage. Missing providers and classified errors appear as degradation.
+No optional upstream Yahoo/social/prediction-market network path is enabled.
+Phase 6 must add deterministic sizing, portfolio checks and the hard bid/ask
+spread ceiling alongside quote age. Research confidence is a ranking feature,
+not a calibrated probability or authoritative risk score.

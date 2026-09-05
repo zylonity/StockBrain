@@ -33,6 +33,21 @@ __all__ = ["LlmCall", "ResearchRun", "Thesis"]
 class ResearchRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "research_runs"
 
+    dedupe_key: Mapped[str | None] = mapped_column(sa.String(64), unique=True)
+    impact_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("event_company_impacts.id", ondelete="SET NULL")
+    )
+    broker_instrument_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("broker_instruments.id", ondelete="SET NULL")
+    )
+    config_version: Mapped[str | None] = mapped_column(sa.String(64))
+    rerun_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid)
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid)
+    lease_expires_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    analyst_config: Mapped[JSONDict | None] = mapped_column()
+    provider_degradation: Mapped[JSONDict | None] = mapped_column()
+    error_class: Mapped[str | None] = mapped_column(sa.Text)
+
     event_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("events.id", ondelete="SET NULL")
     )

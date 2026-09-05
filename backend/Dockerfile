@@ -50,6 +50,9 @@ COPY backend/pyproject.toml ./pyproject.toml
 COPY backend/alembic.ini ./alembic.ini
 COPY backend/alembic ./alembic
 COPY backend/stockbrain ./stockbrain
+COPY third_party/TradingAgents/tradingagents ./third_party/TradingAgents/tradingagents
+COPY third_party/TradingAgents/LICENSE ./third_party/TradingAgents/LICENSE
+RUN python -c "from stockbrain.intelligence.tradingagents_runtime import upstream_root; upstream_root()"
 
 # The SPA is served from stockbrain/../static (see stockbrain.main.FRONTEND_DIST).
 COPY --from=frontend /build/dist ./static

@@ -8,6 +8,7 @@
  */
 
 import type {
+  ResearchRun,
   BrokerInstrumentRecord,
   CompanyAliasRecord,
   DiscoveryStatus,
@@ -75,6 +76,8 @@ function eventQuery(filters: EventFilters): string {
 }
 
 export const api = {
+  research: (eventId?: string) => request<ResearchRun[]>(`/api/v1/research${eventId ? `?event_id=${encodeURIComponent(eventId)}` : ""}`),
+  researchRun: (id: string) => request<ResearchRun>(`/api/v1/research/${encodeURIComponent(id)}`),
   health: () => request<HealthResponse>("/api/health"),
   readiness: () => request<ReadinessResponse>("/api/health/ready"),
   providers: () => request<ProvidersResponse>("/api/health/providers"),

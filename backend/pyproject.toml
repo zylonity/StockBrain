@@ -26,6 +26,12 @@ dependencies = [
     # uvicorn[standard], but an explicit import deserves an explicit dependency.
     "websockets>=14.0,<18.0",
     "python-dateutil>=2.9,<3.0",
+    # Minimal runtime for the pinned upstream submodule; no upstream CLI/Redis.
+    "langchain-openai>=1.1,<2",
+    "langgraph>=1.0,<2",
+    "yfinance>=1.4.1,<2",
+    "stockstats>=0.6.5,<0.7",
+    "pytz>=2025.2",
 ]
 
 [project.optional-dependencies]
@@ -96,6 +102,7 @@ ignore = [
 # Same reason: the Phase 4 live smoke test prints the Trading 212 and Alpaca
 # contracts it observed, which is the entire point of running it.
 "tests/integration/test_phase4_live.py" = ["T201"]
+"tests/integration/test_research_live.py" = ["T201"]
 "alembic/versions/*" = ["E501"]
 
 [tool.ruff.lint.isort]

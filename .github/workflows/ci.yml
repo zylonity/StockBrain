@@ -29,9 +29,12 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: astral-sh/setup-uv@v5
       - run: uv venv --python 3.12
-      - run: uv pip install -e ".[dev]"
+      - run: uv pip sync requirements-dev.txt
+      - run: uv pip install --no-deps -e .
       - name: Format check
         run: .venv/bin/ruff format --check .
       - name: Lint
@@ -67,5 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Build application image
         run: docker build -f backend/Dockerfile -t stockbrain:ci .

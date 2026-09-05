@@ -30,6 +30,8 @@ export function EventDetail() {
         ← All events
       </Link>
 
+      <p><Link to={`/research?event_id=${encodeURIComponent(eventId ?? "")}`}>Research for this event</Link></p>
+
       {error && <div className="error">{error}</div>}
       {!data && !error && <div className="placeholder">Loading…</div>}
 

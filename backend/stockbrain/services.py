@@ -42,8 +42,12 @@ from stockbrain.ingestion.service import IngestionOutcome, IngestionService
 from stockbrain.ingestion.topics import seed_default_topics
 from stockbrain.instruments.service import ResolutionService
 from stockbrain.intelligence.classifier import EventClassifier
+from stockbrain.intelligence.research_data import AlpacaResearchProvider, FredMacroProvider
+from stockbrain.intelligence.research_service import ResearchService
+from stockbrain.intelligence.research_transport import ResearchTransport
 from stockbrain.intelligence.semantic_dedupe import SemanticDeduplicator
 from stockbrain.intelligence.service import ClassificationService
+from stockbrain.intelligence.tradingagents_adapter import TradingAgentsResearchEngine
 from stockbrain.jobs.handlers import register_ingestion_handlers
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.jobs.registry import JobRegistry
@@ -101,6 +105,9 @@ class ServiceContainer:
     instrument_sync: InstrumentSyncService | None = field(default=None, init=False)
     resolution: ResolutionService | None = field(default=None, init=False)
     market_data: AlpacaMarketDataClient | None = field(default=None, init=False)
+    research: ResearchService | None = field(default=None, init=False)
+    research_transport: ResearchTransport | None = field(default=None, init=False)
+    fred: FredMacroProvider | None = field(default=None, init=False)
 
     _stream_task: asyncio.Task[None] | None = field(default=None, init=False)
 
@@ -184,6 +191,57 @@ class ServiceContainer:
                 telemetry=telemetry,
             )
 
+        if settings.research_enabled and settings.deepseek_api_key.get_secret_value():
+            if self.budget is None:
+                self.budget = BudgetGuard(
+                    self.database,
+                    daily_soft_usd=settings.llm_daily_soft_usd,
+                    daily_hard_usd=settings.llm_daily_hard_usd,
+                    monthly_soft_usd=settings.llm_monthly_soft_usd,
+                    monthly_hard_usd=settings.llm_monthly_hard_usd,
+                )
+            try:
+                self.research_transport = ResearchTransport(
+                    settings.deepseek_api_key,
+                    timeout=settings.deepseek_timeout_seconds,
+                    max_tokens=settings.research_max_output_tokens,
+                )
+                engine = TradingAgentsResearchEngine(
+                    self.research_transport,
+                    quick_model=settings.deepseek_flash_model,
+                    deep_model=settings.deepseek_pro_model,
+                )
+                if settings.fred_api_key.get_secret_value():
+                    self.fred = FredMacroProvider(settings.fred_api_key)
+                self.research = ResearchService(
+                    self.database,
+                    engine,
+                    budget=self.budget,
+                    health=self.health,
+                    models=engine.models,
+                    macro=self.fred,
+                    supplemental=AlpacaResearchProvider(self.market_data)
+                    if self.market_data
+                    else None,
+                    timeout_seconds=settings.research_timeout_seconds,
+                    max_tokens=settings.research_max_output_tokens,
+                )
+                self.health.record(
+                    ProviderName.TRADINGAGENTS,
+                    ProviderStatus.HEALTHY,
+                    detail="Pinned research engine loaded; provider models unprobed",
+                )
+            except Exception as exc:
+                self.health.record(
+                    ProviderName.TRADINGAGENTS,
+                    ProviderStatus.DOWN,
+                    detail=f"Research engine unavailable: {type(exc).__name__}",
+                )
+        else:
+            self.health.set_disabled(
+                ProviderName.TRADINGAGENTS, "Research disabled or DeepSeek key missing"
+            )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -192,6 +250,7 @@ class ServiceContainer:
             self.registry,
             classifier_available=self.classification is not None,
             instrument_sync_available=self.instrument_sync is not None,
+            research_available=self.research is not None,
         )
 
         async with self.database.transaction() as session:
@@ -242,6 +301,8 @@ class ServiceContainer:
             self.deepseek,
             self.t212_metadata,
             self.market_data,
+            self.research_transport,
+            self.fred,
         ):
             if client is not None:
                 with contextlib.suppress(Exception):
@@ -251,6 +312,15 @@ class ServiceContainer:
     # Schedules
     # ------------------------------------------------------------------
     def _register_schedules(self, scheduler: Scheduler) -> None:
+        if self.research is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="research_backlog",
+                    interval_seconds=60,
+                    run=self._research_sweep,
+                    initial_delay_seconds=35,
+                )
+            )
         if self.firecrawl is not None:
             scheduler.add(
                 ScheduledTask(
@@ -333,6 +403,11 @@ class ServiceContainer:
         async with self.database.session() as session:
             row = await session.get(AppSetting, DISCOVERY_PAUSED_KEY)
         return bool(row and row.value.get("paused"))
+
+    async def _research_sweep(self) -> None:
+        if self.research is not None:
+            await self.research.sweep()
+            await self.research.enqueue_event()
 
     async def _enqueue_due_topic_searches(self) -> None:
         """Enqueue every enabled query whose topic interval has elapsed.

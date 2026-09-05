@@ -45,7 +45,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | 2 | Discovery ingestion (Alpaca news WS, Firecrawl, SEC EDGAR), dedupe, job queue | **done** |
 | 3 | DeepSeek event classifier, semantic dedupe, LLM telemetry and budgets | **done** |
 | 4 | Instrument resolution and market data | **done** |
-| 5 | Pinned TradingAgents research engine | not started |
+| 5 | Pinned TradingAgents research engine | **done** |
 | 6 | Risk engine, proposals, web approval | not started |
 | 7 | Telegram bot | not started |
 | 8 | Trading 212 demo execution and reconciliation | not started |
@@ -76,6 +76,7 @@ for deployment and runbooks.
 ## Quick start
 
 ```bash
+git submodule update --init --recursive
 cp .env.example .env
 # Edit .env: set POSTGRES_PASSWORD, match it in DATABASE_URL, and generate a key:
 #   python -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -117,7 +118,8 @@ make help           # everything else
 ```bash
 cd backend
 uv venv --python 3.12
-uv pip install -e ".[dev]"
+uv pip sync requirements-dev.txt
+uv pip install --no-deps -e .
 ```
 
 Run the API against the compose database, with the frontend dev server proxying
@@ -213,10 +215,10 @@ advice.
   state explicitly that instructions inside it are not to be followed, and
   substitution is single-pass so document text cannot introduce prompt
   structure. It is sanitised before rendering.
-* LLM providers are reached through a text-in/text-out interface with no tools,
-  no broker access, no filesystem access and no arbitrary network capability.
-  Every model response is validated against a Pydantic schema before anything
-  acts on it.
+* Classification uses a text-in/text-out interface. Research can only read its
+  supplied packet through an enumerated context tool. Neither has broker access,
+  filesystem access or arbitrary network capability. Final model decisions are
+  validated against a Pydantic schema before anything acts on them.
 * Telegram authorises on numeric user IDs only — never usernames, which the
   owner can change. An empty allowlist authorises nobody.
 * Approval tokens are opaque and stored only as SHA-256 hashes. Order parameters
@@ -230,3 +232,41 @@ advice.
 ## Licence
 
 Proprietary. Not investment advice; no warranty of any kind.
+
+### Phase 5 research
+
+Initialize the pinned upstream checkout after cloning:
+
+```bash
+git submodule update --init --recursive
+```
+
+The Research page shows advisory decisions, evidence, analyst reports, provider
+limitations and per-role usage. Classified candidates with a RESOLVED company
+and instrument are queued automatically. `RESEARCH_ENABLED=false` disables new
+research wiring; `RESEARCH_TIMEOUT_SECONDS` (600) and
+`RESEARCH_MAX_OUTPUT_TOKENS` (3000 per call) bound work. Existing LLM budgets
+apply. FRED is optional; DFF/DGS10 are the only configured series. No broker
+mutation or trade approval is part of this phase.
+
+To enqueue an existing resolved impact manually:
+
+```bash
+docker compose exec stockbrain python -m stockbrain.intelligence.research_cli IMPACT_UUID
+```
+
+To intentionally create a new version, append `--rerun-id NEW_UUID`; reuse the
+same UUID if the command is interrupted. Failed/interrupted paid runs are not
+automatically repeated because provider spend can be uncertain. Read-only API:
+`GET /api/v1/research`, `/{run_id}`, and `/health`; the list accepts `event_id`,
+`status`, `limit`, and `offset` filters.
+
+Minimal live checks remain explicitly opt-in:
+
+```bash
+cd backend
+.venv/bin/pytest -m live -s tests/integration/test_research_live.py
+```
+
+They read credentials from the environment or root `.env`, perform a tiny Flash
+thinking/tool continuity flow and one FRED DFF query, and print no secrets.

@@ -462,3 +462,60 @@ export interface PriceReaction {
   session_holiday_aware: boolean;
   notes: string[];
 }
+
+export interface ResearchDecision {
+  action: "BUY" | "HOLD" | "REDUCE" | "SELL" | "NO_ACTION";
+  confidence: number;
+  horizon: "intraday" | "days" | "weeks" | "months";
+  thesis: string;
+  bull_case: string;
+  bear_case: string;
+  catalysts: string[];
+  risks: string[];
+  invalidation_conditions: string[];
+  evidence_ids: string[];
+}
+
+export interface ResearchRun {
+  id: string;
+  event_id: string | null;
+  status: string;
+  as_of: string;
+  started_at: string | null;
+  completed_at: string | null;
+  tradingagents_version: string | null;
+  quick_model: string | null;
+  deep_model: string | null;
+  prompt_version: string | null;
+  config_version: string | null;
+  estimated_cost_usd: string | null;
+  error: string | null;
+  error_class: string | null;
+  thesis_id: string | null;
+  decision: ResearchDecision | null;
+  reports: Record<string, string>;
+  packet: {
+    title: string;
+    summary: string;
+    event_time: string;
+    impact_path: string;
+    relationship: string | null;
+    classifier_rationale: string | null;
+    company: {
+      name: string; symbol: string; exchange: string | null;
+      currency: string | null; isin: string | null; broker_ticker: string;
+    };
+    evidence: { source_id: string; publisher: string | null; url: string | null;
+      published_at: string | null; text: string; text_truncated: boolean; relationship: string }[];
+    market_context: { provider: string; kind: string; as_of: string; text: string }[];
+    degradation: { provider: string; error_class: string; detail: string }[];
+  } | null;
+  calls: {
+    id: string; purpose: string; provider: string; model: string;
+    input_tokens: number | null; output_tokens: number | null;
+    cached_input_tokens: number | null; cache_miss_input_tokens: number | null;
+    estimated_cost_usd: string | null; latency_ms: number | null;
+    provider_request_id: string | null; finish_reason: string | null;
+    error_class: string | null; thinking_enabled: boolean;
+  }[];
+}
