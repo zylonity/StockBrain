@@ -82,6 +82,25 @@ def _env(name: str) -> str:
 
 
 def _t212_settings() -> Settings:
+    """Credentials for the metadata verification, demo by default.
+
+    Trading 212 issues API keys **per environment**: a live key answers HTTP 401
+    against ``demo.trading212.com`` and vice versa. An operator who only holds a
+    live key therefore cannot verify the metadata contract at all, which is a
+    real situation rather than a hypothetical one -- it is what happened on
+    2026-09-04.
+
+    Reading reference data from the live environment is strictly a GET against
+    the instrument universe: no account state, no orders, and this client has no
+    order method to call. It is nonetheless gated behind **two** independent
+    switches, mirroring how live execution is gated, so it can never happen as a
+    side effect of running the test suite:
+
+    * ``T212_METADATA_ENV=live`` selects the environment, and
+    * ``T212_ALLOW_LIVE_METADATA_READ=yes`` records that a human intended it.
+
+    Either one missing keeps the call on demo. Neither is written to ``.env``.
+    """
     key = _env("T212_API_KEY")
     secret = _env("T212_API_SECRET")
     if not key or not secret:
@@ -89,13 +108,21 @@ def _t212_settings() -> Settings:
             "T212_API_KEY / T212_API_SECRET are not configured "
             f"(checked the process environment and {_ENV_FILE})"
         )
+
+    requested = (os.environ.get("T212_METADATA_ENV") or "demo").strip().lower()
+    consented = os.environ.get("T212_ALLOW_LIVE_METADATA_READ", "").strip().lower() == "yes"
+    environment = "live" if (requested == "live" and consented) else "demo"
+    if requested == "live" and not consented:
+        pytest.skip(
+            "T212_METADATA_ENV=live requires T212_ALLOW_LIVE_METADATA_READ=yes; "
+            "refusing to reach the live environment implicitly"
+        )
+
     return Settings(
         app_env="test",
         t212_api_key=key,
         t212_api_secret=secret,
-        # Demo only. A live-environment metadata call would still be read-only,
-        # but this phase has no business authenticating against the live account.
-        t212_env="demo",
+        t212_env=environment,
     )
 
 
@@ -188,7 +215,7 @@ async def test_live_trading212_demo_metadata() -> None:
 
     # --- 6: is shortName usable as a market symbol? ----------------------
     with_short = [i for i in instruments if i.short_name]
-    dirty = [
+    rewritten = [
         i
         for i in with_short
         if i.short_name and normalize_ticker(i.short_name) != i.short_name.strip().upper()
@@ -202,13 +229,31 @@ async def test_live_trading212_demo_metadata() -> None:
     symbol_counts = Counter(normalize_ticker(i.short_name) for i in with_short if i.short_name)
     reused = [symbol for symbol, count in symbol_counts.items() if count > 1]
     print(f"\nshortName present:       {len(with_short)} ({_pct(len(with_short), total)})")
-    print(f"  chars lost to normalisation: {len(dirty)} ({_pct(len(dirty), len(with_short))})")
+    print(
+        f"  rewritten by normalisation: {len(rewritten)} "
+        f"({_pct(len(rewritten), len(with_short))})  <- share-class separators"
+    )
     print(f"  disagrees with ticker prefix: {len(disagreeing)} ({_pct(len(disagreeing), total)})")
     print(f"  reused across listings:  {len(reused)} distinct symbols")
-    if dirty:
-        print(f"  sample dirty shortNames: {[i.short_name for i in dirty[:5]]}")
+    if rewritten:
+        print(f"  sample rewritten:        {[i.short_name for i in rewritten[:5]]}")
     if reused:
         print(f"  sample reused symbols:   {reused[:5]}")
+
+    # Trading 212 writes share classes with a slash ("TAP/A"), while a model or
+    # a market-data feed writes them with a dot or a hyphen ("TAP.A", "BRK-B").
+    # Canonicalising the separator is what lets a hint match a stored listing --
+    # but only if it does not merge two listings that differ *only* by their
+    # separator character. Measured here rather than assumed.
+    raw_symbols = {i.short_name.strip().upper() for i in with_short if i.short_name}
+    canonical: dict[str, set[str]] = {}
+    for raw_symbol in raw_symbols:
+        canonical.setdefault(normalize_ticker(raw_symbol), set()).add(raw_symbol)
+    merged = {k: v for k, v in canonical.items() if len(v) > 1}
+    print(f"  distinct raw shortNames: {len(raw_symbols)}")
+    print(f"  collisions introduced by canonicalisation: {len(merged)}")
+    if merged:
+        print(f"    {list(merged.items())[:10]}")
 
     # --- 7: does workingScheduleId resolve to an exchange? ---------------
     with_schedule = [i for i in instruments if i.working_schedule_id is not None]

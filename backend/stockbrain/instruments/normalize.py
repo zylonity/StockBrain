@@ -61,7 +61,17 @@ _NAME_SUFFIXES = frozenset(
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _ISIN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
-_TICKER_ALLOWED = re.compile(r"[^A-Z0-9.\-]")
+
+#: Characters kept in a ticker. ``/`` is here because Trading 212 writes share
+#: classes with a slash (``TAP/A``); dropping it silently collapsed six real
+#: listings onto unrelated ones -- ``HVT/A`` became ``HVTA``, which is a
+#: different security. Measured against the live universe on 2026-09-04.
+_TICKER_ALLOWED = re.compile(r"[^A-Z0-9./\- ]")
+
+#: Every spelling of a share-class separator, canonicalised to ``.``. Trading
+#: 212 uses ``/``, market-data feeds and language models use ``.`` or ``-``, and
+#: a hint has to be able to match a stored listing across that difference.
+_CLASS_SEPARATOR = re.compile(r"[./\- ]+")
 
 
 def instrument_name_key(name: str | None) -> str:
@@ -87,16 +97,26 @@ def instrument_name_key(name: str | None) -> str:
 
 
 def normalize_ticker(ticker: str | None) -> str:
-    """Normalise a market-data ticker.
+    """Normalise a market-data ticker, canonicalising share-class separators.
 
-    Upper-cased, whitespace removed, and everything but letters, digits, ``.``
-    and ``-`` dropped.  Class separators are *preserved*: ``BRK.A`` and ``BRK-A``
-    stay distinguishable from ``BRK``, and collapsing them would be the exact
-    silent merge this system exists to prevent.
+    Upper-cased, unsupported characters dropped, and every class separator --
+    ``.``, ``-``, ``/`` or a space -- rewritten to a single ``.``.  So
+    ``BRK.B``, ``BRK-B`` and Trading 212's own ``BRK/B`` all agree, which is
+    what lets a classifier hint match a stored listing.
+
+    The class is never collapsed *away*: ``BRK.A`` stays distinguishable from
+    ``BRK``, and that would be the exact silent merge this system exists to
+    prevent.  Trailing separators are also preserved, because the London line
+    of BP is ``BP.`` and must not become the New York ``BP``.
+
+    Verified against Trading 212's live universe (17,452 instruments,
+    2026-09-04): canonicalising introduces no collisions and removes six that
+    the previous slash-stripping form created.
     """
     if not ticker:
         return ""
-    return _TICKER_ALLOWED.sub("", ticker.strip().upper())
+    cleaned = _TICKER_ALLOWED.sub("", ticker.strip().upper())
+    return _CLASS_SEPARATOR.sub(".", cleaned)
 
 
 def normalize_isin(isin: str | None) -> str:
@@ -173,11 +193,20 @@ def split_broker_ticker(broker_ticker: str) -> tuple[str, str | None, str | None
 
     ``AAPL_US_EQ`` -> ``("AAPL", "US", "EQ")``.  This is a *derivation*, not
     documented provider metadata: Trading 212 documents the ticker only as an
-    opaque unique identifier.  Anything that does not have the three-part shape
-    yields no market code and no kind rather than a guess, and the full ticker
-    is always what reaches the broker.
+    opaque unique identifier, and the full ticker is always what reaches the
+    broker.
+
+    Non-US listings use a two-part form -- ``VODl_EQ`` -> ``("VODl", None,
+    "EQ")`` -- so a missing venue code is normal rather than exceptional: 64% of
+    the live universe has one (measured 2026-09-04).  Returning the *whole*
+    ticker as the symbol in that case, as this function first did, made the
+    fallback market symbol ``VODL.EQ``; it now returns the first segment and no
+    venue code.  Either way ``shortName`` is preferred, and it is populated on
+    100% of live rows.
     """
     parts = broker_ticker.split("_")
     if len(parts) >= 3:
         return parts[0], parts[-2], parts[-1]
+    if len(parts) == 2:
+        return parts[0], None, parts[-1]
     return broker_ticker, None, None

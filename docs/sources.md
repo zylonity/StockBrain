@@ -183,9 +183,79 @@ Sources: <https://docs.trading212.com/api>,
    StockBrain paces instead of bursting, because the metadata endpoints have a
    budget of one.
 
-**Live verification status: ATTEMPTED 2026-09-04, BLOCKED ON HTTP 401.**
-Credentials were supplied and every documented authentication form was rejected
-by the **demo** environment:
+**Live verification PASSED 2026-09-04** against the **live** environment,
+read-only, with explicit operator consent. The demo environment could not be
+used: the available key pair is a live-environment key, and Trading 212 issues
+keys per environment.
+
+```
+GET https://live.trading212.com/api/v0/equity/account/summary   -> 200  (auth check)
+GET https://live.trading212.com/api/v0/equity/metadata/exchanges -> 200
+GET https://live.trading212.com/api/v0/equity/metadata/instruments -> 200
+
+exchanges                 17
+working schedules         53
+instruments            17452
+instrument types       STOCK 11161 · ETF 6268 · WARRANT 23
+```
+
+Field population across all 17,452 instruments:
+
+| Field | Populated |
+|---|---|
+| `ticker`, `name`, `shortName`, `isin`, `currencyCode`, `type`, `extendedHours`, `maxOpenQuantity`, `workingScheduleId`, `addedOn` | **100.00%** |
+| `minTradeQuantity` | **0.00%** — confirms the field does not exist |
+
+| Question | Observed |
+|---|---|
+| ISIN coverage on STOCK/ETF | **100.00%** (17,429 / 17,429; STOCK 11,161/11,161, ETF 6,268/6,268) |
+| `workingScheduleId` resolves to an exchange | **100.00%**, zero unmapped schedule ids |
+| `shortName` populated | **100.00%** |
+| `shortName` agrees with the ticker prefix | **35.7%** — it disagrees on 11,217 rows (64.3%) |
+| `shortName` reused across listings | **1,640 distinct symbols** |
+| rate-limit headers | all five, on every response |
+
+```
+exchanges    : limit=1 period=30 remaining=0 used=1 reset=1788580640
+instruments  : limit=1 period=50 remaining=0 used=1 reset=1788580661
+```
+
+`period` matches the documented per-endpoint limits exactly (30s and 50s), and
+an authentication failure returns **no** rate-limit headers at all — so a 401
+costs no request budget, which is worth knowing when diagnosing credentials.
+
+**Three findings that changed the code:**
+
+1. **Trading 212 writes share classes with a slash** (`TAP/A`, `BBD/B`, `HVT/A`
+   -- 47 rows), while market-data feeds and language models write `TAP.A` or
+   `BRK-B`. The old normaliser dropped `/` outright, which did two bad things:
+   a classifier hint of `BRK.B` could never match the stored listing, and six
+   real listings collapsed onto unrelated ones -- `HVT/A` became `HVTA`, which
+   is a different security (likewise `AGF/B`, `HEI/A`, `CRD/A`, `MOG/B`,
+   `EMP/A`). `normalize_ticker` now canonicalises every separator to `.`.
+   Re-measured across all 15,573 distinct shortNames: **zero collisions**, and
+   the six false ones are gone. A trailing separator is deliberately kept, since
+   London's `BP.` must not become New York's `BP`.
+2. **64% of tickers use a two-part form** (`VODl_EQ`, not `AAPL_US_EQ`), so a
+   missing venue code is the norm rather than the exception.
+   `split_broker_ticker` returned the *whole* ticker as the symbol in that case,
+   which would have made the fallback market symbol `VODL.EQ`. It now returns
+   the first segment and no venue code. `shortName` is preferred and is
+   populated on every row, so this is a last-resort path -- but a last-resort
+   path should still be right.
+3. **`shortName` is not unique**: 1,640 symbols are reused across listings
+   (`STN`, `TLS`, `PET`, `XNAS`, ...). This is the "ticker reuse" ambiguity class
+   with a real number attached, and it confirms the resolver must treat a bare
+   ticker as insufficient. Rung 3 already returns every match and reports
+   AMBIGUOUS without an exchange hint.
+
+**Still unverified against the demo environment.** The instrument universe a
+demo account sees may differ from live. Nothing in the code depends on the two
+being identical -- the sync reads whichever universe the configured environment
+returns -- but the numbers above are live-account numbers.
+
+**Superseded: the earlier 401 diagnosis.** For the record, every documented
+authentication form was rejected by the **demo** environment with this live key:
 
 ```
 GET https://demo.trading212.com/api/v0/equity/metadata/exchanges
@@ -196,30 +266,16 @@ GET https://demo.trading212.com/api/v0/equity/account/summary
     Authorization: <raw key>    -> HTTP 401   (the documented legacyApiKeyHeader)
 ```
 
-The 401 carries an empty body and **no rate-limit headers at all**, which means
-the request is rejected before the rate limiter is consulted -- a useful
-diagnostic: an auth rejection costs no request budget. The credential itself is
-clean (37 alphanumeric characters; secret 43 characters of URL-safe base64, no
-whitespace, no quotes, no inline comment), so this is not a parsing or paste
-error. The most likely cause is that the key pair was generated for the **live**
-account rather than the practice/demo account -- Trading 212 issues keys per
-environment. No live-environment call was made to confirm that: this phase has
-no business authenticating against a real-money account.
+The same pair returned 200 against `live.trading212.com`, which is what
+identified it as a live key. The credential itself was clean throughout (37
+alphanumeric characters; secret 43 characters of URL-safe base64, no whitespace,
+no quotes, no inline comment), so this was never a parsing or paste error.
 
-Everything in the two tables above therefore remains verified against
-Trading 212's *documentation* only. These facts are still **documented but not
-observed**, and each has a safe-by-construction fallback in the code:
-
-| Unobserved fact | Fallback if the observation differs |
-|---|---|
-| ISIN is populated on STOCK/ETF rows | `isin` is nullable; a row without one resolves but creates no company |
-| `shortName` is a usable market-data symbol | `market_symbol` falls back to the ticker prefix, and is never sent to the broker |
-| `workingScheduleId` resolves to an exchange | an unmapped schedule leaves `exchange` NULL, never guessed |
-| the five `x-ratelimit-*` headers arrive on every response | `RateLimitSnapshot` fields are all optional; the client paces from its own bucket |
-
-`pytest -m live -s tests/integration/test_phase4_live.py` measures all four in
-two GETs and prints the numbers. Run it with a **demo-environment** key and
-record the results here before Phase 6 sizes anything against this metadata.
+Reading reference data from the live environment is gated behind **two**
+independent switches in the live test -- `T212_METADATA_ENV=live` and
+`T212_ALLOW_LIVE_METADATA_READ=yes` -- mirroring how live execution is gated, so
+it cannot happen as a side effect of running the suite. Demo remains the
+default. Neither switch is written to `.env`.
 
 **Trading 212 pricing rule, re-checked in Phase 4.** The current public API
 documentation exposes no market-data endpoint at all — the metadata endpoints

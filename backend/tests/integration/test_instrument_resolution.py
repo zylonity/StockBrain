@@ -40,7 +40,11 @@ from stockbrain.enums import (
     ResolutionStatus,
 )
 from stockbrain.instruments.aliases import AliasSpec, upsert_alias
-from stockbrain.instruments.normalize import instrument_name_key, normalize_ticker
+from stockbrain.instruments.normalize import (
+    instrument_name_key,
+    normalize_ticker,
+    split_broker_ticker,
+)
 from stockbrain.instruments.resolver import InstrumentResolver, ResolutionRequest
 from stockbrain.instruments.service import ResolutionService
 
@@ -739,10 +743,60 @@ async def test_normalisation_keeps_share_classes_apart() -> None:
         "Berkshire Hathaway Inc. Class B"
     )
     assert normalize_ticker("brk.a") == "BRK.A"
-    assert normalize_ticker("BRK-B") == "BRK-B"
     assert normalize_ticker("brk.a") != normalize_ticker("BRK")
+    assert normalize_ticker("BRK.A") != normalize_ticker("BRK.B")
     # Legal suffixes and punctuation do collapse -- that is the point.
     assert instrument_name_key("Vertiv Holdings Co.") == instrument_name_key("VERTIV holdings")
+
+
+async def test_every_share_class_separator_spelling_agrees() -> None:
+    """Trading 212 writes ``TAP/A``; a model or a feed writes ``TAP.A``/``TAP-A``.
+
+    Observed on the live universe: 47 of 17,452 shortNames use a slash. Without
+    canonicalisation a classifier hint of "BRK.B" could never match the stored
+    listing, which would turn every class share into a NOT_FOUND.
+    """
+    assert normalize_ticker("BRK.B") == normalize_ticker("BRK-B") == normalize_ticker("BRK/B")
+    assert normalize_ticker("brk/b") == "BRK.B"
+    assert normalize_ticker("TAP/A") == "TAP.A"
+
+
+async def test_canonicalisation_does_not_merge_unrelated_listings() -> None:
+    """Regression for six real collisions found in the live universe.
+
+    The previous normaliser dropped ``/`` outright, so Haverty Furniture's class
+    A line (``HVT/A``) collapsed onto the unrelated ``HVTA`` -- and likewise
+    AGF/B, HEI/A, CRD/A, MOG/B and EMP/A. Re-measured after the fix: zero
+    collisions across all 15,573 distinct shortNames.
+    """
+    for slashed, plain in (
+        ("HVT/A", "HVTA"),
+        ("AGF/B", "AGFB"),
+        ("HEI/A", "HEIA"),
+        ("CRD/A", "CRDA"),
+        ("MOG/B", "MOGB"),
+        ("EMP/A", "EMPA"),
+    ):
+        assert normalize_ticker(slashed) != normalize_ticker(plain)
+
+
+async def test_a_trailing_separator_is_not_stripped() -> None:
+    """BP's London line is ``BP.`` and must not become New York's ``BP``."""
+    assert normalize_ticker("BP.") == "BP."
+    assert normalize_ticker("BP.") != normalize_ticker("BP")
+
+
+async def test_a_two_part_broker_ticker_splits_without_a_venue_code() -> None:
+    """64% of the live universe uses the two-part form (``VODl_EQ``).
+
+    Returning the whole ticker as the symbol -- the original behaviour -- made
+    the fallback market symbol ``VODL.EQ``. ``shortName`` is preferred and is
+    populated on 100% of live rows, so this is a last-resort path, but a
+    last-resort path should still be right.
+    """
+    assert split_broker_ticker("AAPL_US_EQ") == ("AAPL", "US", "EQ")
+    assert split_broker_ticker("VODl_EQ") == ("VODl", None, "EQ")
+    assert split_broker_ticker("OPAQUE") == ("OPAQUE", None, None)
 
 
 def test_utcnow_is_timezone_aware() -> None:

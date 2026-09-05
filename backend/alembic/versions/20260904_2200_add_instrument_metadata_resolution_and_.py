@@ -40,6 +40,15 @@ depends_on: str | Sequence[str] | None = None
 
 # --------------------------------------------------------------------------
 # Frozen copies of stockbrain.instruments.normalize as of this revision.
+#
+# These have since diverged from the application versions, which is the point of
+# freezing them: a migration must keep producing the same values forever.
+# `_normalize_ticker` here still strips "/" rather than canonicalising share-class
+# separators to ".", a change made after the live universe showed six real
+# collisions. That divergence is harmless: `market_symbol` and `market_code` are
+# in the instrument sync's updatable column set, so the next INSTRUMENT_REFRESH
+# rewrites every row with the current logic. A backfill migration would only be
+# needed if the column were write-once.
 # --------------------------------------------------------------------------
 _NAME_SUFFIXES = frozenset(
     {
