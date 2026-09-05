@@ -434,6 +434,69 @@ _TERMINAL_NOTIFICATIONS = frozenset(
 )
 
 
+async def handle_execute_proposal(context: HandlerContext) -> None:
+    """Drive one authorized proposal to at most one broker transmission.
+
+    Idempotent at four layers, because at-least-once delivery guarantees this
+    job runs twice eventually and the endpoint it drives is non-idempotent:
+
+    * ``uq_jobs_dedupe_key_active`` -- one pending execution job per proposal;
+    * a transaction-scoped advisory lock on the proposal, so two workers
+      serialise rather than interleave;
+    * an explicit "has anything already been recorded as sent?" check inside
+      that lock, which turns a redelivery into a reconciliation;
+    * ``uq_execution_attempts_sent_once`` -- the database having the last word
+      if all three of the above were somehow bypassed.
+
+    A refusal, a rejection and an ambiguity are all *answers*, not job failures:
+    the job succeeds and the outcome is visible on the attempt. Only an
+    infrastructure fault raises, and it must never raise *after* a transmission
+    -- a raise there would earn the job a retry, and a retried execution job on
+    a proposal whose send was recorded simply reconciles.
+    """
+    execution = getattr(context.services, "execution", None)
+    if execution is None:
+        raise RuntimeError("the execution service is not configured")
+
+    proposal_id = uuid.UUID(str(context.payload["proposal_id"]))
+    result = await execution.execute(proposal_id)
+    log.info(
+        "execute_proposal_job_complete",
+        proposal_id=str(proposal_id),
+        transmitted=result.transmitted,
+        outcome=result.outcome.value if result.outcome else None,
+        broker_order_id=result.broker_order_id,
+        proposal_status=result.status.value if result.status else None,
+        reconcile_required=result.reconcile_required,
+        reason=result.reason[:300],
+    )
+
+
+async def handle_reconcile_execution(context: HandlerContext) -> None:
+    """Resolve one execution attempt by reading the broker.
+
+    Transmits nothing.  An inconclusive pass is a successful job: the attempt
+    stays ambiguous, its reconciliation counter advances, and the sweep will
+    look again until the configured ceiling -- after which it waits for a
+    person, because an order the broker cannot account for is not a thing to
+    poll forever.
+    """
+    reconciliation = getattr(context.services, "reconciliation", None)
+    if reconciliation is None:
+        raise RuntimeError("the reconciliation service is not configured")
+
+    attempt_id = uuid.UUID(str(context.payload["attempt_id"]))
+    outcome = await reconciliation.reconcile(attempt_id)
+    log.info(
+        "reconcile_execution_job_complete",
+        attempt_id=str(attempt_id),
+        result=outcome.result.value,
+        broker_order_id=outcome.broker_order_id,
+        candidates=outcome.candidates,
+        proposal_status=outcome.proposal_status.value if outcome.proposal_status else None,
+    )
+
+
 def register_ingestion_handlers(
     registry: JobRegistry,
     *,
@@ -442,6 +505,7 @@ def register_ingestion_handlers(
     research_available: bool = False,
     proposals_available: bool = False,
     account_sync_available: bool = False,
+    execution_available: bool = False,
 ) -> None:
     """Register the handlers this deployment can actually run.
 
@@ -472,6 +536,12 @@ def register_ingestion_handlers(
     # the deployment looks like, and an unregistered type would leave those jobs
     # unclaimable rather than merely undelivered.
     registry.register(JobType.SEND_NOTIFICATION.value, handle_send_notification)
+    # Registered only with a broker execution provider constructed. Without one
+    # there is nothing to transmit to, and a handler that always failed would
+    # fill the queue with jobs guaranteed to exhaust their retry budget.
+    if execution_available:
+        registry.register(JobType.EXECUTE_PROPOSAL.value, handle_execute_proposal)
+        registry.register(JobType.RECONCILE_EXECUTION.value, handle_reconcile_execution)
 
 
 async def handle_run_research(context: HandlerContext) -> None:

@@ -22,6 +22,7 @@ from stockbrain.broker.account_state import AccountStateService
 from stockbrain.broker.instrument_sync import InstrumentSyncService
 from stockbrain.broker.trading212_account import Trading212AccountClient
 from stockbrain.broker.trading212_metadata import Trading212MetadataClient
+from stockbrain.broker.trading212_orders import Trading212OrderClient
 from stockbrain.config import Settings
 from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
@@ -38,6 +39,9 @@ from stockbrain.enums import (
     ResolutionStatus,
 )
 from stockbrain.errors import ProviderAuthError, ProviderEntitlementError
+from stockbrain.execution.base import Trading212ExecutionProvider
+from stockbrain.execution.reconciliation import ReconciliationService
+from stockbrain.execution.service import ExecutionService
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
 from stockbrain.ingestion.firecrawl import FirecrawlClient
 from stockbrain.ingestion.sec_edgar import SecEdgarClient
@@ -122,6 +126,10 @@ class ServiceContainer:
     control: ControlStateService = field(init=False)
     telegram: TelegramRuntime | None = field(default=None, init=False)
 
+    t212_orders: Trading212OrderClient | None = field(default=None, init=False)
+    execution: ExecutionService | None = field(default=None, init=False)
+    reconciliation: ReconciliationService | None = field(default=None, init=False)
+
     _stream_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -161,6 +169,37 @@ class ServiceContainer:
             # Only enqueue classification when something can actually run it.
             classification_enabled=self.classification is not None,
         )
+
+        # The execution layer is built only when there is something to transmit
+        # to *and* a proposal service to transmit for. It is deliberately not
+        # gated on `order_transmission_permitted`: that predicate is re-read at
+        # send time and shown in the API, so a deployment with the master switch
+        # off still reports honestly rather than looking unconfigured.
+        if self.proposals is not None and self.settings.broker_credentials_present:
+            self.t212_orders = Trading212OrderClient(self.settings)
+            provider = Trading212ExecutionProvider(self.t212_orders)
+            self.execution = ExecutionService(
+                self.database,
+                self.settings,
+                proposals=self.proposals,
+                provider=provider,
+                control=self.control,
+                broker=Broker.TRADING212,
+            )
+            self.reconciliation = ReconciliationService(
+                self.database,
+                self.settings,
+                provider=provider,
+                proposals=self.proposals,
+                broker=Broker.TRADING212,
+            )
+            log.info(
+                "execution_service_ready",
+                broker_environment=self.settings.t212_env.value,
+                order_transmission_permitted=self.settings.order_transmission_permitted,
+                order_transmission_blockers=self.settings.order_transmission_blockers,
+                extended_hours=self.settings.t212_order_extended_hours,
+            )
 
         # Built last, and only when it can actually run: enabled, a token, and a
         # non-empty numeric user allowlist. Anything less and the provider stays
@@ -321,6 +360,7 @@ class ServiceContainer:
             research_available=self.research is not None,
             proposals_available=self.proposals is not None,
             account_sync_available=self.t212_account is not None,
+            execution_available=self.execution is not None,
         )
 
         # Before a worker or the scheduler can act, say out loud whether this
@@ -378,6 +418,7 @@ class ServiceContainer:
         if self.runner is not None:
             await self.runner.stop()
         for client in (
+            self.t212_orders,
             self.alpaca_news,
             self.firecrawl,
             self.sec,
@@ -488,6 +529,38 @@ class ServiceContainer:
                     run=self._proposal_sweep,
                     initial_delay_seconds=45.0,
                     jitter_ratio=0.05,
+                )
+            )
+        if self.execution is not None:
+            # The scheduler only ever *enqueues*; the handler transmits. That
+            # separation is what keeps a slow broker from delaying the cadence,
+            # and it means a restart resumes from the database rather than from
+            # an in-memory list.
+            scheduler.add(
+                ScheduledTask(
+                    name="execution_enqueue",
+                    interval_seconds=self.settings.execution_enqueue_interval_seconds,
+                    run=self._enqueue_execution,
+                    initial_delay_seconds=50.0,
+                    jitter_ratio=0.05,
+                )
+            )
+            scheduler.add(
+                ScheduledTask(
+                    name="execution_crash_recovery",
+                    interval_seconds=self.settings.reconcile_interval_seconds,
+                    run=self._recover_execution,
+                    initial_delay_seconds=15.0,
+                )
+            )
+        if self.reconciliation is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="execution_reconcile",
+                    interval_seconds=self.settings.reconcile_interval_seconds,
+                    run=self._reconcile_execution,
+                    initial_delay_seconds=70.0,
+                    jitter_ratio=0.1,
                 )
             )
         scheduler.add(
@@ -621,6 +694,23 @@ class ServiceContainer:
                 dedupe_key=f"account:{Broker.TRADING212.value}",
                 priority=20,
             )
+
+    async def _enqueue_execution(self) -> None:
+        if self.execution is not None:
+            await self.execution.enqueue_ready()
+
+    async def _recover_execution(self) -> None:
+        """Find attempts stranded mid-flight by a crash and mark them ambiguous.
+
+        Never resends. This is the sweep that turns "we recorded a send and then
+        died" into a reconciliation task rather than into a duplicate order.
+        """
+        if self.execution is not None:
+            await self.execution.recover_incomplete()
+
+    async def _reconcile_execution(self) -> None:
+        if self.reconciliation is not None:
+            await self.reconciliation.sweep()
 
     async def _proposal_sweep(self) -> None:
         """Expire, invalidate and re-price proposals, then queue new ones."""

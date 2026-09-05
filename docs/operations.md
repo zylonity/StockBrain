@@ -64,7 +64,10 @@ The application then:
    paused or killed comes back paused or killed, and says so at WARNING. Silent
    resumption after a crash is the failure that state exists to prevent;
 7. starts Telegram long polling, if it is configured, in a supervisor task —
-   never blocking the HTTP server or the job workers.
+   never blocking the HTTP server or the job workers;
+8. **sweeps execution attempts stranded mid-flight.** An attempt recorded as
+   sent with no result is marked `EXECUTION_AMBIGUOUS` and queued for
+   reconciliation. It is never resent.
 
 ## Health
 
@@ -190,6 +193,65 @@ A failed *notification* is recorded in `notifications` with status `FAILED` and
 is deliberately never resent: a resend cannot tell "never arrived" from "arrived
 but the status write failed", and the second reading produces a duplicate trade
 alert. Query the table to see what was missed.
+
+### An order's state is unknown
+
+`EXECUTION_AMBIGUOUS` means StockBrain transmitted a request and did not receive
+a definitive response. The order may or may not exist.
+
+**Do not resend it, and do not place it manually**, until reconciliation reports
+an outcome. There is no resend path in the software — the order endpoint is
+non-idempotent, so a second POST creates a second position — and the same
+applies to a human with the app open.
+
+```bash
+curl -s localhost:8080/api/v1/execution/status | python3 -m json.tool
+curl -s localhost:8080/api/v1/proposals/<id>/execution | python3 -m json.tool
+```
+
+Reconciliation runs on a timer and reads two endpoints: pending orders and order
+history, filtered to the instrument. It concludes only when the evidence
+supports one:
+
+| Result | Meaning | Next |
+|---|---|---|
+| `ORDER_FOUND` | one API-initiated order matched exactly | the proposal follows the order |
+| `ORDER_NOT_PLACED` | both read paths answered, nothing matched, past the settle window | the proposal fails and releases its reservation |
+| `MULTIPLE_CANDIDATES` | two indistinguishable orders match | **stays ambiguous** — resolve in the Trading 212 app and record what you found |
+| `BROKER_UNAVAILABLE` / `INCONCLUSIVE` | a read failed, or it is too early to call absence | swept again |
+
+After `EXECUTION_RECONCILE_MAX_ATTEMPTS` inconclusive passes it stops being
+swept and waits for you. Ask for one more read with:
+
+```bash
+curl -sX POST localhost:8080/api/v1/execution/attempts/<id>/reconcile \
+     -H 'content-type: application/json' -d '{}'
+```
+
+That endpoint only reads the broker. It cannot send an order, and no endpoint
+can.
+
+### A broker order was refused
+
+`REJECTED_BY_BROKER` with HTTP 400 is a validation refusal — the quantity, the
+ticker or the account state was unacceptable, and no order exists. HTTP 403 is
+different and is a configuration fault: the API key lacks Trading 212's
+`orders:execute` scope. Grant it in the account's API settings; the proposal
+must be re-derived through the pipeline.
+
+### Turning execution on
+
+`T212_EXECUTION_ENABLED=false` by default. Nothing transmits until it is set,
+whatever else is configured. Check the posture before and after:
+
+```bash
+curl -s localhost:8080/api/v1/execution/status | python3 -m json.tool
+```
+
+`order_transmission_permitted` is "no blockers remain", so the flag and the
+`blockers` list can never disagree. Live transmission additionally requires all
+four live gates; demo requires only the switch, credentials and
+`EXECUTION_MODE=manual_approval`.
 
 ### LLM budget exhausted
 

@@ -27,6 +27,7 @@ from stockbrain.telegram.service import (
 )
 
 __all__ = [
+    "AMBIGUOUS_NOTICE",
     "PHASE_NOTICE",
     "control_line",
     "render_control",
@@ -48,8 +49,20 @@ __all__ = [
 #: has no broker order path at all in this phase, and a control interface that
 #: leaves that ambiguous is worse than one that does not exist.
 PHASE_NOTICE = (
-    "No broker order is sent. Authorization records that deterministic risk "
-    "allowed the trade and who signed it off; order transmission is Phase 8."
+    "Authorizing records that deterministic risk allowed the trade and who signed "
+    "it off. Transmission is a separate, separately gated step, and every order is "
+    "sent at most once."
+)
+
+#: Shown on any proposal whose order state is unknown. The wording matters more
+#: than most: the obvious reaction to "we do not know if the order arrived" is to
+#: send it again, and that is the one action that turns an unknown into a real,
+#: duplicated position.
+AMBIGUOUS_NOTICE = (
+    "ORDER STATE UNKNOWN. StockBrain sent a request and did not receive a definitive "
+    "response, so the order may or may not exist. It will NOT be retried. "
+    "Reconciliation is reading Trading 212 - do not resend and do not place the trade "
+    "manually until the outcome is known."
 )
 
 _NAME_LIMIT = 64
@@ -254,8 +267,17 @@ def render_proposal_detail(view: ProposalView, *, now: dt.datetime | None = None
         f"Quote age: {view.quote_age_ms} ms · session {esc(view.market_session or 'unknown')}",
         f"Research confidence: {esc(_confidence(view.research_confidence))}",
         f"Expires: {esc(stamp(view.expires_at))} ({esc(age(view.expires_at, now=now))})",
-        f"Broker order sent: {esc(_yes_no(view.broker_order_sent))}",
+        f"Broker: {esc(view.broker)} · environment {esc(view.broker_environment)}",
+        f"Broker order sent: {esc(_yes_no(view.broker_order_sent))}"
+        + (f" · order {code(view.broker_order_id)}" if view.broker_order_id else "")
+        + (f" · {esc(view.execution_outcome)}" if view.execution_outcome else ""),
     ]
+    if view.reconciliation_result:
+        lines.append(f"Reconciliation: {esc(view.reconciliation_result)}")
+    if view.execution_ambiguous:
+        lines.append("")
+        lines.append(bold("DO NOT RESEND"))
+        lines.append(esc(AMBIGUOUS_NOTICE))
     if view.thesis_summary:
         lines.append(f"\n{bold('Thesis')}\n{trim(view.thesis_summary, _TEXT_LIMIT)}")
     if view.risks:

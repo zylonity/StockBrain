@@ -727,3 +727,91 @@ export interface TelegramStatusResponse {
   group_chats_allowed: boolean;
   blockers: string[];
 }
+
+/**
+ * One broker transmission attempt, including the ones that never transmitted.
+ *
+ * `sent_to_broker` is written *before* the HTTP request rather than after the
+ * response, so it means "bytes may have left" — which is the fact that matters
+ * when a response never arrives. `true` with an `AMBIGUOUS` outcome is exactly
+ * the state in which no order may be sent again.
+ */
+export interface ExecutionAttempt {
+  id: string;
+  proposal_id: string;
+  attempt_number: number;
+  broker_environment: string;
+  outcome: string;
+  ambiguous: boolean;
+  sent_to_broker: boolean;
+  sent_at: string | null;
+  started_at: string;
+  preflight_at: string | null;
+  completed_at: string | null;
+  http_status: number | null;
+  broker_order_id: string | null;
+  request_fingerprint: string;
+  error: string | null;
+  error_category: string | null;
+  reconciled_at: string | null;
+  reconciliation_result: string | null;
+  reconciliation_attempts: number;
+  reconciliation_detail: Record<string, unknown>;
+  rate_limit: Record<string, unknown>;
+  execution_snapshot: Record<string, unknown>;
+  /** Always false for a transmitted attempt. There is no resend path. */
+  resend_permitted: boolean;
+}
+
+export interface BrokerOrderRecord {
+  broker: string;
+  broker_order_id: string;
+  broker_environment: string | null;
+  broker_ticker: string;
+  side: string;
+  order_type: string;
+  quantity: string;
+  filled_quantity: string | null;
+  filled_value: string | null;
+  currency: string | null;
+  broker_status: string | null;
+  initiated_from: string | null;
+  is_terminal: boolean;
+  discovered_by_reconciliation: boolean;
+  submitted_at: string | null;
+  last_synced_at: string;
+}
+
+export interface ProposalExecution {
+  proposal_id: string;
+  proposal_status: ProposalStatus;
+  broker_environment: string;
+  authorization_source: string | null;
+  execution_policy: string;
+  transmitted: boolean;
+  ambiguous: boolean;
+  reconciliation_required: boolean;
+  attempts: ExecutionAttempt[];
+  orders: BrokerOrderRecord[];
+  notice: string;
+}
+
+export interface ExecutionStatusSummary {
+  broker: string;
+  broker_environment: string;
+  order_transmission_permitted: boolean;
+  blockers: string[];
+  execution_mode: string;
+  execution_policy: string;
+  live_execution_permitted: boolean;
+  automated_trading_consent_confirmed: boolean;
+  trading_halted: boolean;
+  control_blockers: string[];
+  attempts_by_outcome: Record<string, number>;
+  ambiguous_attempts: number;
+  reconciliation_pending: number;
+  order_endpoint: string;
+  /** Reported rather than assumed: a client that forgot would build a retry. */
+  order_endpoint_idempotent: boolean;
+  notice: string;
+}

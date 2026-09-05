@@ -16,6 +16,7 @@ __all__ = [
     "ApprovalActionInvalid",
     "AuthorizationNotPermitted",
     "BrokerError",
+    "BrokerRejection",
     "ConfigurationError",
     "DefinitePreSendFailure",
     "ExecutionNotPermitted",
@@ -207,6 +208,21 @@ class TelegramSendError(ProviderError):
 
 class BrokerError(ProviderError):
     """The broker returned a definitive error response."""
+
+
+class BrokerRejection(BrokerError):
+    """The broker answered and refused.  Definitive: no order was created.
+
+    Distinct from :class:`DefinitePreSendFailure` (the request never left) and
+    from :class:`AmbiguousTransportFailure` (nobody knows).  A complete HTTP
+    response is proof that the broker decided, which is what makes this the one
+    failure the system may act on without reconciling first.
+    """
+
+    def __init__(self, message: str, *, status: int, category: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.category = category
 
 
 class DefinitePreSendFailure(BrokerError):

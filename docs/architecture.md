@@ -31,14 +31,19 @@ Firecrawl ──────┘                              │
                                                │
                                       fresh revalidation
                                                │
-                                  ONE non-retried broker POST   ← phase 8
+                                    final pre-send preflight
+                                               │
+                                  ONE non-retried broker POST
                                                │
                                   reconciliation + audit log
 ```
 
-Everything above the phase 8 line exists today. Authorization is *not*
-execution: an `APPROVED` proposal records that deterministic risk allowed the
-trade and which authority signed it off. No order-submission path exists yet.
+All of it exists today. Authorization is still *not* execution: an `APPROVED`
+proposal records that deterministic risk allowed the trade and which authority
+signed it off, and transmission is a separate step behind a separate gate. What
+Phase 8 added is the last two boxes — and the discipline that makes them
+survivable, because the broker's order endpoint is documented as
+**non-idempotent**.
 
 ## Module map
 
@@ -70,6 +75,7 @@ stockbrain/
   risk/              deterministic engine, rules, sizing, spread, versioned config
   proposals/         state machine, generation, authorization, expiry, quotes
   control/           durable pause and kill switch, persisted in app_settings
+  execution/         preflight, one transmission, classification, reconciliation
   telegram/          long polling, numeric-id auth, opaque tokens, two-stage confirm
   jobs/              (phase 2+)
 ```
@@ -113,6 +119,10 @@ schema therefore enforces:
 | `pg_advisory_xact_lock(broker, account)` | Exposure accounting is serialised across tasks, processes and restarts — which an in-memory lock is not. |
 | `uq_notifications_dedupe_key` — partial unique on `(dedupe_key) WHERE dedupe_key IS NOT NULL` | One notification per proposal transition, across a redelivered job, two workers and a restart. |
 | `approval_actions.consumed_at` under `SELECT … FOR UPDATE` | A callback token is redeemable at most once, whichever device taps first. |
+| `fk_execution_attempts_proposal_environment` — composite FK on `(proposal_id, broker_environment)` | An execution attempt always runs in its proposal's environment. A worker started under a different `T212_ENV` cannot write a row claiming otherwise. |
+| `ck_execution_attempts_ambiguous_matches_outcome` | The `ambiguous` flag and the `outcome` enum are two spellings of one fact and cannot disagree. |
+| `ck_execution_attempts_broker_order_requires_send` | A broker order id can only exist on an attempt that recorded a transmission. |
+| `ck_execution_attempts_broker_outcome_requires_send` | An outcome claiming the broker answered requires a recorded send. |
 
 `sent_to_broker` is set in the transaction *before* the HTTP request, not after
 the response. That ordering is what makes the index meaningful: it records
@@ -953,21 +963,327 @@ under `EXECUTION_POLICY=automatic`, and Telegram cannot convert an automatic
 proposal into a human-authorized one, because the check constraint that permits
 `SYSTEM_AUTOMATIC` only on an AUTOMATIC proposal also refuses the reverse.
 
-### The Phase 8 execution boundary
+## Phase 8 Trading 212 demo execution
 
-Phase 6 stops at authorization. What phase 8 must preserve when it adds
-transmission:
+### The ordering that is the whole argument
 
-* `uq_execution_attempts_sent_once`, and setting `sent_to_broker` *before* the
-  HTTP request;
-* re-running the full authorization-time revalidation immediately before the
-  POST, against a snapshot no older than the freshness limits;
-* the `broker_environment` recorded on the proposal, so a demo proposal cannot
-  execute against live;
-* `EXECUTION_AMBIGUOUS` and no blind retry;
-* `execution_policy` and `authorization_source` as the record of *who* permitted
-  the trade, and the four live-execution gates as the separate record of whether
-  transmission is permitted at all;
-* the durable kill switch and pause, checked again at *send* time and not only
-  at authorization — an `APPROVED` proposal that was authorized before an
-  emergency stop must not transmit after one.
+Trading 212 documents the market-order endpoint as **not idempotent**: *"Sending
+the same request multiple times may result in duplicate orders."* There is no
+idempotency key, no client-supplied reference, and no request field that would
+let the broker collapse a duplicate. Every design choice below follows from
+taking that one sentence seriously.
+
+```
+1. look for an already-transmitted attempt   → if one exists, reconcile, never send
+2. preflight                                  (network reads, no locks held)
+3. take a local rate-limit token               (before the send transaction)
+4. THE SEND TRANSACTION
+     lock the proposal row · re-check version, status, expiry
+     re-read the kill switch FROM THE DATABASE
+     insert the attempt with sent_to_broker = TRUE, sent_at = now
+     move the proposal to EXECUTING
+     COMMIT
+5. POST exactly once                           (no retry, at any layer, ever)
+6. classify and persist
+```
+
+**Step 4 commits "bytes may have left" before step 5 makes it possible.** That
+ordering is deliberate and it is the point: if the process dies anywhere between
+the commit and the response, the next worker finds a transmitted attempt and
+reconciles rather than resending. `uq_execution_attempts_sent_once` — a partial
+unique index on `(proposal_id) WHERE sent_to_broker` — then makes a second
+transmission impossible even against a bug that bypassed every service check.
+
+The cost is paid honestly: a *provable* pre-send failure has to be retracted,
+which happens in exactly one place and is discussed below.
+
+### The state split
+
+Two questions, two places to answer them, because collapsing them is how a
+system decides to resend an order that already exists:
+
+| Question | Answered by |
+|---|---|
+| Where is this proposal in its life? | `trade_proposals.status` |
+| What happened to this transmission? | `execution_attempts.outcome` |
+
+```
+APPROVED ──→ EXECUTING ──→ EXECUTED          (broker reports FILLED)
+   ↑             ├────────→ FAILED            (broker refused, or ended the order)
+   │             └────────→ EXECUTION_AMBIGUOUS
+   └──────────────────────  (proven pre-send failure only)
+```
+
+`ExecutionOutcome` carries the finer detail — `PENDING`,
+`FAILED_BEFORE_SEND`, `SUBMITTED`, `REJECTED_BY_BROKER`, `AMBIGUOUS`,
+`RECONCILED_FILLED`, `RECONCILED_NOT_PLACED` — and the four questions it keeps
+apart are *did we try*, *did the bytes leave*, *did the broker answer*, and *do
+we know*. No new proposal statuses were added; the existing vocabulary already
+said everything a proposal needs to say.
+
+An acknowledged-but-unfilled order leaves the proposal `EXECUTING`, which keeps
+its exposure reserved. An unfilled order is committed cash that the account
+snapshot cannot see yet.
+
+### Why `EXECUTING → APPROVED` now exists
+
+Phase 6 wrote that `EXECUTING` never returns to `APPROVED`. Phase 8 found that
+this contradicted `ExecutionOutcome`, which documents `FAILED_BEFORE_SEND` as
+"the only outcome from which a *new* attempt may be created". With no way back,
+a DNS failure permanently killed an authorized proposal the broker had never
+heard of.
+
+The transition therefore exists, for exactly one situation, and its narrowness
+is enforced above the state machine. `Trading212OrderClient` raises
+`DefinitePreSendFailure` only for httpx exceptions that **cannot occur once a
+request line has been written** — `ConnectError`, `ConnectTimeout`,
+`PoolTimeout`, `ProxyError`, `LocalProtocolError`, `UnsupportedProtocol`,
+`InvalidURL`. Every other transport failure (`WriteTimeout`, `WriteError`,
+`ReadTimeout`, `ReadError`, `RemoteProtocolError`, `CloseError`) is
+`AmbiguousTransportFailure`, because "the connection broke" and "the connection
+broke after the broker read the order" are indistinguishable from this side of
+the socket.
+
+On that proof, and only there, `sent_to_broker` is set back to `false` and the
+proposal returns to `APPROVED`. That is not a weakening of
+`uq_execution_attempts_sent_once`: the flag records "bytes may have left", and
+here there is proof they did not, so retracting it is what keeps the index
+meaningful rather than merely obstructive. Tests assert that exactly one module
+names `PRESEND_RECOVERY_TARGET` and exactly one line sets the flag false.
+
+### Classifying the outcome
+
+A complete HTTP response is proof the broker decided, so it is definitive.
+Anything less is not:
+
+| Result | Outcome | Proposal | Reservation |
+|---|---|---|---|
+| 2xx, parseable | `SUBMITTED` | `EXECUTING`, or `EXECUTED` when filled | held until filled |
+| 400 / 401 / 403 / 404 / 422 | `REJECTED_BY_BROKER` | `FAILED` | **released** — provably nothing exists |
+| Proven pre-send transport failure | `FAILED_BEFORE_SEND` | back to `APPROVED` | held |
+| 408 / 429 / 5xx / undocumented status | `AMBIGUOUS` | `EXECUTION_AMBIGUOUS` | **held** |
+| Any other transport failure | `AMBIGUOUS` | `EXECUTION_AMBIGUOUS` | held |
+| **2xx with an unparseable body** | `AMBIGUOUS` | `EXECUTION_AMBIGUOUS` | held |
+
+The last row is the most dangerous shape there is: the broker accepted the order
+and StockBrain cannot read its id. Treating it as a failure would release the
+reservation for a position that exists, so it reconciles.
+
+HTTP 429 is treated as *unknown* rather than as a refusal. Trading 212 does not
+document whether its limiter runs before or after order acceptance, and the
+conservative reading is the only one that cannot lose an order. In practice the
+local bucket (49/minute against a documented 50, because limits are per
+*account* rather than per key) should mean it never happens.
+
+### The immutable execution snapshot
+
+Written once, immediately before transmission, never updated:
+the proposal, both environments plus the provider's, the listing, side, quantity
+and signed quantity, the reference price and notional, the authorization source
+/ actor / timestamp, the execution policy, the risk policy version and snapshot
+hash, the full quote (bid, ask, mid, spread, spread bps, age, source, session),
+the account snapshot, the position, the kill/pause state, every transmission
+gate, and the request fingerprint.
+
+Kept in a JSONB column on the attempt rather than in a table of its own because
+it is strictly one-to-one with the attempt and never queried independently — and
+kept **separate from the proposal's own columns** because a proposal records the
+decision that was made. Overwriting it with the newer world the order was sent
+into would destroy the only record of what the operator actually approved.
+
+### The request fingerprint is not an idempotency key
+
+SHA-256 over the trade's identity: proposal, environment, listing, order type,
+side, quantity, signed quantity, session flag, and a scheme version. Money and
+quantities are decimal *strings*, so the same trade hashes the same on any
+machine. Deliberately no clock and no attempt number — two attempts at the same
+trade *should* fingerprint the same, because that collision is what an operator
+needs to be able to see.
+
+It exists for audit, for reconciliation evidence and for regression detection.
+Nothing may read a matching fingerprint as permission to resend; the module says
+so and a test asserts that it says so.
+
+### Final pre-send revalidation
+
+An authorization is a statement about the moment it was given; an order is sent
+into a later one. So `ExecutionPreflight` re-runs everything, and **refusal is
+the default**:
+
+* **Deterministic risk** comes from `ProposalService.revalidate` — the same
+  engine and the same rule functions that guarded the authorization. There is no
+  second risk implementation, and a test asserts the execution package imports
+  none of `stockbrain.risk`.
+* **Permission and state** are the checks that only exist because transmission
+  exists: three-way environment agreement, the transmission gates, the durable
+  kill switch and pause, the send-time automation consent, `APPROVED` status,
+  authorization provenance, the TTL, and the absence of an earlier transmitted
+  attempt.
+* **Position availability for a sale** is named separately, because selling what
+  a pie holds is its own hazard: Phase 6 measured
+  `quantityAvailableForTrading` differing from `quantity` on 13 of 14 real
+  positions, and the pie can move between authorization and transmission.
+
+A refusal also says whether the proposal **survives** it, which is the
+distinction that decides whether an outage is destructive or merely degrading:
+
+| Blocked by | Meaning | Proposal |
+|---|---|---|
+| `quote_available`, `account_state_available` | an input is missing, so every downstream rule blocks mechanically and the verdict says nothing about the trade | survives, deferred |
+| `quote_freshness`, `account_state_freshness` *alone* | a provider is behind | survives, deferred |
+| drift, spread, session, any cap, position, identity, TTL | a statement *about the trade* | `INVALIDATED` |
+| a permission or state gate (kill switch, master switch, environment) | about the deployment or the moment | survives |
+
+Engaging a kill switch must not silently destroy every authorized proposal it
+stops, and failing every trade whenever a market-data provider blinks would make
+an outage worse than the outage.
+
+### Environment isolation
+
+A proposal's `broker_environment` is recorded at creation and never changes.
+Before any socket opens, **three independent facts must agree**: what the
+proposal was created under, what the process is configured for, and what the
+constructed provider actually points at. The adapter re-checks the third against
+the command itself, so a mis-wired client refuses rather than transmits.
+
+Beneath all of that,
+`fk_execution_attempts_proposal_environment` — a composite foreign key into
+`trade_proposals (id, broker_environment)` — makes it a *database* fact: a
+worker that came up under a different `T212_ENV` cannot write an attempt row
+that claims otherwise, whatever its configuration believes.
+
+### Manual and automatic converge
+
+Both reach `APPROVED` and both are transmitted by the same service; they differ
+only in recorded provenance. There is no second broker path that could diverge.
+
+Automatic execution against **live** additionally re-checks
+`T212_AUTOMATED_TRADING_CONSENT_CONFIRMED` at *send* time and not only at
+authorization: the operator's relationship with their broker can change between
+the two, and API Terms clause 4.2(a) is about the moment an order is determined
+and sent.
+
+Transmission has its own gate, deliberately a superset of the live one:
+
+| Setting | Gates |
+|---|---|
+| `T212_EXECUTION_ENABLED` | any transmission at all, demo included — default **false**, so deploying Phase 8 does not start sending |
+| `EXECUTION_MODE=manual_approval` | `research_only` forbids transmission entirely |
+| credentials present | including the `orders:execute` scope, which the broker enforces with HTTP 403 |
+| the four live gates | added on top when `T212_ENV=live` |
+
+`order_transmission_permitted` is defined as "no blockers remain", so the flag
+and the explanation can never disagree.
+
+### Kill switch and pause at send time
+
+Checked three times, and the last one is the one that matters: the state is
+re-read **from PostgreSQL inside the transaction that would write
+`sent_to_broker`**. An operator who hits the switch while the preflight is
+fetching a quote still stops that order.
+
+If the switch arrives *after* transmission, nothing is cancelled. Trading 212
+documents `DELETE /equity/orders/{id}`; StockBrain does not call it and has no
+cancel path at all. Cancelling races a fill, its failure is a second unknown on
+top of the first, and a kill switch that cancelled would be making a trading
+decision rather than stopping one. No automatic liquidation, in any state.
+
+### Reconciliation
+
+Two honest ways out of "the order may or may not exist" — find it, or prove its
+absence — and a third answer that matters just as much: **inconclusive**.
+
+Matching is deliberately narrow, because the API supports no client reference:
+
+* `initiatedFrom == "API"` — the strongest evidence available, and the reason a
+  buy the operator placed on their phone can never be attributed to StockBrain;
+* the exact broker ticker;
+* the exact **signed** quantity as a `Decimal` — a buy for 3 and a sell for 3 are
+  different orders;
+* `type == "MARKET"`;
+* `createdAt` inside a bounded window around `sent_at`;
+* and an order id not already mirrored against another attempt.
+
+More than one survivor means `MULTIPLE_CANDIDATES` and the attempt stays
+ambiguous. Two identical API-initiated market orders on the same listing in the
+same window are genuinely indistinguishable through this API; the limitation is
+documented rather than papered over.
+
+**Absence is only evidence under two conditions**: both read paths
+(`GET /equity/orders` and `GET /equity/history/orders`) answered, *and* the
+attempt is older than `EXECUTION_RECONCILE_MIN_AGE_SECONDS`. An order that
+exists but has not yet propagated would otherwise be read as proof of its own
+absence — and that conclusion releases a reservation and fails a proposal, so it
+has to be earned. After `EXECUTION_RECONCILE_MAX_ATTEMPTS` inconclusive passes
+the attempt stops being swept and waits for a person.
+
+Nothing in the module can transmit. A test asserts it never names `submit`.
+
+### Crash boundaries
+
+| Crash point | State found afterwards | What happens |
+|---|---|---|
+| A — before the send flag | no attempt, proposal `APPROVED` | the sweep re-drives it; nothing was sent |
+| B — after the flag commits, before the request | attempt `sent_to_broker`, `PENDING` | **reconcile**, never resend |
+| C — during the send | same as B | reconcile |
+| D — broker accepted, response not persisted | same as B | reconcile; the order is found by id or by match |
+| E — response received, final commit lost | same as B | reconcile; an already-mirrored order is not double-claimed |
+
+Boundary B is the one the ordering exists for, and the one that costs something:
+the outcome is unknown even though nothing was sent. `recover_incomplete` sweeps
+attempts stranded in `PENDING` past twice the order timeout and marks them
+ambiguous — because a worker can die without the process doing so.
+
+### The API and the GUI
+
+Read-only, apart from one mutating route, and that route is
+**reconciliation** — a read of the broker, safe to repeat.
+
+There is no resend endpoint and there must not be one: a retry button on an
+ambiguous attempt is a button that creates a second real position. Tests assert
+that the served OpenAPI schema contains no path matching `retry`, `resend`,
+`resubmit`, `place-order` or `submit-order`, and that the only mutating
+`/execution` route is the reconciliation POST. Every mutating request body in the
+system accepts at most a free-text reason and a boolean, with `extra="forbid"`.
+
+The GUI shows the environment as a badge (live reads "LIVE — REAL MONEY"), the
+attempt table with its outcome and error category, the broker-order mirror with
+`initiated_from` and whether reconciliation discovered it, and — for an ambiguous
+attempt — an unmissable **DO NOT RESEND** banner explaining that the order may
+already exist. Telegram announces submitted, rejected, failed, ambiguous,
+reconciled and confirmed through the existing notification architecture; the
+ambiguous one is `CRITICAL` and shouts the same warning. No Telegram handler
+gained broker logic, and a test asserts the package references no execution
+module.
+
+### What Phase 8 deliberately did not do
+
+No cancel, amend, modify or replace path — the capability audit still finds
+none, and `DELETE /equity/orders/{id}` is never called. No limit, stop or
+stop-limit orders: each needs its own price revalidation and its own rate limit,
+and shipping them alongside the first mutation this system has ever performed
+would be two experiments at once. No generic retry, no retry middleware, and
+exactly one HTTP `POST` to a broker anywhere in the codebase. No real-money
+order: the single live verification was one share on the paper account.
+
+### The Phase 9 live-readiness boundary
+
+What must be true before `T212_ENV=live` is set deliberately:
+
+* the **50 pending orders per ticker per account** functional limit, which
+  nothing enforces yet and which only matters once orders actually queue;
+* IP-restricted API credentials, which Trading 212 supports from account
+  settings;
+* the `orders:execute` scope granted knowingly on a live key, and the read-only
+  key kept for everything else;
+* written consent recorded in `T212_WRITTEN_CONSENT_CONFIRMED`, and
+  `T212_AUTOMATED_TRADING_CONSENT_CONFIRMED` only if automatic authorization is
+  actually wanted live;
+* the currency gap resolved: the account is GBP and the priced universe is USD,
+  so `currency_alignment` blocks every proposal this account can price. Either a
+  GBP-denominated listing Alpaca can quote, or a verified FX source, or an
+  accepted limitation — never an inferred rate;
+* one tiny manual live order, placed by a human in the app, before any automated
+  one.
+
+No code flips from demo to live on its own, and none should be added that could.

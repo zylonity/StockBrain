@@ -938,3 +938,176 @@ for `ON CONFLICT` when the predicate is restated in the statement. Without
 exclusion constraint matching the ON CONFLICT specification"* — at the moment a
 proposal needed to be announced. Any future `ON CONFLICT` against a partial
 index in this codebase needs the same treatment.
+
+---
+
+## Phase 8 verified Trading 212 execution surface — 2026-09-05
+
+Checked against the current published documentation before any request schema
+was written, then measured against the **demo** environment with one real order.
+
+* One Markdown document: <https://docs.trading212.com/api.md>
+* Per-operation pages: `.../api/orders/placemarketorder.md`, `.../api/orders/orders.md`,
+  `.../api/orders/orderbyid.md`, `.../api/historical-events/orders_1.md`
+* Machine-readable bundle: <https://docs.trading212.com/_bundle/api.yaml>
+
+### The market-order endpoint
+
+```
+POST /api/v0/equity/orders/market      operationId: placeMarketOrder
+request : {"ticker": "AAPL_US_EQ", "quantity": 0.1, "extendedHours": false}
+rate    : 50 req / 1m0s
+```
+
+`MarketRequest` declares **no required fields** and defaults `extendedHours` to
+`false`. `quantity` is a JSON `number` and `Order.id` is `int64`.
+
+Documented failure statuses, with the wording from the OpenAPI bundle — this is
+the whole classification table:
+
+| Status | Documented meaning | StockBrain's reading |
+|---|---|---|
+| 200 | OK | `CONFIRMED_SUCCESS` |
+| 400 | **Failed validation** | definite rejection: no order exists |
+| 401 | **Bad API key** | definite rejection |
+| 403 | **Scope( orders:execute ) missing for API key** | definite rejection |
+| 408 | **Timed-out** | **ambiguous** — the server timed out, before or after creating the order is unknown |
+| 429 | Limited: 50 / 1m0s | **ambiguous** — the docs do not say whether the limiter runs before or after acceptance |
+| *anything else, 5xx included* | not documented | **ambiguous** by default |
+
+Two of these are new information and both are load-bearing:
+
+* **HTTP 403 means the API key lacks an explicit `orders:execute` scope.** A
+  read-only key authenticates perfectly against every GET and then refuses every
+  order. It is a configuration fault, not a market one, and it is recorded as
+  `BROKER_AUTH_REJECTED` rather than as a transient failure.
+* **No 5xx is documented for this endpoint at all**, so an unknown status cannot
+  be mapped onto a known meaning. StockBrain treats every undocumented status as
+  ambiguous, which is the only direction that cannot lose an order.
+
+**Non-idempotency, verbatim:** *"In this beta version, this endpoint is not
+idempotent. Sending the same request multiple times may result in duplicate
+orders."* There is **no idempotency key, no client-supplied reference and no
+request field of any kind** that would let the broker collapse a duplicate. The
+request fingerprint StockBrain computes is therefore an audit hash and nothing
+more; a test asserts the module says so.
+
+### The read-only endpoints reconciliation uses
+
+| Endpoint | Rate limit | Notes |
+|---|---|---|
+| `GET /equity/orders` | **1 req / 5s** | pending (active) orders only; returns a bare array |
+| `GET /equity/orders/{id}` | **1 req / 1s** | one pending order; 404s once it fills or cancels |
+| `GET /equity/history/orders` | **6 req / 1m0s** | cursor paginated, `items[]` + `nextPagePath`, optional **`ticker` filter**, `limit` max 50 |
+
+The spec documented none of these limits and none of the pagination. Two
+consequences:
+
+* **The history endpoint takes a `ticker` filter**, so reconciliation asks about
+  one instrument rather than paging the account's whole history.
+* **Its rows are wrapped**: each item is `{fill: {...}, order: {...}}`, not a
+  bare order, so a client written from the pending-order shape reads nothing.
+
+### `initiatedFrom` is the strongest matching evidence this API offers
+
+The order object carries `initiatedFrom`, enumerated
+`API | IOS | ANDROID | WEB | SYSTEM | AUTOINVEST | INSTRUMENT_AUTOINVEST`.
+An order StockBrain placed reads `API`; an order the operator placed on their
+phone does not. Absent a client reference, this is what stops a manual trade in
+the Trading 212 app being attributed to an ambiguous StockBrain attempt — and it
+is why reconciliation can ever conclude "no order was placed" at all.
+
+The response also nests an `instrument` object (`{ticker, name, isin, currency}`)
+and returns `side` (`BUY`/`SELL`) explicitly, so the sign convention can be
+verified as round-tripping rather than assumed.
+
+### Rate limiting is per *account*
+
+*"All rate limits are applied on a per-account basis, regardless of which API
+key is used or which IP address the request originates from."* A client-side
+token bucket is therefore a courtesy rather than a guarantee: another client of
+the same account consumes the same window. StockBrain's order bucket is set to
+**49/minute against the documented 50** for that reason, and the limiter is
+consulted *before* the transaction that records the send, so a denial stays
+provably pre-send.
+
+The limiter is a burst window, not a spacing rule: *"you could make a burst of
+all 50 requests in the first 5 seconds"*. Headers are `x-ratelimit-limit`,
+`-period` (**duration in seconds**), `-remaining`, `-reset` (**a Unix
+timestamp**) and `-used`.
+
+Also confirmed unchanged: base URLs `https://demo.trading212.com/api/v0` and
+`https://live.trading212.com/api/v0`; HTTP Basic with the API key as username
+and the secret as password; **negative quantity sells**, called "a core
+convention of the API"; orders execute only in the primary account currency;
+Invest and Stocks ISA only; the API is beta; **50 pending orders per ticker per
+account** as a functional limit (still unenforced anywhere — Phase 9 should).
+
+### Live demo verification — 2026-09-05
+
+**The Trading 212 credentials now authenticate against demo.** The Phase 4–7
+handoffs recorded a live-only key; a Practice/Demo key is evidently configured
+now, and every finding below is from `demo.trading212.com`. **No real-money
+order was placed at any point.** Reproduce with
+`pytest -m live -s tests/integration/test_phase8_live.py`.
+
+Read-only first, two GETs:
+
+```
+GET /equity/orders          authenticated, 0 pending
+GET /equity/history/orders  authenticated, 0 items
+rate-limit headers          all five, on both endpoints
+demo account               GBP, funded, 0 open positions
+```
+
+Then **one** market order, behind two further explicit switches
+(`T212_DEMO_ORDER=yes` and `T212_DEMO_ORDER_TICKER`, because the test never picks
+an instrument), for 1 share of `AAPL_US_EQ`:
+
+| Observation | Result |
+|---|---|
+| HTTP status | **200** |
+| `id` returned | yes |
+| `ticker` echoed unchanged | yes |
+| `side` | `BUY` (derived by the broker from the positive quantity) |
+| `status` | **`NEW`** — the market was closed, so the order queued as documented |
+| `type` | `MARKET` |
+| `strategy` | `QUANTITY` |
+| **`timeInForce`** | **absent** |
+| `initiatedFrom` | **`API`** |
+| `instrument` object present | yes |
+| `quantity` arrived as `Decimal` | yes, positive |
+| Rate-limit headers | all five |
+| Readable back by `GET /equity/orders/{id}` | **yes** |
+
+Two findings:
+
+* **`timeInForce` is documented as a response field and was not returned** for a
+  market order. Every optional field in `T212Order` is therefore genuinely
+  optional; a client that required the documented set would have failed on the
+  first real order it placed.
+* **A closed market queues the order as `NEW` rather than refusing it.** That is
+  the documented behaviour and it is the *better* case to have measured, because
+  a queued order stays visible in `GET /equity/orders` — which is exactly the
+  path reconciliation reads for a known order id, and it answered.
+
+The order was **not** cancelled afterwards: StockBrain has no cancel path and
+the test does not add one, so a small demo position exists on the paper account.
+
+**The demo order was placed through the adapter directly, not through the
+proposal pipeline**, and deliberately so: the account is GBP-denominated and
+`AAPL_US_EQ` is USD, so the Phase 6 `currency_alignment` rule blocks the entire
+priced universe on this account. A pipeline run would have refused before
+reaching the broker and proved nothing about the adapter. The part only a live
+call can verify — request shape, response shape, sign convention, rate-limit
+headers, read-back — is what was verified.
+
+### Bug found by the Phase 8 tests
+
+The metadata naming convention (`ck_%(table_name)s_%(constraint_name)s`) is
+applied by `op.drop_constraint` as well as by `create_check_constraint`, so
+passing an already-rendered name in a downgrade prefixes it twice and then
+truncates it to PostgreSQL's 63-character limit with a hash suffix — producing
+`ck_execution_attempts_ck_execution_attempts_broker_outc_db79`, a name no
+migration can drop. This is Phase 6's bug #13 wearing a different hat. Drop
+constraints by their **bare** names.

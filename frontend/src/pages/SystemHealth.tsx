@@ -14,6 +14,7 @@ export function SystemHealth() {
   const providers = usePolling(api.providers, 15_000);
   const control = usePolling(api.controlState, 15_000);
   const telegram = usePolling(api.telegramStatus, 30_000);
+  const execution = usePolling(api.executionSummary, 20_000);
   const [busy, setBusy] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
 
@@ -103,6 +104,74 @@ export function SystemHealth() {
           </span>
         </div>
         {controlError && <div className="error">{controlError}</div>}
+      </div>
+
+      <div className="card">
+        <h2>Broker execution</h2>
+        {execution.data ? (
+          <table>
+            <tbody>
+              <tr>
+                <td>Environment</td>
+                <td>
+                  <span
+                    className={`pill ${
+                      execution.data.broker_environment === "live"
+                        ? "pill-down"
+                        : "pill-disabled"
+                    }`}
+                  >
+                    {execution.data.broker_environment === "live"
+                      ? "LIVE — REAL MONEY"
+                      : `${execution.data.broker_environment.toUpperCase()} (paper)`}
+                  </span>
+                </td>
+              </tr>
+              <tr>
+                <td>Transmission permitted</td>
+                <td className="mono">
+                  {execution.data.order_transmission_permitted ? "yes" : "no"}
+                </td>
+              </tr>
+              {execution.data.blockers.length > 0 && (
+                <tr>
+                  <td>Blockers</td>
+                  <td className="detail">{execution.data.blockers.join("; ")}</td>
+                </tr>
+              )}
+              <tr>
+                <td>Order endpoint</td>
+                <td className="mono detail">
+                  {execution.data.order_endpoint} · idempotent:{" "}
+                  {execution.data.order_endpoint_idempotent ? "yes" : "NO"}
+                </td>
+              </tr>
+              <tr>
+                <td>Attempts</td>
+                <td className="mono">
+                  {Object.entries(execution.data.attempts_by_outcome)
+                    .map(([outcome, count]) => `${outcome} ${count}`)
+                    .join(" · ") || "none"}
+                </td>
+              </tr>
+              <tr>
+                <td>Awaiting reconciliation</td>
+                <td className="mono">
+                  {execution.data.reconciliation_pending}
+                  {execution.data.ambiguous_attempts > 0 && (
+                    <span className="error">
+                      {" "}
+                      — {execution.data.ambiguous_attempts} ambiguous; DO NOT RESEND
+                    </span>
+                  )}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        ) : (
+          <p className="muted">Loading…</p>
+        )}
+        <p className="detail">{execution.data?.notice}</p>
       </div>
 
       <div className="card">

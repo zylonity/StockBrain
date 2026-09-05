@@ -26,6 +26,7 @@ __all__ = [
     "ControlFlag",
     "EventSourceRelationship",
     "EventStatus",
+    "ExecutionFailure",
     "ExecutionOutcome",
     "ExecutionPolicy",
     "ImpactDirection",
@@ -42,6 +43,7 @@ __all__ = [
     "ProposalStatus",
     "ProviderStatus",
     "ReactionStatus",
+    "ReconciliationResult",
     "ResearchStatus",
     "ResolutionMethod",
     "ResolutionStatus",
@@ -300,15 +302,102 @@ class ExecutionOutcome(StrEnum):
     ``FAILED_BEFORE_SEND`` is the only outcome from which a *new* attempt may be
     created, because it proves no bytes reached the broker.  ``AMBIGUOUS`` must
     be resolved by reconciliation or by the operator, never by resending.
+
+    These four questions are all different and are kept apart on purpose:
+    *did we try* (``PENDING``), *did the bytes leave* (``FAILED_BEFORE_SEND``),
+    *did the broker answer* (``SUBMITTED`` / ``REJECTED_BY_BROKER``), and *do we
+    know* (``AMBIGUOUS``).  Collapsing any two of them is how a system decides
+    to resend an order that already exists.
     """
 
     PENDING = "PENDING"
+    """An attempt exists and its result is not yet recorded.  Found in this
+    state after a crash, it is treated as ``AMBIGUOUS``, never as "not sent"."""
+
     FAILED_BEFORE_SEND = "FAILED_BEFORE_SEND"
+    """Proof that nothing reached the broker: a refused preflight, a local rate
+    limiter denial, a DNS or connect failure.  The only outcome that permits
+    another attempt."""
+
     SUBMITTED = "SUBMITTED"
     REJECTED_BY_BROKER = "REJECTED_BY_BROKER"
     AMBIGUOUS = "AMBIGUOUS"
     RECONCILED_FILLED = "RECONCILED_FILLED"
     RECONCILED_NOT_PLACED = "RECONCILED_NOT_PLACED"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the attempt still needs work from a sweep or an operator."""
+        return self in {
+            ExecutionOutcome.FAILED_BEFORE_SEND,
+            ExecutionOutcome.SUBMITTED,
+            ExecutionOutcome.REJECTED_BY_BROKER,
+            ExecutionOutcome.RECONCILED_FILLED,
+            ExecutionOutcome.RECONCILED_NOT_PLACED,
+        }
+
+
+class ExecutionFailure(StrEnum):
+    """Why a transmission attempt did not end in a confirmed broker order.
+
+    Recorded as a *category* rather than as provider text, because a
+    python-telegram-bot- or httpx-shaped message can carry a URL, and a Trading
+    212 URL carries nothing secret but a provider body can echo a request.  The
+    category is what an operator triages on and what a metric aggregates.
+    """
+
+    PREFLIGHT_REFUSED = "PREFLIGHT_REFUSED"
+    """A pre-send check said no.  Nothing was transmitted."""
+
+    RATE_LIMITED_LOCALLY = "RATE_LIMITED_LOCALLY"
+    """StockBrain's own token bucket declined before any socket was opened."""
+
+    CONNECT_FAILED = "CONNECT_FAILED"
+    """DNS, TLS or TCP failed before a request line was written."""
+
+    BROKER_REJECTED = "BROKER_REJECTED"
+    """HTTP 400: the broker validated the request and refused it."""
+
+    BROKER_AUTH_REJECTED = "BROKER_AUTH_REJECTED"
+    """HTTP 401/403.  403 specifically means the API key lacks the documented
+    ``orders:execute`` scope, which is a configuration fault, not a market one."""
+
+    BROKER_RATE_LIMITED = "BROKER_RATE_LIMITED"
+    """HTTP 429.  Treated as ambiguous: Trading 212 does not document whether
+    the limiter runs before or after order acceptance."""
+
+    BROKER_TIMEOUT = "BROKER_TIMEOUT"
+    """HTTP 408, which the broker documents for this endpoint.  The server timed
+    out; whether it timed out before or after creating the order is unknown."""
+
+    TRANSPORT_AMBIGUOUS = "TRANSPORT_AMBIGUOUS"
+    """The request was written but no complete response arrived."""
+
+    UNREADABLE_SUCCESS = "UNREADABLE_SUCCESS"
+    """The broker answered 2xx with a body StockBrain could not parse.  An order
+    almost certainly exists and its id is unknown -- the most dangerous shape of
+    all, and the reason a malformed success is ambiguous rather than failed."""
+
+    UNEXPECTED_STATUS = "UNEXPECTED_STATUS"
+    """A status the documentation does not list.  Ambiguous by default."""
+
+    CRASH_RECOVERY = "CRASH_RECOVERY"
+    """The process died between recording the send and recording the result."""
+
+
+class ReconciliationResult(StrEnum):
+    """What a reconciliation pass concluded.
+
+    ``INCONCLUSIVE`` is a first-class answer.  The alternative -- guessing --
+    means either resending an order that exists or releasing the reservation for
+    one that does.
+    """
+
+    ORDER_FOUND = "ORDER_FOUND"
+    ORDER_NOT_PLACED = "ORDER_NOT_PLACED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    MULTIPLE_CANDIDATES = "MULTIPLE_CANDIDATES"
+    BROKER_UNAVAILABLE = "BROKER_UNAVAILABLE"
 
 
 class ActorType(StrEnum):
@@ -340,6 +429,8 @@ class JobType(StrEnum):
     known set and is used by the dispatcher."""
 
     CLASSIFY_EVENT = "CLASSIFY_EVENT"
+    EXECUTE_PROPOSAL = "EXECUTE_PROPOSAL"
+    RECONCILE_EXECUTION = "RECONCILE_EXECUTION"
     RESOLVE_CANDIDATES = "RESOLVE_CANDIDATES"
     RUN_RESEARCH = "RUN_RESEARCH"
     GENERATE_PROPOSAL = "GENERATE_PROPOSAL"
@@ -389,6 +480,25 @@ class NotificationEvent(StrEnum):
     PROPOSAL_EXPIRED = "PROPOSAL_EXPIRED"
     AUTHORIZATION_REFUSED = "AUTHORIZATION_REFUSED"
     """A fresh risk revalidation refused an authorization somebody asked for."""
+
+    EXECUTION_SUBMITTED = "EXECUTION_SUBMITTED"
+    """An order reached the broker and the broker acknowledged it."""
+
+    EXECUTION_REJECTED = "EXECUTION_REJECTED"
+    """The broker answered and refused.  Definitive: no order exists."""
+
+    EXECUTION_FAILED = "EXECUTION_FAILED"
+    """The attempt failed before anything could reach the broker."""
+
+    EXECUTION_AMBIGUOUS = "EXECUTION_AMBIGUOUS"
+    """CRITICAL. The order may or may not exist. Reconciliation decides, and
+    nothing may be resent until it does."""
+
+    EXECUTION_RECONCILED = "EXECUTION_RECONCILED"
+    """Reconciliation resolved an ambiguous attempt one way or the other."""
+
+    EXECUTION_CONFIRMED = "EXECUTION_CONFIRMED"
+    """The broker reports the order filled.  The position is now real."""
 
 
 class ControlFlag(StrEnum):

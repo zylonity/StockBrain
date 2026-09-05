@@ -117,7 +117,25 @@ class BrokerOrder(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     currency: Mapped[str | None] = mapped_column(sa.String(3))
 
     broker_status: Mapped[str | None] = mapped_column(sa.Text)
-    """Verbatim broker status string; not coerced into a StockBrain enum."""
+    """Verbatim broker status string; not coerced into a StockBrain enum.
+
+    Trading 212 documents LOCAL, UNCONFIRMED, CONFIRMED, NEW, CANCELLING,
+    CANCELLED, PARTIALLY_FILLED, FILLED, REJECTED, REPLACING and REPLACED. The
+    set is the broker's to change, and mapping it onto a StockBrain enum would
+    turn an unfamiliar value into either a crash or a wrong guess."""
+
+    broker_environment: Mapped[str | None] = mapped_column(sa.Text)
+    """Which environment this order exists in. A demo order and a live order can
+    share an id space, so a mirror without this is a mirror of nothing in
+    particular."""
+
+    initiated_from: Mapped[str | None] = mapped_column(sa.Text)
+    """Trading 212's own account of who created the order: API, IOS, ANDROID,
+    WEB, SYSTEM, AUTOINVEST or INSTRUMENT_AUTOINVEST.
+
+    Load-bearing for reconciliation. An order StockBrain placed reads ``API``,
+    so an order the operator placed on their phone can be excluded from
+    candidate matching rather than being attributed to an ambiguous attempt."""
 
     is_terminal: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
     discovered_by_reconciliation: Mapped[bool] = mapped_column(

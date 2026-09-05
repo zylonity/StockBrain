@@ -5,6 +5,7 @@ import { ApiError, api } from "../api/client";
 import type { Proposal, RiskRule } from "../api/types";
 import { StatusPill } from "../components/StatusPill";
 import { formatRelative, formatTimestamp } from "../components/formats";
+import { ExecutionPanel } from "../components/ExecutionPanel";
 import { usePolling } from "../components/usePolling";
 
 /**
@@ -492,7 +493,10 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
               Authorize {data.side} {data.proposed_quantity} {data.broker_ticker} at{" "}
               <span className="mono">{data.reference_price}</span>? The listing, account state,
               quote, spread and every risk rule are re-checked before this is recorded.{" "}
-              <strong>No broker order is sent.</strong>{" "}
+              <strong>
+                Authorizing does not itself send an order; transmission is a separate,
+                separately gated step, and every order is sent at most once.
+              </strong>{" "}
               <button disabled={busy} onClick={() => act(() => api.approveProposal(data.id))}>
                 Confirm authorization
               </button>{" "}
@@ -531,6 +535,8 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
           )}
         </div>
       )}
+
+      <ExecutionPanel proposalId={data.id} />
 
       {data.blockers.length > 0 && (
         <div className="card">

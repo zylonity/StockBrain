@@ -105,7 +105,7 @@ from stockbrain.risk.models import (
 )
 from stockbrain.risk.rules import action_is_executable, proposal_ttl, reference_price_drift
 
-__all__ = ["AuthorizationResult", "GenerationResult", "ProposalService"]
+__all__ = ["AuthorizationResult", "GenerationResult", "ProposalService", "Revalidation"]
 
 log = get_logger(__name__)
 
@@ -136,6 +136,53 @@ class GenerationResult:
     reason: str = ""
     authorized: bool = False
     blocks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Revalidation:
+    """A fresh, read-only verdict on a proposal.  Changes nothing.
+
+    Produced by :meth:`ProposalService.revalidate`, which Phase 8's pre-send
+    preflight uses so that the checks guarding a broker POST are *the same
+    checks*, from the same engine and the same rule functions, that guarded the
+    authorization.  A second implementation of "is this still safe" is how two
+    answers start disagreeing.
+    """
+
+    proposal_id: uuid.UUID
+    decision: RiskDecision
+    rules: tuple[RuleResult, ...]
+    quote: QuoteSnapshot | None
+    account: AccountState | None
+    quote_reason: str | None = None
+    account_reason: str | None = None
+
+    @property
+    def blocked(self) -> tuple[RuleResult, ...]:
+        return tuple(rule for rule in self.rules if rule.outcome is RuleOutcome.BLOCK)
+
+    @property
+    def allowed(self) -> bool:
+        return not self.blocked
+
+    @property
+    def reasons(self) -> tuple[str, ...]:
+        return tuple(rule.reason for rule in self.blocked)
+
+    @property
+    def rule_ids(self) -> tuple[str, ...]:
+        return tuple(rule.rule_id for rule in self.blocked)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "outcome": (RiskOutcome.BLOCK if self.blocked else self.decision.outcome).value,
+            "policy_version": self.decision.policy_version,
+            "rules": [rule.as_dict() for rule in self.rules],
+            "snapshot": self.decision.as_dict(),
+            "snapshot_hash": self.decision.snapshot_hash(),
+            "quote_missing_reason": self.quote_reason,
+            "account_missing_reason": self.account_reason,
+        }
 
 
 @dataclass(slots=True)
@@ -722,6 +769,81 @@ class ProposalService:
             decision=decision,
         )
 
+    async def revalidate(
+        self, proposal_id: uuid.UUID, *, now: dt.datetime | None = None
+    ) -> Revalidation | None:
+        """Re-run every deterministic check against a fresh world, mutating nothing.
+
+        Same inputs, same engine and same rule set as :meth:`authorize`; the
+        difference is that this records no evaluation, takes no lock and moves
+        no status.  Phase 8 calls it immediately before a broker POST, because
+        an authorization is a statement about the moment it was given and an
+        order is sent into a later one.
+
+        Returns ``None`` when the proposal no longer exists.
+        """
+        moment = now or utcnow()
+        async with self.database.session() as session:
+            proposal = await session.get(TradeProposal, proposal_id)
+            if proposal is None:
+                return None
+            instrument = (
+                await session.get(BrokerInstrument, proposal.broker_instrument_id)
+                if proposal.broker_instrument_id
+                else None
+            )
+            action = ThesisAction(proposal.research_action or ThesisAction.BUY.value)
+            confidence = Decimal(str(proposal.research_confidence or 0))
+            account_id = proposal.account_id
+
+        account, account_reason = await self.account_state.load(
+            max_age_seconds=self.config.max_account_state_age_seconds, now=moment
+        )
+        quote: QuoteSnapshot | None = None
+        quote_reason: str | None = "the listing could not be identified for pricing"
+        if instrument is not None:
+            async with self.database.session() as session:
+                quote, quote_reason = await self.quotes.fetch(
+                    session, instrument, self.config, now=moment
+                )
+
+        async with self.database.session() as session:
+            fresh = await session.get(TradeProposal, proposal_id)
+            if fresh is None:  # pragma: no cover - selected a moment ago
+                return None
+            identity = await self._identity_from_proposal(session, fresh)
+            reserved = await self._reserved_exposure(
+                session, account_id, identity.broker_ticker, exclude_proposal_id=proposal_id
+            )
+            decision = self.engine.evaluate(
+                RiskInputs(
+                    config=self.config,
+                    action=action,
+                    confidence=confidence,
+                    identity=identity,
+                    account=account,
+                    quote=quote,
+                    reserved=reserved,
+                    now=moment,
+                    account_state_missing_reason=account_reason,
+                    quote_missing_reason=quote_reason,
+                ),
+                now=moment,
+            )
+            rules = (
+                *decision.rules,
+                *self._authorization_rules(fresh, decision, quote, moment),
+            )
+        return Revalidation(
+            proposal_id=proposal_id,
+            decision=decision,
+            rules=rules,
+            quote=quote,
+            account=account,
+            quote_reason=quote_reason,
+            account_reason=account_reason,
+        )
+
     async def reject(
         self, proposal_id: uuid.UUID, *, actor: str, reason: str | None = None
     ) -> TradeProposal:
@@ -1114,6 +1236,23 @@ class ProposalService:
                 priority=25,
             )
         return 1 if job_id is not None else 0
+
+    async def enqueue_notification(
+        self,
+        session: AsyncSession,
+        proposal_id: uuid.UUID,
+        event: NotificationEvent,
+        *,
+        detail: str | None = None,
+    ) -> None:
+        """Public entry point to the same queueing the lifecycle uses.
+
+        Phase 8's execution service announces its own transitions, and it must
+        do so through *this* function rather than its own: the dedupe key shape
+        is what makes "one notification per transition" a unique-index
+        guarantee, and two spellings of it would be two guarantees.
+        """
+        await self._notify(session, proposal_id, event, detail=detail)
 
     async def _notify(
         self,

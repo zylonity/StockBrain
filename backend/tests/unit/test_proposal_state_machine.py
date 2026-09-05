@@ -12,7 +12,10 @@ from stockbrain.proposals.state_machine import (
     ACTIVE_STATUSES,
     ALLOWED_TRANSITIONS,
     AUTHORIZABLE_STATUSES,
+    EXECUTABLE_STATUSES,
     EXPOSURE_RESERVING_STATUSES,
+    IN_FLIGHT_STATUSES,
+    PRESEND_RECOVERY_TARGET,
     TERMINAL_STATUSES,
     assert_transition,
     can_transition,
@@ -48,11 +51,35 @@ def test_happy_path_is_walkable() -> None:
         assert_transition(current, target)
 
 
-def test_executing_cannot_return_to_approved() -> None:
-    """Once execution has begun the proposal must never become re-approvable."""
-    assert not can_transition(S.EXECUTING, S.APPROVED)
+def test_executing_returns_to_approved_only_for_a_proven_pre_send_failure() -> None:
+    """Phase 8 replaced "never" with "from exactly one place", deliberately.
+
+    Phase 6 wrote that ``EXECUTING`` never returns to ``APPROVED``. That
+    contradicted :class:`~stockbrain.enums.ExecutionOutcome`, which documents
+    ``FAILED_BEFORE_SEND`` as "the only outcome from which a *new* attempt may
+    be created": with no way back, a DNS failure permanently killed an
+    authorized proposal the broker had never heard of.
+
+    The transition is now legal, and its narrowness is enforced above the state
+    machine: it is taken only after ``sent_to_broker`` has been retracted on the
+    strength of an httpx exception that cannot occur once a request line has been
+    written. ``test_only_one_call_site_takes_the_presend_recovery_transition``
+    in the execution suite pins that down.
+    """
+    assert can_transition(S.EXECUTING, S.APPROVED)
+    assert PRESEND_RECOVERY_TARGET is S.APPROVED
+
+
+def test_an_ambiguous_proposal_can_never_return_to_approved() -> None:
+    """The distinction the pre-send transition must not blur.
+
+    "The bytes provably never left" is recoverable. "We do not know" is not:
+    re-approving an ambiguous proposal would put it back in the queue for a
+    second transmission, which is the one thing this system exists to prevent.
+    """
+    assert not can_transition(S.EXECUTION_AMBIGUOUS, S.APPROVED)
     with pytest.raises(InvalidProposalTransition):
-        assert_transition(S.EXECUTING, S.APPROVED)
+        assert_transition(S.EXECUTION_AMBIGUOUS, S.APPROVED)
 
 
 def test_executing_cannot_expire_or_be_cancelled() -> None:
@@ -61,10 +88,39 @@ def test_executing_cannot_expire_or_be_cancelled() -> None:
     assert not can_transition(S.EXECUTING, S.CANCELLED)
 
 
-def test_executing_outcomes_are_exactly_the_three_possible_ones() -> None:
+def test_executing_outcomes_are_exactly_the_four_possible_ones() -> None:
+    """Three broker outcomes, plus the proven-pre-send route back."""
     assert ALLOWED_TRANSITIONS[S.EXECUTING] == frozenset(
-        {S.EXECUTED, S.FAILED, S.EXECUTION_AMBIGUOUS}
+        {S.EXECUTED, S.FAILED, S.EXECUTION_AMBIGUOUS, S.APPROVED}
     )
+
+
+def test_only_approved_proposals_are_executable() -> None:
+    """An authorization is the only licence to transmit.
+
+    ``EXECUTING`` is deliberately absent, so a second worker cannot read the
+    status as permission to start a second attempt.
+    """
+    assert frozenset({S.APPROVED}) == EXECUTABLE_STATUSES
+    for status in S:
+        if status is not S.APPROVED:
+            assert status not in EXECUTABLE_STATUSES
+
+
+def test_in_flight_statuses_are_the_two_where_an_order_may_exist() -> None:
+    """These are the states a sweep must never expire or cancel out from under."""
+    assert frozenset({S.EXECUTING, S.EXECUTION_AMBIGUOUS}) == IN_FLIGHT_STATUSES
+    assert not (IN_FLIGHT_STATUSES & TERMINAL_STATUSES)
+
+
+def test_an_in_flight_proposal_still_reserves_its_exposure() -> None:
+    """An order that may exist at the broker is committed cash.
+
+    Releasing the reservation while the outcome is unknown would let the next
+    proposal be sized against money that is already spent.
+    """
+    for status in IN_FLIGHT_STATUSES:
+        assert status in EXPOSURE_RESERVING_STATUSES
 
 
 def test_ambiguous_state_is_only_resolved_forward() -> None:

@@ -48,7 +48,7 @@ from stockbrain.observability.metrics import METRICS
 from stockbrain.proposals.state_machine import assert_transition, can_transition
 from stockbrain.telegram import messages
 from stockbrain.telegram.approvals import ApprovalCoordinator
-from stockbrain.telegram.formatting import bold, chunk, esc, trim
+from stockbrain.telegram.formatting import bold, chunk, code, esc, trim
 from stockbrain.telegram.service import ProposalView, TelegramService
 from stockbrain.telegram.transport import MessageSender
 
@@ -72,6 +72,26 @@ _OPENING_EVENTS: frozenset[NotificationEvent] = frozenset(
     {NotificationEvent.PROPOSAL_MANUAL, NotificationEvent.PROPOSAL_AUTO_AUTHORIZED}
 )
 
+#: Execution transitions are announced unconditionally.  They are deliberately
+#: *not* in ``_FOLLOW_UP_EVENTS``: an order that may exist at a broker has to be
+#: reported whether or not the proposal that produced it was ever announced,
+#: because the operator's exposure does not depend on having read a message.
+_EXECUTION_EVENTS: frozenset[NotificationEvent] = frozenset(
+    {
+        NotificationEvent.EXECUTION_SUBMITTED,
+        NotificationEvent.EXECUTION_REJECTED,
+        NotificationEvent.EXECUTION_FAILED,
+        NotificationEvent.EXECUTION_AMBIGUOUS,
+        NotificationEvent.EXECUTION_RECONCILED,
+        NotificationEvent.EXECUTION_CONFIRMED,
+    }
+)
+
+#: Execution outcomes that must be impossible to skim past. An ambiguous order
+#: is the one message in this system where doing nothing is the correct action
+#: and doing the obvious thing -- sending it again -- is the worst one.
+_CRITICAL_EVENTS: frozenset[NotificationEvent] = frozenset({NotificationEvent.EXECUTION_AMBIGUOUS})
+
 _CLASSES: dict[NotificationEvent, NotificationClass] = {
     NotificationEvent.PROPOSAL_MANUAL: NotificationClass.PROPOSAL,
     NotificationEvent.PROPOSAL_AUTO_AUTHORIZED: NotificationClass.PROPOSAL,
@@ -79,6 +99,12 @@ _CLASSES: dict[NotificationEvent, NotificationClass] = {
     NotificationEvent.PROPOSAL_INVALIDATED: NotificationClass.SYSTEM_WARNING,
     NotificationEvent.PROPOSAL_EXPIRED: NotificationClass.SYSTEM_WARNING,
     NotificationEvent.AUTHORIZATION_REFUSED: NotificationClass.SYSTEM_WARNING,
+    NotificationEvent.EXECUTION_SUBMITTED: NotificationClass.PROPOSAL,
+    NotificationEvent.EXECUTION_REJECTED: NotificationClass.SYSTEM_WARNING,
+    NotificationEvent.EXECUTION_FAILED: NotificationClass.SYSTEM_WARNING,
+    NotificationEvent.EXECUTION_AMBIGUOUS: NotificationClass.CRITICAL,
+    NotificationEvent.EXECUTION_RECONCILED: NotificationClass.PROPOSAL,
+    NotificationEvent.EXECUTION_CONFIRMED: NotificationClass.PROPOSAL,
 }
 
 _TITLES: dict[NotificationEvent, str] = {
@@ -88,6 +114,12 @@ _TITLES: dict[NotificationEvent, str] = {
     NotificationEvent.PROPOSAL_INVALIDATED: "Trade proposal invalidated",
     NotificationEvent.PROPOSAL_EXPIRED: "Trade proposal expired",
     NotificationEvent.AUTHORIZATION_REFUSED: "Authorization refused by deterministic risk",
+    NotificationEvent.EXECUTION_SUBMITTED: "Order accepted by the broker",
+    NotificationEvent.EXECUTION_REJECTED: "Broker refused the order",
+    NotificationEvent.EXECUTION_FAILED: "Order not transmitted",
+    NotificationEvent.EXECUTION_AMBIGUOUS: "ORDER STATE UNKNOWN — do not resend",
+    NotificationEvent.EXECUTION_RECONCILED: "Reconciliation resolved an order",
+    NotificationEvent.EXECUTION_CONFIRMED: "Order filled",
 }
 
 
@@ -321,11 +353,29 @@ class ProposalNotifier:
             f"{esc(proposal.broker_ticker)} {esc(proposal.side)} "
             f"{esc(proposal.quantity)} — now {esc(proposal.status.value)}",
         ]
+        if event in _EXECUTION_EVENTS:
+            lines.append(
+                f"Broker: {esc(proposal.broker)} · environment {esc(proposal.broker_environment)}"
+            )
+            if proposal.broker_order_id:
+                lines.append(f"Broker order: {code(proposal.broker_order_id)}")
         if detail:
             lines.append(trim(detail, 400))
         elif proposal.status_reason:
             lines.append(trim(proposal.status_reason, 400))
-        lines.append(esc(messages.PHASE_NOTICE))
+        if event in _CRITICAL_EVENTS:
+            lines.append("")
+            lines.append(bold("DO NOT RESEND THIS ORDER."))
+            lines.append(
+                esc(
+                    "StockBrain transmitted a request and did not receive a definitive "
+                    "response. The order may or may not exist. Reconciliation is reading "
+                    "Trading 212; it will not retry. Do not place the trade manually until "
+                    "the outcome is known."
+                )
+            )
+        elif event not in _EXECUTION_EVENTS:
+            lines.append(esc(messages.PHASE_NOTICE))
         return "\n".join(lines)
 
     async def _send(

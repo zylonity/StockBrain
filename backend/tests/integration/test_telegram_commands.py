@@ -182,7 +182,9 @@ async def test_start_and_help_answer_an_authorised_user(clean_tables: Database) 
     joined = "\n".join(_replies(fake))
     assert "Connected" in joined
     assert "/proposals" in joined
-    assert "Phase 8" in joined
+    # Phase 8 replaced "no order is ever sent" with the separation that is
+    # actually true: authorizing and transmitting are different permissions.
+    assert "separately gated" in joined
 
 
 async def test_status_reports_policy_control_and_proposal_counts(

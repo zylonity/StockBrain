@@ -194,6 +194,8 @@ def proposal_view(**overrides: Any) -> ProposalView:
         "approved_by": None,
         "company": "Apple Inc.",
         "instrument_name": "Apple Inc.",
+        "broker": "TRADING212",
+        "broker_environment": "demo",
         "broker_ticker": "AAPL_US_EQ",
         "market_symbol": "AAPL",
         "side": "BUY",

@@ -1,13 +1,17 @@
 """Security properties of the HTTP and LLM surface.
 
-Phase 6 deliberately breaks the old "zero state-changing routes" property: the
-approve, reject and cancel endpoints mutate StockBrain's own state. What must
-*not* change is the invariant that actually protects money, so the assertions
-are narrowed rather than deleted:
+Each phase that gained a capability narrowed these assertions rather than
+deleting them. Phase 6 broke "zero state-changing routes" by adding approve,
+reject and cancel. Phase 7 added pause, resume and the kill switch. **Phase 8
+breaks "zero broker mutations anywhere" -- the whole point of the phase -- so the
+property becomes a boundary rather than an absence:**
 
-1. **Zero broker order/execution routes.** Every state-changing route mutates
-   StockBrain state only; no API path reaches a Trading 212 mutation, and no
-   order/cancel/modify method exists anywhere to be reached.
+1. **Exactly one module may transmit a broker order**, it is the Trading 212
+   order adapter, and even there the surface is one market-order method. There
+   is still **no cancel, amend or modify path anywhere**, and no API route can
+   reach the mutation: the execution layer is driven by the job queue from a
+   persisted, revalidated proposal, and the only mutating execution route is a
+   *reconciliation* (a read).
 2. **No LLM path acquires broker capability.** The provider interface is
    text-in / text-out, the classifier hint reaches instrument resolution as
    data rather than as an identity, and no model-supplied number can enter
@@ -44,11 +48,13 @@ _BROKER_ACTION_WORDS = ("order", "execute", "submit", "broker-order", "trade212"
 #: The complete set of state-changing routes this phase is allowed to have.
 #: New entries here are a decision, not an accident.
 #:
-#: Phase 7 adds three, and all three move in the *safe* direction: they halt
-#: proposal generation and authorization, or lift a halt. None of them touches a
-#: proposal, a quantity, a price or a broker; the kill switch in particular
-#: closes no position and cancels no order, which the module scan below proves
-#: structurally rather than by assertion of intent.
+#: Phase 7 added three, and all three move in the *safe* direction: they halt
+#: proposal generation and authorization, or lift a halt.
+#:
+#: Phase 8 adds exactly one, and it is deliberately **not** a retry. Trading
+#: 212 documents the order POST as non-idempotent, so a "resend" route would be
+#: a route that creates a second real position. Reconciliation only *reads* the
+#: broker, which is why it is safe to expose and safe to invoke repeatedly.
 _EXPECTED_MUTATIONS = {
     "POST /api/v1/proposals/{proposal_id}/approve",
     "POST /api/v1/proposals/{proposal_id}/reject",
@@ -56,7 +62,14 @@ _EXPECTED_MUTATIONS = {
     "POST /api/v1/system/pause",
     "POST /api/v1/system/resume",
     "POST /api/v1/system/kill-switch",
+    "POST /api/v1/execution/attempts/{attempt_id}/reconcile",
 }
+
+#: Route path fragments that would name a *resend*.  None may ever appear.
+_FORBIDDEN_ROUTE_WORDS = ("retry", "resend", "resubmit", "place-order", "submit-order")
+
+#: The one module permitted to contain a broker mutation.
+_EXECUTION_ADAPTER = "broker/trading212_orders.py"
 
 #: Every Trading 212 path that would change broker state.
 _T212_MUTATION_PATHS = (
@@ -125,50 +138,81 @@ def test_the_only_state_changing_routes_are_the_expected_internal_ones() -> None
     assert walked == _EXPECTED_MUTATIONS
 
 
-def test_no_route_path_names_a_broker_order_or_execution() -> None:
-    """Approving is an internal act; ordering is not, and has no route."""
-    offenders = [
-        route.path
+def test_no_route_lets_a_client_place_or_resend_an_order() -> None:
+    """Phase 8 transmits orders; no *route* does.
+
+    Execution is driven by the job queue from a persisted, revalidated proposal.
+    The API can read execution state and ask for a reconciliation, and there is
+    deliberately no path a client could call to place an order or to resend an
+    ambiguous one.
+    """
+    paths = {route.path.lower() for route in _api_routes()}
+    for path in paths:
+        for word in _FORBIDDEN_ROUTE_WORDS:
+            assert word not in path, f"{path} names {word}"
+
+    # The execution routes that do exist are reads, apart from the one
+    # reconciliation POST -- which reads the broker.
+    execution_mutations = {
+        f"{method} {route.path}"
         for route in _api_routes()
-        if any(word in route.path.lower() for word in _BROKER_ACTION_WORDS)
-    ]
-    assert offenders == []
+        if route.path.startswith("/api/v1/execution")
+        for method in (route.methods or set())
+        if method in _MUTATION_METHODS
+    }
+    assert execution_mutations == {"POST /api/v1/execution/attempts/{attempt_id}/reconcile"}
 
 
-def test_no_api_path_can_reach_a_trading212_mutation() -> None:
-    """Structural: the route modules must not name a broker mutation path.
+def test_no_api_route_module_names_a_trading212_mutation() -> None:
+    """Structural: no route module may name a broker mutation path.
 
     An approval endpoint is only safe while approving cannot reach an order, so
     this asserts the absence of the path string rather than trusting that no
-    call site happens to use it today.
+    call site happens to use it today. The execution routes are included: they
+    read attempts and trigger reconciliation, and must not learn to submit.
     """
+    import stockbrain.api.routes.execution as execution_routes
     import stockbrain.api.routes.proposals as proposal_routes
     import stockbrain.api.routes.system as system_routes
 
-    for module in (proposal_routes, instrument_routes, system_routes):
+    for module in (proposal_routes, instrument_routes, system_routes, execution_routes):
         source = inspect.getsource(module)
-        for path in _T212_MUTATION_PATHS:
+        # `MARKET_ORDER_PATH` is imported by name in the execution routes so the
+        # status endpoint can report which endpoint would be used; the literal
+        # path must still appear nowhere.
+        for path in ("/equity/orders/market", "/equity/orders/limit", "/equity/pies"):
             assert path not in source
+        assert "submit_market_order" not in source
         assert "place_order" not in source
-        assert "place_market_order" not in source
 
 
-def test_no_trading212_order_cancel_or_modify_method_exists_anywhere() -> None:
-    """The capability audit: a method that does not exist cannot be called.
+def test_no_cancel_amend_or_modify_path_exists_anywhere() -> None:
+    """The capability audit, narrowed but not weakened.
 
-    Every module under ``stockbrain`` is scanned, not only the broker package,
-    because the guarantee is about the process rather than about one file.
+    Phase 8 adds order *placement*. It adds no way to cancel, amend, modify or
+    replace one, and it must not: cancelling races a fill, and a kill switch
+    that cancelled would be making a trading decision rather than stopping one.
+    Trading 212 documents ``DELETE /equity/orders/{id}``; nothing here calls it.
+
+    Every module under ``stockbrain`` is scanned, because the guarantee is about
+    the process rather than about one file.
     """
     root = Path(inspect.getfile(create_app)).resolve().parent
     forbidden = (
-        "place_order",
-        "place_market_order",
-        "place_limit_order",
         "cancel_order",
         "modify_order",
         "amend_order",
-        '"/equity/orders',
-        "'/equity/orders",
+        "replace_order",
+        "place_limit_order",
+        "place_stop_order",
+        "/equity/orders/limit",
+        "/equity/orders/stop",
+        "/equity/pies",
+        'request_json("DELETE"',
+        # An HTTP DELETE to the broker. Not `sa.delete(`, which is a database
+        # statement and appears legitimately in the account-state mirror.
+        "client.delete(",
+        '.request("DELETE"',
     )
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
@@ -177,6 +221,44 @@ def test_no_trading212_order_cancel_or_modify_method_exists_anywhere() -> None:
             if needle in text:
                 offenders.append(f"{path.relative_to(root)}: {needle}")
     assert offenders == []
+
+
+def test_exactly_one_module_can_transmit_a_broker_order() -> None:
+    """The Phase 8 boundary, asserted as a boundary.
+
+    The order path is one module and one method. Everything else -- the
+    execution service, reconciliation, the job handlers, the API, Telegram --
+    reaches it through the four-operation provider interface, so a reader can
+    find every line of code that can spend money by opening one file.
+    """
+    root = Path(inspect.getfile(create_app)).resolve().parent
+    mutation_markers = ("client.post(", '"/equity/orders/market"', "submit_market_order")
+    transmitters = sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if any(marker in path.read_text(encoding="utf-8") for marker in mutation_markers)
+        and "submit_market_order" not in {""}  # keep the comprehension readable
+    )
+    # The adapter transmits; `base.py` and `service.py` name the method they call.
+    assert _EXECUTION_ADAPTER in transmitters
+    posting = [
+        path for path in transmitters if "client.post(" in (root / path).read_text(encoding="utf-8")
+    ]
+    assert posting == [_EXECUTION_ADAPTER], (
+        "only the Trading 212 order adapter may issue an HTTP POST to the broker"
+    )
+
+
+def test_the_order_adapter_never_retries_and_says_so() -> None:
+    """A non-idempotent POST with a retry loop is the failure mode of the phase."""
+    from stockbrain.broker import trading212_orders
+
+    source = inspect.getsource(trading212_orders)
+    # The POST goes through httpx directly, not through the retrying helper.
+    assert "self._client.post(" in source
+    assert "retry_safe=True" not in source
+    # And the reason is written down where the next reader will find it.
+    assert "not idempotent" in source
 
 
 def test_the_broker_clients_expose_no_mutation_method() -> None:

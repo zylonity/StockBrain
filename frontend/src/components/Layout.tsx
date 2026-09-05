@@ -49,11 +49,11 @@ export function Layout() {
       </main>
       <footer className="footer">
         <span>
-          Authorizing a proposal does not send a broker order: there is no
-          order-submission path in this phase. No automatic retries on broker
-          mutations.
+          Authorizing a proposal and transmitting an order are separately gated.
+          Every order is sent at most once, and a broker mutation is never
+          retried: an unknown outcome is reconciled, never resent.
         </span>
-        <span className="mono">phase 7 · telegram control and approvals</span>
+        <span className="mono">phase 8 · trading 212 demo execution</span>
       </footer>
     </div>
   );

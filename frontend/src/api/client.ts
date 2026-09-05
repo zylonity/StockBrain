@@ -8,7 +8,11 @@
  */
 
 import type {
+  BrokerOrderRecord,
   ControlStateResponse,
+  ExecutionAttempt,
+  ExecutionStatusSummary,
+  ProposalExecution,
   ExecutionPolicyResponse,
   Proposal,
   ProposalListResponse,
@@ -162,6 +166,30 @@ export const api = {
     ),
   proposalPolicy: () =>
     request<ExecutionPolicyResponse>("/api/v1/proposals/policy"),
+  executionSummary: () =>
+    request<ExecutionStatusSummary>("/api/v1/execution/status"),
+  proposalExecution: (id: string) =>
+    request<ProposalExecution>(
+      `/api/v1/proposals/${encodeURIComponent(id)}/execution`,
+    ),
+  executionAttempts: (ambiguousOnly = false, limit = 50) =>
+    request<ExecutionAttempt[]>(
+      `/api/v1/execution/attempts?ambiguous_only=${ambiguousOnly}&limit=${limit}`,
+    ),
+  brokerOrders: (limit = 50) =>
+    request<BrokerOrderRecord[]>(`/api/v1/execution/orders?limit=${limit}`),
+  /**
+   * Ask the broker again what happened to an attempt.
+   *
+   * The only mutating execution call, and it is a *read* of the broker: it
+   * fetches pending orders and order history and compares them against the
+   * attempt. There is deliberately no resend counterpart — Trading 212's order
+   * POST is non-idempotent, so a retry button would create a second position.
+   */
+  reconcileAttempt: (attemptId: string) =>
+    post<ExecutionAttempt>(
+      `/api/v1/execution/attempts/${encodeURIComponent(attemptId)}/reconcile`,
+    ),
   approveProposal: (id: string) =>
     post<Proposal>(`/api/v1/proposals/${encodeURIComponent(id)}/approve`),
   rejectProposal: (id: string, reason?: string) =>

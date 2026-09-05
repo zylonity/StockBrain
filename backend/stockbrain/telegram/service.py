@@ -27,7 +27,7 @@ from stockbrain.config import Settings
 from stockbrain.control.state import ControlSnapshot, ControlStateService
 from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
 from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
-from stockbrain.db.models.proposals import TradeProposal
+from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
 from stockbrain.db.models.research import Thesis
 from stockbrain.db.models.sources import Event
 from stockbrain.db.session import Database
@@ -113,6 +113,8 @@ class ProposalView:
     approved_by: str | None
     company: str | None
     instrument_name: str | None
+    broker: str
+    broker_environment: str
     broker_ticker: str
     market_symbol: str | None
     side: str
@@ -135,10 +137,22 @@ class ProposalView:
     expires_at: dt.datetime
     created_at: dt.datetime
     blocking_reasons: list[str] = field(default_factory=list)
-    #: Always ``False`` in Phase 7: no order-submission path exists anywhere in
-    #: the process.  Rendered rather than omitted, for the same reason the
-    #: policy endpoint returns an empty ``broker_order_routes`` list.
+
+    #: Whether an execution attempt for this proposal has been *recorded as
+    #: sent*.  Phase 7 hardcoded ``False`` because no order path existed; Phase 8
+    #: reads it from ``execution_attempts.sent_to_broker``, which is written
+    #: before the request rather than after the response -- so this says "bytes
+    #: may have left", which is the fact that matters.
     broker_order_sent: bool = False
+    broker_order_id: str | None = None
+    execution_outcome: str | None = None
+    execution_sent_at: dt.datetime | None = None
+    execution_error_category: str | None = None
+    reconciliation_result: str | None = None
+
+    @property
+    def execution_ambiguous(self) -> bool:
+        return self.status is ProposalStatus.EXECUTION_AMBIGUOUS
 
     @property
     def awaiting_authorization(self) -> bool:
@@ -471,11 +485,25 @@ class TelegramService:
 # Helpers
 # ---------------------------------------------------------------------------
 def _proposal_query() -> sa.Select[Any]:
+    """Proposals with their listing, company, thesis and *transmitted* attempt.
+
+    The attempt join is restricted to ``sent_to_broker`` because
+    ``uq_execution_attempts_sent_once`` guarantees at most one such row per
+    proposal -- so the join stays one-to-one and cannot duplicate a proposal.
+    Refused attempts are numerous and are read on the detail endpoint instead.
+    """
     return (
-        sa.select(TradeProposal, BrokerInstrument, Company, Thesis)
+        sa.select(TradeProposal, BrokerInstrument, Company, Thesis, ExecutionAttempt)
         .outerjoin(BrokerInstrument, BrokerInstrument.id == TradeProposal.broker_instrument_id)
         .outerjoin(Company, Company.id == TradeProposal.company_id)
         .outerjoin(Thesis, Thesis.id == TradeProposal.thesis_id)
+        .outerjoin(
+            ExecutionAttempt,
+            sa.and_(
+                ExecutionAttempt.proposal_id == TradeProposal.id,
+                ExecutionAttempt.sent_to_broker.is_(True),
+            ),
+        )
     )
 
 
@@ -484,6 +512,7 @@ def _to_proposal_view(
     instrument: BrokerInstrument | None,
     company: Company | None,
     thesis: Thesis | None,
+    attempt: ExecutionAttempt | None = None,
 ) -> ProposalView:
     return ProposalView(
         id=proposal.id,
@@ -496,6 +525,8 @@ def _to_proposal_view(
         approved_by=proposal.approved_by,
         company=company.name if company else None,
         instrument_name=instrument.name if instrument else None,
+        broker=proposal.broker.value,
+        broker_environment=proposal.broker_environment,
         broker_ticker=proposal.broker_ticker,
         market_symbol=instrument.market_symbol if instrument else None,
         side=proposal.side.value,
@@ -522,6 +553,12 @@ def _to_proposal_view(
             for rule in (proposal.risk_rules or [])
             if isinstance(rule, dict) and rule.get("outcome") == "BLOCK"
         ],
+        broker_order_sent=attempt is not None and attempt.sent_to_broker,
+        broker_order_id=attempt.broker_order_id if attempt else None,
+        execution_outcome=attempt.outcome.value if attempt else None,
+        execution_sent_at=attempt.sent_at if attempt else None,
+        execution_error_category=attempt.error_category if attempt else None,
+        reconciliation_result=attempt.reconciliation_result if attempt else None,
     )
 
 

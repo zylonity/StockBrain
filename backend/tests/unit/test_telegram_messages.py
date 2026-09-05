@@ -119,7 +119,14 @@ def test_an_event_title_and_a_thesis_body_are_escaped() -> None:
 # ---------------------------------------------------------------------------
 # What a proposal message promises
 # ---------------------------------------------------------------------------
-def test_every_proposal_message_says_no_broker_order_was_sent() -> None:
+def test_every_proposal_message_reports_whether_an_order_was_sent() -> None:
+    """Phase 7 asserted "no order is ever sent"; Phase 8 makes that a *fact*.
+
+    The notice no longer claims transmission is impossible -- it is not -- so
+    what every message must now carry is the state itself: whether an order has
+    been recorded as sent, and that authorization and transmission are separate
+    gates.
+    """
     view = proposal_view()
     for rendered in (
         messages.render_proposal_notification(view),
@@ -127,7 +134,42 @@ def test_every_proposal_message_says_no_broker_order_was_sent() -> None:
         messages.render_proposals([view]),
         messages.render_proposal_confirmation(view),
     ):
-        assert "Phase 8" in rendered
+        assert "sent at most once" in rendered or "broker order sent" in rendered.lower()
+
+    detail = messages.render_proposal_detail(view)
+    assert "Broker order sent: no" in detail
+    assert "environment demo" in detail
+
+
+def test_a_transmitted_proposal_shows_the_order_and_the_outcome() -> None:
+    view = proposal_view(
+        status=ProposalStatus.EXECUTING,
+        broker_order_sent=True,
+        broker_order_id="998877",
+        execution_outcome="SUBMITTED",
+    )
+    detail = messages.render_proposal_detail(view)
+    assert "Broker order sent: yes" in detail
+    assert "998877" in detail
+    assert "SUBMITTED" in detail
+
+
+def test_an_ambiguous_proposal_shouts_do_not_resend() -> None:
+    """The one message where the obvious reaction is the dangerous one.
+
+    Somebody reading "we do not know whether the order arrived" will reach for
+    the trade again. The message has to talk them out of it.
+    """
+    view = proposal_view(
+        status=ProposalStatus.EXECUTION_AMBIGUOUS,
+        broker_order_sent=True,
+        execution_outcome="AMBIGUOUS",
+        execution_error_category="TRANSPORT_AMBIGUOUS",
+    )
+    detail = messages.render_proposal_detail(view)
+    assert "DO NOT RESEND" in detail
+    assert "may or may not exist" in detail
+    assert "will NOT be retried" in detail
 
 
 def test_a_manual_proposal_asks_for_approval_and_an_automatic_one_reports_it() -> None:

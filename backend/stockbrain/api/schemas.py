@@ -9,14 +9,16 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from stockbrain.enums import ProviderStatus
+from stockbrain.enums import ProposalStatus, ProviderStatus
 
 __all__ = [
     "AliasResponse",
     "BrokerInstrumentResponse",
+    "BrokerOrderResponse",
     "CompanyImpactResponse",
     "ControlChangeRequest",
     "ControlFlagResponse",
@@ -27,7 +29,9 @@ __all__ = [
     "EventDetailResponse",
     "EventListResponse",
     "EventSummaryResponse",
+    "ExecutionAttemptResponse",
     "ExecutionStatusResponse",
+    "ExecutionStatusSummaryResponse",
     "HealthResponse",
     "IngestionStatsResponse",
     "InstrumentCandidateResponse",
@@ -39,10 +43,12 @@ __all__ = [
     "LlmUsageResponse",
     "MarketDataHealthResponse",
     "PriceReactionResponse",
+    "ProposalExecutionResponse",
     "ProviderHealthResponse",
     "ProvidersResponse",
     "QuoteResponse",
     "ReadinessResponse",
+    "ReconciliationTriggerRequest",
     "ResolutionListResponse",
     "ResolutionResponse",
     "SourceResponse",
@@ -156,6 +162,115 @@ class ControlChangeRequest(ApiModel):
 
 class KillSwitchRequest(ControlChangeRequest):
     engaged: bool = True
+
+
+class ExecutionAttemptResponse(ApiModel):
+    """One transmission attempt, including the ones that never transmitted.
+
+    ``sent_to_broker`` is written *before* the HTTP request, so it means "bytes
+    may have left" rather than "bytes left".  A client must read it that way:
+    ``true`` with an ``AMBIGUOUS`` outcome is precisely the state in which no
+    order may be sent again.
+    """
+
+    id: uuid.UUID
+    proposal_id: uuid.UUID
+    attempt_number: int
+    broker_environment: str
+    outcome: str
+    ambiguous: bool
+    sent_to_broker: bool
+    sent_at: dt.datetime | None = None
+    started_at: dt.datetime
+    preflight_at: dt.datetime | None = None
+    completed_at: dt.datetime | None = None
+    http_status: int | None = None
+    broker_order_id: str | None = None
+    request_fingerprint: str
+    error: str | None = None
+    error_category: str | None = None
+    reconciled_at: dt.datetime | None = None
+    reconciliation_result: str | None = None
+    reconciliation_attempts: int = 0
+    reconciliation_detail: dict[str, Any] = Field(default_factory=dict)
+    rate_limit: dict[str, Any] = Field(default_factory=dict)
+    execution_snapshot: dict[str, Any] = Field(default_factory=dict)
+    resend_permitted: bool = False
+    """Always false for a transmitted attempt.  Returned rather than implied,
+    because the absence of a retry path is worth asserting on every poll."""
+
+
+class BrokerOrderResponse(ApiModel):
+    """StockBrain's mirror of an order the broker owns."""
+
+    broker: str
+    broker_order_id: str
+    broker_environment: str | None = None
+    broker_ticker: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    filled_quantity: Decimal | None = None
+    filled_value: Decimal | None = None
+    currency: str | None = None
+    broker_status: str | None = None
+    initiated_from: str | None = None
+    is_terminal: bool = False
+    discovered_by_reconciliation: bool = False
+    submitted_at: dt.datetime | None = None
+    last_synced_at: dt.datetime
+
+
+class ProposalExecutionResponse(ApiModel):
+    """Everything known about one proposal's journey to the broker."""
+
+    proposal_id: uuid.UUID
+    proposal_status: ProposalStatus
+    broker_environment: str
+    authorization_source: str | None = None
+    execution_policy: str
+    transmitted: bool
+    ambiguous: bool
+    reconciliation_required: bool
+    attempts: list[ExecutionAttemptResponse]
+    orders: list[BrokerOrderResponse]
+    notice: str
+
+
+class ExecutionStatusSummaryResponse(ApiModel):
+    """Deployment-level execution posture and the current attempt counts.
+
+    ``order_transmission_permitted`` is defined as "no blockers remain", so this
+    response can never show a green light beside a blocker.
+    """
+
+    broker: str
+    broker_environment: str
+    order_transmission_permitted: bool
+    blockers: list[str]
+    execution_mode: str
+    execution_policy: str
+    live_execution_permitted: bool
+    automated_trading_consent_confirmed: bool
+    trading_halted: bool
+    control_blockers: list[str]
+    attempts_by_outcome: dict[str, int]
+    ambiguous_attempts: int
+    reconciliation_pending: int
+    order_endpoint: str
+    order_endpoint_idempotent: bool
+    notice: str
+
+
+class ReconciliationTriggerRequest(ApiModel):
+    """The complete input a manual reconciliation accepts: nothing.
+
+    Reconciliation reads the broker; it has no parameters, and deliberately no
+    "resend" flag.  A body that could ask for a resend would be a body that
+    could duplicate an order.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class TelegramStatusResponse(ApiModel):

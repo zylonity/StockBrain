@@ -111,6 +111,23 @@ class TokenBucket:
         self._updated = time.monotonic()
         self._lock = asyncio.Lock()
 
+    async def try_acquire(self) -> bool:
+        """Take a token if one is free, without waiting.
+
+        The order path needs this: waiting for a token is fine, but it has to
+        happen *before* the transaction that records "bytes may have left", so a
+        limiter denial stays provably a pre-send condition rather than becoming
+        part of the unknown window.
+        """
+        async with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self._capacity, self._tokens + (now - self._updated) * self._rate)
+            self._updated = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+            return False
+
     async def acquire(self) -> None:
         async with self._lock:
             while True:

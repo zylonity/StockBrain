@@ -15,9 +15,18 @@ Notable rules:
   out), ``REJECTED`` (a human said no) and ``CANCELLED`` (someone withdrew it):
   the proposal was still live and unacted-on, but the listing, the position, the
   account or the market moved out from under the numbers it carries.
-* ``EXECUTING`` never returns to ``APPROVED``.  Once the execution transaction
-  has started, the only exits are ``EXECUTED``, ``FAILED`` or
-  ``EXECUTION_AMBIGUOUS``.
+* ``EXECUTING`` returns to ``APPROVED`` from **exactly one** situation: a
+  transport failure that provably occurred *before any byte was written* (see
+  ``PRESEND_RECOVERY_TARGET``).  Phase 6 wrote "EXECUTING never returns to
+  APPROVED", and Phase 8 found that this contradicted
+  :class:`~stockbrain.enums.ExecutionOutcome`, which documents
+  ``FAILED_BEFORE_SEND`` as "the only outcome from which a *new* attempt may be
+  created".  With no way back, a DNS failure permanently killed an authorized
+  proposal that the broker had never heard of.  The transition therefore exists,
+  and its narrowness is enforced by the execution service -- which only takes it
+  after retracting ``sent_to_broker`` on the strength of an httpx exception that
+  cannot occur after the request line is written.  Every other exit from
+  ``EXECUTING`` is still ``EXECUTED``, ``FAILED`` or ``EXECUTION_AMBIGUOUS``.
 * ``EXECUTION_AMBIGUOUS`` is not terminal, but it is only left by
   *reconciliation* discovering the truth at the broker -- never by resending.
 
@@ -38,7 +47,10 @@ __all__ = [
     "ACTIVE_STATUSES",
     "ALLOWED_TRANSITIONS",
     "AUTHORIZABLE_STATUSES",
+    "EXECUTABLE_STATUSES",
     "EXPOSURE_RESERVING_STATUSES",
+    "IN_FLIGHT_STATUSES",
+    "PRESEND_RECOVERY_TARGET",
     "PRE_EXECUTION_STATUSES",
     "TERMINAL_STATUSES",
     "assert_transition",
@@ -65,7 +77,9 @@ _TRANSITIONS: Final[dict[ProposalStatus, frozenset[ProposalStatus]]] = {
     )
     | _INVALIDATION_TARGETS,
     S.APPROVED: frozenset({S.EXECUTING, S.EXPIRED, S.CANCELLED, S.FAILED}) | _INVALIDATION_TARGETS,
-    S.EXECUTING: frozenset({S.EXECUTED, S.FAILED, S.EXECUTION_AMBIGUOUS}),
+    # APPROVED is reachable again only through the proven-pre-send path; see the
+    # module docstring and `PRESEND_RECOVERY_TARGET`.
+    S.EXECUTING: frozenset({S.EXECUTED, S.FAILED, S.EXECUTION_AMBIGUOUS, S.APPROVED}),
     S.EXECUTION_AMBIGUOUS: frozenset({S.EXECUTED, S.FAILED, S.CANCELLED}),
     S.EXECUTED: frozenset(),
     S.REJECTED: frozenset(),
@@ -81,6 +95,22 @@ ALLOWED_TRANSITIONS: Final[MappingProxyType[ProposalStatus, frozenset[ProposalSt
 
 TERMINAL_STATUSES: Final[frozenset[ProposalStatus]] = frozenset(
     status for status, targets in _TRANSITIONS.items() if not targets
+)
+
+#: The only legal destination for a proposal whose transmission provably never
+#: happened.  Named so that the one call site permitted to use it is greppable,
+#: and so a test can assert there is exactly one.
+PRESEND_RECOVERY_TARGET: Final[ProposalStatus] = S.APPROVED
+
+#: Statuses from which the execution engine may begin a transmission attempt.
+#: Deliberately just one: an authorization is the only licence to send, and
+#: ``EXECUTING`` is absent so a second worker cannot start a second attempt.
+EXECUTABLE_STATUSES: Final[frozenset[ProposalStatus]] = frozenset({S.APPROVED})
+
+#: Statuses in which an order may exist at the broker, so the proposal must not
+#: be expired, cancelled or re-driven by any sweep.
+IN_FLIGHT_STATUSES: Final[frozenset[ProposalStatus]] = frozenset(
+    {S.EXECUTING, S.EXECUTION_AMBIGUOUS}
 )
 
 #: States in which no broker mutation has been attempted, so expiry and

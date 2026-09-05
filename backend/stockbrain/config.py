@@ -247,6 +247,49 @@ class Settings(BaseSettings):
     about the operator's relationship with their broker; it is not a bypass, and
     there is no general "ignore broker rules" switch."""
 
+    t212_execution_enabled: bool = False
+    """Master switch for **any** broker order transmission, demo included.
+
+    Default false so that deploying Phase 8 does not, by itself, start sending
+    orders.  Turning it on is a deliberate operator act; it is *not* one of the
+    four live gates and never substitutes for them -- with ``T212_ENV=live``
+    those still apply on top."""
+
+    t212_order_extended_hours: bool = False
+    """Whether a market order may fill outside the regular session.
+
+    Trading 212 defaults this to false and StockBrain keeps that: the Phase 6
+    spread ceiling is calibrated on regular-hours books, and an overnight book
+    was measured at 1,024 bps."""
+
+    t212_order_timeout_seconds: float = Field(default=30.0, ge=5.0, le=120.0)
+    """Timeout for the one order POST.
+
+    Longer than the read timeout used for GETs: a timeout here does not mean
+    "try again", it means the outcome is unknown and reconciliation is required,
+    so waiting a little longer for a definitive answer is strictly better than
+    giving up on one."""
+
+    execution_enqueue_interval_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
+    reconcile_interval_seconds: float = Field(default=60.0, ge=10.0, le=3600.0)
+
+    execution_reconcile_min_age_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+    """How long after transmission an attempt must be before reconciliation may
+    conclude the order was **not** placed.
+
+    A negative conclusion releases the reservation and fails the proposal, so it
+    has to survive the broker's own propagation delay: an order that exists but
+    has not yet appeared in either the pending list or the history would
+    otherwise be read as proof of absence."""
+
+    execution_reconcile_window_seconds: float = Field(default=900.0, ge=60.0, le=86400.0)
+    """How far either side of ``sent_at`` a broker order may be and still be
+    considered a candidate match for an attempt."""
+
+    execution_reconcile_max_attempts: int = Field(default=20, ge=1, le=1000)
+    """After this many inconclusive passes an attempt stops being swept and waits
+    for a human. An ambiguous order is not a thing to poll forever."""
+
     t212_account_refresh_interval_seconds: int = 60
     """How often broker cash and positions are re-read. The summary endpoint
     allows one request per 5 seconds and positions one per second, so a minute
@@ -604,6 +647,38 @@ class Settings(BaseSettings):
         if not self.broker_credentials_present:
             blockers.append("Trading 212 API credentials are not configured")
         return blockers
+
+    @property
+    def order_transmission_blockers(self) -> list[str]:
+        """Every reason an order may not be transmitted **in this environment**.
+
+        Deliberately a superset of :attr:`execution_blockers`, which is
+        live-specific.  Demo transmission is permitted with credentials, the
+        master switch and ``EXECUTION_MODE=manual_approval``; live transmission
+        additionally requires all four live gates.  Keeping them in one list
+        means the GUI banner, the API and the send-time check cannot disagree
+        about why nothing is being sent.
+        """
+        blockers: list[str] = []
+        if not self.t212_execution_enabled:
+            blockers.append("T212_EXECUTION_ENABLED is false")
+        if not self.broker_credentials_present:
+            blockers.append("Trading 212 API credentials are not configured")
+        if self.execution_mode is not ExecutionMode.MANUAL_APPROVAL:
+            blockers.append(f"EXECUTION_MODE is '{self.execution_mode.value}'")
+        if self.t212_env is BrokerEnvironment.LIVE:
+            blockers.extend(self.execution_blockers)
+        return blockers
+
+    @property
+    def order_transmission_permitted(self) -> bool:
+        """Defined as "no blockers remain", so the two can never disagree.
+
+        Permission to *transmit*, which is a different question from permission
+        to *authorize*: the latter is :attr:`automatic_authorization_permitted`.
+        Neither implies the other, and a send-time check consults this one.
+        """
+        return not self.order_transmission_blockers
 
     @property
     def automation_blockers(self) -> list[str]:

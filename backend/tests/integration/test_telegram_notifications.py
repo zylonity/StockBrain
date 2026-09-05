@@ -200,7 +200,7 @@ async def test_an_automatic_authorization_is_announced_without_an_approve_button
     assert sender.sent[0].keyboard is None
     assert "authorized automatically" in sender.sent[0].text
     assert "SYSTEM_AUTOMATIC" in sender.sent[0].text
-    assert "Phase 8" in sender.sent[0].text
+    assert "separately gated" in sender.sent[0].text
 
 
 # ---------------------------------------------------------------------------

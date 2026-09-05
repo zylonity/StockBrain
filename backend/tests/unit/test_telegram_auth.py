@@ -139,12 +139,23 @@ def test_every_outcome_has_a_sentence() -> None:
 # Configuration wiring
 # ---------------------------------------------------------------------------
 def test_settings_report_the_exact_reasons_the_bot_will_not_run() -> None:
-    """One list drives the startup log, the health record and ``/status``."""
-    blank = Settings(app_env="test")
+    """One list drives the startup log, the health record and ``/status``.
+
+    Every field is passed explicitly. ``Settings`` reads the developer's own
+    ``.env``, so a test that relied on a variable being *absent* there passed
+    only until somebody configured it -- which is exactly what happened between
+    Phase 7 and Phase 8.
+    """
+    blank = Settings(app_env="test", telegram_enabled=False, telegram_allowed_user_ids="")
     assert not blank.telegram_available
     assert "TELEGRAM_ENABLED is false" in blank.telegram_blockers
 
-    no_allowlist = Settings(app_env="test", telegram_enabled=True, telegram_bot_token="123:abc")
+    no_allowlist = Settings(
+        app_env="test",
+        telegram_enabled=True,
+        telegram_bot_token="123:abc",
+        telegram_allowed_user_ids="",
+    )
     assert not no_allowlist.telegram_available
     assert any("authorises nobody" in blocker for blocker in no_allowlist.telegram_blockers)
 
@@ -165,6 +176,7 @@ def test_notification_targets_prefer_the_chat_allowlist_and_never_guess() -> Non
         telegram_enabled=True,
         telegram_bot_token="123:abc",
         telegram_allowed_user_ids="1,2,2",
+        telegram_allowed_chat_ids="",
     )
     assert users_only.telegram_notification_targets == [1, 2]
 

@@ -59,7 +59,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | 5 | Pinned TradingAgents research engine | **done** |
 | 6 | Risk engine, proposals, web approval | **done** |
 | 7 | Telegram control, approvals and durable pause/kill switch | **done** |
-| 8 | Trading 212 demo execution and reconciliation | not started |
+| 8 | Trading 212 demo execution and reconciliation | **done** |
 | 9 | Live readiness | not started |
 
 ## Architecture
@@ -246,9 +246,13 @@ advice.
   `ProposalService.authorize` the web calls, with the same row lock, the same
   compare-and-swap and the same full revalidation. There is no Telegram-specific
   risk path to diverge from it, and a test asserts the package imports none.
-* There are **zero broker order or execution routes**. The six state-changing
-  HTTP routes that exist — approve, reject and cancel a proposal, and pause,
-  resume and the kill switch — mutate StockBrain's own state and nothing else. No API path can reach a Trading 212
+* **Exactly one module can transmit a broker order**, and exactly one HTTP
+  `POST` to a broker exists anywhere in the codebase. There is still **no
+  cancel, amend or modify path at all**. The seven state-changing HTTP routes
+  are approve, reject and cancel a proposal; pause, resume and the kill switch;
+  and one reconciliation — which *reads* the broker. There is deliberately no
+  resend route: Trading 212 documents the order endpoint as non-idempotent, so a
+  retry button would create a second real position. No API path can reach a Trading 212
   mutation, and no order, amend or cancel method exists anywhere in the process
   to be reached: the two Trading 212 clients read instrument metadata and
   account state. Tests enumerate the route table, the OpenAPI schema and every
@@ -257,6 +261,27 @@ advice.
   ticker, side, quantity, price and account are re-read from the proposal row
   under lock — a client that could name a quantity would be a client that could
   size a trade.
+
+### Phase 8 broker execution
+
+* `sent_to_broker` is committed **before** the HTTP request, not after the
+  response, and `uq_execution_attempts_sent_once` makes a second transmission
+  per proposal impossible. A crash in the send window therefore leaves evidence
+  that bytes may have left, and the next worker **reconciles rather than
+  resends**.
+* Failures are classified, not lumped: a complete HTTP response is definitive; a
+  transport failure that provably preceded the request line is recoverable;
+  everything else — including a 2xx whose body cannot be parsed — is ambiguous
+  and reconciles. An ambiguous attempt is never retried and keeps its exposure
+  reserved.
+* Every check runs again immediately before the POST, from the same risk engine
+  that guarded the authorization. A refusal says whether the proposal survives
+  it, so a provider outage defers rather than destroying authorized work.
+* Environment isolation is a database guarantee: a composite foreign key binds
+  each attempt to its proposal's `broker_environment`, so a worker configured
+  for the other environment cannot record an attempt at all.
+* `T212_EXECUTION_ENABLED` defaults to **false**. Deploying the execution layer
+  does not, by itself, send anything.
 
 ### Phase 7 Telegram and execution control
 

@@ -193,7 +193,13 @@ class TradeProposal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="proposal", cascade="all, delete-orphan"
     )
     execution_attempts: Mapped[list[ExecutionAttempt]] = relationship(
-        back_populates="proposal", cascade="all, delete-orphan"
+        back_populates="proposal",
+        cascade="all, delete-orphan",
+        # Two foreign keys link these tables: `proposal_id` alone, and the
+        # composite `(proposal_id, broker_environment)` that makes environment
+        # isolation a database guarantee. The ORM cannot pick between them, so
+        # the identifying one is named explicitly.
+        foreign_keys="ExecutionAttempt.proposal_id",
     )
 
     # ruff wants ClassVar here, but SQLAlchemy declares __mapper_args__ as an
@@ -247,6 +253,11 @@ class TradeProposal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "invalidated_at IS NULL OR status = 'INVALIDATED'",
             name="invalidated_requires_status",
         ),
+        # Redundant against the primary key by itself, and that is the point:
+        # it is the target `execution_attempts (proposal_id, broker_environment)`
+        # references, which turns "an attempt can never run against the other
+        # broker environment" from a service-layer check into a database fact.
+        sa.UniqueConstraint("id", "broker_environment", name="uq_trade_proposals_id_environment"),
     )
 
     def is_expired(self, now: dt.datetime | None = None) -> bool:
@@ -389,6 +400,20 @@ class ExecutionAttempt(UUIDPrimaryKeyMixin, Base):
     impossible, which is exactly the guarantee a non-idempotent order endpoint
     requires.  A new attempt may only be created when every prior attempt has
     outcome ``FAILED_BEFORE_SEND``.
+
+    The flag is deliberately pessimistic: it records "bytes may have left", not
+    "bytes left".  It is retracted in exactly one case -- an httpx exception
+    that cannot occur after the request line is written -- and that retraction
+    is the only thing that ever frees the partial index for another attempt.
+
+    ``execution_snapshot`` is written once, immediately before transmission, and
+    never updated.  It holds everything the send was decided on: the quote, the
+    account, the position, the risk policy version, the authorization provenance
+    and the kill/pause state.  Kept here rather than in a table of its own
+    because it is strictly one-to-one with the attempt and is never queried
+    independently of it -- and kept *separate from the proposal's own columns*
+    because a proposal records the decision that was made, not the newer world
+    the order was sent into.
     """
 
     __tablename__ = "execution_attempts"
@@ -427,10 +452,39 @@ class ExecutionAttempt(UUIDPrimaryKeyMixin, Base):
     )
     ambiguous: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
     error: Mapped[str | None] = mapped_column(sa.Text)
+    error_category: Mapped[str | None] = mapped_column(sa.Text)
+    """A :class:`~stockbrain.enums.ExecutionFailure` value.  Stored as text so a
+    new category needs no migration; the enum documents the known set."""
+
     actor_identifier: Mapped[str | None] = mapped_column(sa.Text)
     rate_limit_headers: Mapped[JSONDict | None] = mapped_column()
 
-    proposal: Mapped[TradeProposal] = relationship(back_populates="execution_attempts")
+    execution_snapshot: Mapped[JSONDict] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    """Immutable record of everything the transmission was decided on."""
+
+    preflight_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    """When the final pre-send revalidation finished.  Separate from
+    ``started_at`` because the gap between them is exactly the window in which
+    the world can move, and an operator reading an incident needs to see it."""
+
+    reconciled_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    reconciliation_result: Mapped[str | None] = mapped_column(sa.Text)
+    """A :class:`~stockbrain.enums.ReconciliationResult` value."""
+
+    reconciliation_attempts: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default="0"
+    )
+    reconciliation_detail: Mapped[JSONDict] = mapped_column(
+        nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    """What the last pass actually saw: how many candidates, from which
+    endpoints, and why it did or did not conclude."""
+
+    proposal: Mapped[TradeProposal] = relationship(
+        back_populates="execution_attempts", foreign_keys=lambda: [ExecutionAttempt.proposal_id]
+    )
 
     __table_args__ = (
         sa.UniqueConstraint(
@@ -443,7 +497,38 @@ class ExecutionAttempt(UUIDPrimaryKeyMixin, Base):
             postgresql_where=sa.text("sent_to_broker"),
         ),
         sa.Index("ix_execution_attempts_outcome", "outcome"),
+        # The sweep that finds attempts needing reconciliation reads exactly
+        # this predicate.
+        sa.Index(
+            "ix_execution_attempts_unresolved",
+            "sent_at",
+            postgresql_where=sa.text("outcome IN ('PENDING', 'AMBIGUOUS')"),
+        ),
+        sa.Index("ix_execution_attempts_broker_order_id", "broker_order_id"),
         sa.CheckConstraint(
             "NOT sent_to_broker OR sent_at IS NOT NULL", name="sent_requires_timestamp"
+        ),
+        # `ambiguous` and `outcome` are two spellings of one fact, and a UI that
+        # reads the flag while a sweep reads the enum must not be able to see
+        # different answers.
+        sa.CheckConstraint("ambiguous = (outcome = 'AMBIGUOUS')", name="ambiguous_matches_outcome"),
+        # A broker order id can only exist if something was transmitted.
+        sa.CheckConstraint(
+            "broker_order_id IS NULL OR sent_to_broker", name="broker_order_requires_send"
+        ),
+        # An outcome that claims the broker answered requires a recorded send.
+        sa.CheckConstraint(
+            "outcome NOT IN ('SUBMITTED', 'REJECTED_BY_BROKER') OR sent_to_broker",
+            name="broker_outcome_requires_send",
+        ),
+        # The database guarantee behind environment isolation: an attempt's
+        # environment is the proposal's environment, not the process's. A worker
+        # started under a different `T212_ENV` cannot write a row that claims
+        # otherwise, whatever its configuration says.
+        sa.ForeignKeyConstraint(
+            ["proposal_id", "broker_environment"],
+            ["trade_proposals.id", "trade_proposals.broker_environment"],
+            name="fk_execution_attempts_proposal_environment",
+            ondelete="CASCADE",
         ),
     )
