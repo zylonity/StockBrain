@@ -62,6 +62,38 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | 8 | Trading 212 demo execution and reconciliation | **done** |
 | 9 | Production hardening: cost control, FX, web auth, backups, alerts | **done** |
 | 10 | Multi-provider web discovery: Brave + Exa search, local extraction, Firecrawl as fallback | **done** |
+| 11 | Operator interface: logs, settings, portfolio, granular Telegram notifications | **done** |
+
+## Operator interface
+
+The GUI is served by the application itself, same-origin, behind the session
+cookie. Ten routes:
+
+| Route | What it answers |
+|---|---|
+| `/` | Is anything waiting for me, and is anything wrong? |
+| `/events` | What has been discovered, and what did the classifier make of it? |
+| `/research` | What did research conclude, on what evidence, at what cost? |
+| `/proposals` | What needs authorizing, and what did the risk engine decide? |
+| `/portfolio` | What does the broker say I hold, and how old is that number? |
+| `/discovery` | What is each paid provider allowed to spend, and what has it spent? |
+| `/instruments` | Which company hints resolved to a tradable listing, and which did not? |
+| `/health` | What state is every dependency in, what does that state mean, and what do I do? |
+| `/logs` | What did service X actually do? |
+| `/settings` | What is this deployment configured to do, and what can I change now? |
+
+Three things are runtime-editable and each has its own audited endpoint: the
+trading pause and kill switch, the hold on scheduled discovery, and the
+per-category Telegram notification preferences. Everything else -- every risk
+limit and all four live-execution gates -- is environment-driven with a restart
+behind it, and `/settings` is a read model rather than a form. There is
+deliberately no generic configuration mutation endpoint: one would be a way to
+turn on live execution over HTTP, which is what the gates exist to prevent.
+
+`/logs` reads a bounded in-memory ring of the application's own structured
+events (`LOG_BUFFER_SIZE`), filterable by service, severity, category, time and
+text. Credentials are removed before an entry is stored. There is no path,
+file or container parameter anywhere in that API.
 
 ## Architecture
 
