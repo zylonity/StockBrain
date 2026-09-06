@@ -41,7 +41,7 @@ import hashlib
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -638,6 +638,14 @@ class ProposalService:
                 self._apply_quote(locked, quote)
                 locked.reference_price = decision.sizing.reference_price or locked.reference_price
                 locked.estimated_notional = locked.proposed_quantity * locked.reference_price
+                # Convert the fixed quantity being authorized, not the newly
+                # computed maximum/recommended quantity. Use this evaluation's
+                # FX facts once and persist their provenance with the amount.
+                assert facts.fx is not None and facts.fx.usable
+                locked.estimated_notional_account_currency = facts.fx.to_account_currency(
+                    locked.estimated_notional
+                ).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+                self._apply_fx(locked, facts.fx)
                 locked.max_quantity = decision.sizing.max_quantity
                 locked.max_notional = decision.sizing.max_notional
                 locked.account_currency = account.currency
@@ -1326,7 +1334,11 @@ class ProposalService:
             quote_timestamp=quote.provider_timestamp,
             quote_age_ms=quote.age_ms,
             estimated_notional=sizing.target_notional,
-            estimated_notional_account_currency=sizing.notional_account_currency,
+            # The database stores four decimal places. Round the reservation
+            # upward so persistence cannot create a fraction of spare cash.
+            estimated_notional_account_currency=sizing.notional_account_currency.quantize(
+                Decimal("0.0001"), rounding=ROUND_CEILING
+            ),
             account_currency=account.currency,
             max_quantity=sizing.max_quantity,
             max_notional=sizing.max_notional,

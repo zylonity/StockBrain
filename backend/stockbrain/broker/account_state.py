@@ -28,6 +28,7 @@ from stockbrain.db.base import utcnow
 from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
 from stockbrain.db.session import Database
 from stockbrain.enums import Broker
+from stockbrain.fx.base import normalize_currency
 from stockbrain.logging import get_logger
 from stockbrain.risk.models import AccountState, PositionState
 
@@ -242,7 +243,7 @@ class AccountStateService:
                     currency=row.currency,
                     average_price=row.average_price,
                     current_price=row.current_price,
-                    market_value=_market_value(row),
+                    market_value=_market_value(row, account_currency=snapshot.currency),
                 )
                 for row in rows
             }
@@ -264,20 +265,22 @@ class AccountStateService:
         )
 
 
-def _market_value(row: Position) -> Decimal | None:
+def _market_value(row: Position, *, account_currency: str) -> Decimal | None:
     """The position's value in the *account* currency.
 
     Preferred from the broker's own ``walletImpact.currentValue``, which is
     already in the account currency and already accounts for FX.  The
     quantity-times-price fallback is only correct when the instrument and the
-    account share a currency, which the risk engine's currency rule enforces
-    separately -- so it is used only when the broker did not supply a value.
+    account share a currency. Otherwise leave it unknown; the shared evaluator
+    may convert the current listing with its already validated FX snapshot.
     """
     wallet = (row.raw or {}).get("wallet_impact")
     if isinstance(wallet, dict):
         current = wallet.get("current_value")
         if current is not None:
             return Decimal(str(current))
-    if row.current_price is not None:
+    if row.current_price is not None and normalize_currency(row.currency) == normalize_currency(
+        account_currency
+    ):
         return row.quantity * row.current_price
     return None

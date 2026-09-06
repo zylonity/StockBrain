@@ -389,6 +389,7 @@ class ReservedExposure:
 
     count: int = 0
     notional: Decimal = ZERO
+    """Reserved cash in account currency, never in a listing's currency."""
     same_instrument_count: int = 0
     same_instrument_notional: Decimal = ZERO
     same_instrument_sides: tuple[str, ...] = ()
@@ -396,8 +397,12 @@ class ReservedExposure:
     whether any of them *conflicts* depends on the side being proposed, which is
     the rule's business rather than this snapshot's."""
 
+    blockers: tuple[str, ...] = ()
+    """Unpriced or inconsistent reservations must never become zero exposure."""
+
     def as_dict(self) -> dict[str, Any]:
         return {
+            "blockers": list(self.blockers),
             "active_proposals": self.count,
             "reserved_notional": str(self.notional),
             "same_instrument_count": self.same_instrument_count,

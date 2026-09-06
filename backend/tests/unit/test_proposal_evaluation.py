@@ -139,6 +139,7 @@ async def test_the_shared_path_preserves_the_complete_engine_decision(
             session,
             "12345",
             inputs.identity.broker_ticker,
+            account_currency=inputs.account.currency if inputs.account else None,
             exclude_proposal_id=row.id if row is not None else None,
         )
     assert verdict.decision == expected

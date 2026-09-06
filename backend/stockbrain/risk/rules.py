@@ -99,8 +99,27 @@ def gate_results(inputs: RiskInputs) -> list[RuleResult]:
         _current_position(inputs),
         _duplicate_or_conflicting_proposal(inputs),
         _max_active_proposals(inputs),
+        _reservation_accounting(inputs),
         _research_confidence_floor(inputs),
     ]
+
+
+def _reservation_accounting(inputs: RiskInputs) -> RuleResult:
+    needed = inputs.action in EXPOSURE_INCREASING_ACTIONS
+    blocked = needed and bool(inputs.reserved.blockers)
+    return RuleResult(
+        rule_id="reservation_accounting",
+        rule_version=1,
+        outcome=RuleOutcome.BLOCK if blocked else RuleOutcome.PASS,
+        reason=(
+            "; ".join(inputs.reserved.blockers)
+            if blocked
+            else "reservations are priced in account currency"
+            if needed
+            else "reductions do not consume reserved cash"
+        ),
+        threshold="all increasing exposure priced in account currency",
+    )
 
 
 def action_is_executable(action: ThesisAction) -> RuleResult:
@@ -612,6 +631,16 @@ def _current_position(inputs: RiskInputs) -> RuleResult:
             reason=f"{available} of {held} shares are available to reduce",
             observed=f"{available} available",
             threshold="> 0",
+        )
+
+    if held > ZERO and position is not None and position.market_value is None:
+        return RuleResult(
+            rule_id="current_position",
+            rule_version=1,
+            outcome=RuleOutcome.BLOCK,
+            reason="the existing position has no validated account-currency valuation",
+            observed="unknown",
+            threshold="position valued in account currency",
         )
 
     return RuleResult(

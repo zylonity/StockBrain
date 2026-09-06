@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -189,10 +189,36 @@ class ProposalEvaluator:
         now: dt.datetime,
     ) -> Revalidation:
         proposal = context.proposal
+        # walletImpact is already in account currency and is never converted.
+        # Only an absent valuation may use quantity * broker price, converted
+        # with the very same FX measurement that the engine will judge below.
+        account = facts.account
+        position = account.position(context.identity.broker_ticker) if account else None
+        fx = facts.fx
+        if (
+            account is not None
+            and position is not None
+            and position.market_value is None
+            and position.current_price is not None
+            and normalize_currency(position.currency)
+            == normalize_currency(context.identity.currency)
+            and fx is not None
+            and fx.usable
+        ):
+            value = fx.to_account_currency(position.quantity * position.current_price)
+            account = replace(
+                account,
+                positions={
+                    **account.positions,
+                    position.broker_ticker: replace(position, market_value=value),
+                },
+            )
+            facts = replace(facts, account=account)
         reserved = await self._reserved_exposure(
             session,
             context.account_id,
             context.identity.broker_ticker,
+            account_currency=facts.account.currency if facts.account else None,
             exclude_proposal_id=proposal.id if proposal is not None else None,
         )
         decision = self.engine.evaluate(
@@ -279,9 +305,15 @@ class ProposalEvaluator:
         account_id: str,
         broker_ticker: str,
         *,
+        account_currency: str | None = None,
         exclude_proposal_id: uuid.UUID | None = None,
     ) -> ReservedExposure:
         """What live proposals have already claimed.
+
+        Cross-currency amounts were converted with the evaluation's validated
+        FX snapshot when written. Read them directly: another conversion or FX
+        request here would give the same obligation two incompatible prices.
+        An unknown amount is a risk blocker, never an invented zero or parity.
 
         Only exposure-*increasing* sides reserve: a pending sell frees cash
         rather than committing it, so counting it as reserved would shrink the
@@ -303,19 +335,58 @@ class ProposalEvaluator:
                         TradeProposal.broker_ticker,
                         TradeProposal.side,
                         TradeProposal.estimated_notional,
+                        TradeProposal.estimated_notional_account_currency,
+                        TradeProposal.account_currency,
+                        TradeProposal.reference_currency,
+                        TradeProposal.fx_required,
                     ).where(*conditions)
                 )
             ).all()
         )
-        notional = sum((row.estimated_notional for row in rows if row.side is OrderSide.BUY), ZERO)
+        amounts: dict[uuid.UUID, Decimal] = {}
+        blockers: list[str] = []
+        for row in rows:
+            if row.side is not OrderSide.BUY:
+                continue
+            currency = normalize_currency(row.account_currency)
+            reference_currency = normalize_currency(row.reference_currency)
+            if not currency or (
+                account_currency and currency != normalize_currency(account_currency)
+            ):
+                blockers.append(
+                    f"proposal {row.id} reserves a different or unknown account currency"
+                )
+                continue
+            # Old same-currency rows may predate the converted-notional column.
+            # Parity is valid only when both currency identities establish it.
+            same_currency = bool(reference_currency) and currency == reference_currency
+            amount = row.estimated_notional_account_currency
+            if same_currency and not row.fx_required:
+                if amount is None:
+                    amount = row.estimated_notional
+                elif amount.is_finite():
+                    # Keep the upward-rounded reservation. The instrument
+                    # amount can have rounded down at database precision.
+                    # max also covers same-currency rows authorized before
+                    # authorization refreshed the account-currency column.
+                    amount = max(amount, row.estimated_notional)
+            if (
+                not reference_currency
+                or row.fx_required == same_currency
+                or amount is None
+                or not amount.is_finite()
+                or amount <= ZERO
+            ):
+                blockers.append(f"proposal {row.id} has no validated account-currency reservation")
+                continue
+            amounts[row.id] = amount
         same = [row for row in rows if row.broker_ticker == broker_ticker]
         return ReservedExposure(
+            blockers=tuple(blockers),
             count=len(rows),
-            notional=notional,
+            notional=sum(amounts.values(), ZERO),
             same_instrument_count=len(same),
-            same_instrument_notional=sum(
-                (row.estimated_notional for row in same if row.side is OrderSide.BUY), ZERO
-            ),
+            same_instrument_notional=sum((amounts.get(row.id, ZERO) for row in same), ZERO),
             same_instrument_sides=tuple(sorted({row.side.value for row in same})),
         )
 

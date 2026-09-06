@@ -697,6 +697,21 @@ Reserving only from `APPROVED` would let a queue of unapproved proposals each be
 sized against the same cash, so approving them in sequence would breach every
 cap that each individually respected.
 
+Reservations use `estimated_notional_account_currency`, converted with the
+evaluation's validated FX snapshot. Generation records that amount and its FX
+provenance together; authorization refreshes both for the fixed proposed
+quantity. Reservation reads fetch no additional rate and never convert an
+already converted amount. Missing cross-currency amounts or mismatched account
+currencies block additional exposure. Older same-currency rows can use their
+instrument notional only because the currency identities establish equality.
+Stored account-currency reservations round upward at database precision.
+
+Broker `walletImpact` position values are already in account currency. When
+that value is absent, `quantity × broker price` is usable directly only for a
+same-currency holding; the shared evaluator converts a foreign holding with
+its existing FX snapshot. An unvalued holding cannot count as zero exposure
+when buying more of it.
+
 Concurrency is handled in PostgreSQL, never in memory:
 
 * a **transaction-scoped advisory lock** on `(broker, account)` serialises every
