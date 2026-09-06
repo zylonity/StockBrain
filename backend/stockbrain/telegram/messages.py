@@ -17,20 +17,23 @@ import datetime as dt
 from stockbrain.control.state import ControlSnapshot
 from stockbrain.enums import ProposalStatus, ProviderStatus
 from stockbrain.telegram.formatting import age, bold, code, esc, money, quantity, stamp, trim
+from stockbrain.telegram.preferences import PipelineEvent
 from stockbrain.telegram.service import (
     EventView,
     PortfolioView,
     PositionView,
     ProposalView,
+    ResearchRunView,
     ResearchView,
     StatusView,
 )
 
 __all__ = [
     "AMBIGUOUS_NOTICE",
-    "PHASE_NOTICE",
+    "AUTHORIZATION_NOTICE",
     "control_line",
     "render_control",
+    "render_event_stage",
     "render_events",
     "render_help",
     "render_portfolio",
@@ -40,15 +43,16 @@ __all__ = [
     "render_proposal_notification",
     "render_proposals",
     "render_research",
+    "render_research_stage",
     "render_start",
     "render_status",
     "render_terminal_status",
 ]
 
-#: Repeated on every message that could be mistaken for an order.  StockBrain
-#: has no broker order path at all in this phase, and a control interface that
-#: leaves that ambiguous is worse than one that does not exist.
-PHASE_NOTICE = (
+#: Repeated on every message that could be mistaken for an order.  Authorizing
+#: and transmitting are separately gated, and a control interface that leaves
+#: that ambiguous is worse than one that does not exist.
+AUTHORIZATION_NOTICE = (
     "Authorizing records that deterministic risk allowed the trade and who signed "
     "it off. Transmission is a separate, separately gated step, and every order is "
     "sent at most once."
@@ -79,7 +83,7 @@ def render_start(authorised: bool) -> str:
         f"{bold('StockBrain')}\n"
         "Connected. This chat is authorised for status, portfolio and proposal "
         "authorization.\n\n"
-        f"{esc(PHASE_NOTICE)}\n\n"
+        f"{esc(AUTHORIZATION_NOTICE)}\n\n"
         "Send /help for the command list."
     )
 
@@ -99,7 +103,7 @@ def render_help() -> str:
     body = "\n".join(f"{code(command)} — {esc(description)}" for command, description in rows)
     return (
         f"{bold('StockBrain commands')}\n{body}\n\n"
-        f"{esc(PHASE_NOTICE)}\n"
+        f"{esc(AUTHORIZATION_NOTICE)}\n"
         f"{esc('/kill never liquidates a position and never cancels a broker order.')}"
     )
 
@@ -140,7 +144,7 @@ def render_status(view: StatusView, *, now: dt.datetime | None = None) -> str:
     else:
         lines.append("All configured providers healthy or disabled.")
     lines.append(_telegram_line(view.telegram))
-    lines.append(esc(PHASE_NOTICE))
+    lines.append(esc(AUTHORIZATION_NOTICE))
     return "\n".join(lines)
 
 
@@ -247,7 +251,7 @@ def render_proposals(views: list[ProposalView], *, now: dt.datetime | None = Non
             f"{esc(_yes_no(view.broker_order_sent))}\n"
             f"  expires {esc(stamp(view.expires_at))}"
         )
-    lines.append(esc(PHASE_NOTICE))
+    lines.append(esc(AUTHORIZATION_NOTICE))
     return "\n".join(lines)
 
 
@@ -288,7 +292,7 @@ def render_proposal_detail(view: ProposalView, *, now: dt.datetime | None = None
             f"• {trim(reason, _REASON_LIMIT)}" for reason in view.blocking_reasons[:4]
         )
         lines.append(f"\n{bold('Blocked by')}\n{blocks}")
-    lines.append(f"\n{esc(PHASE_NOTICE)}")
+    lines.append(f"\n{esc(AUTHORIZATION_NOTICE)}")
     return "\n".join(lines)
 
 
@@ -326,7 +330,7 @@ def render_proposal_notification(view: ProposalView, *, now: dt.datetime | None 
     if view.risks:
         risks = "\n".join(f"• {trim(risk, _REASON_LIMIT)}" for risk in view.risks[:3])
         lines.append(f"\n{bold('Risks')}\n{risks}")
-    lines.append(f"\n{esc(PHASE_NOTICE)}")
+    lines.append(f"\n{esc(AUTHORIZATION_NOTICE)}")
     return "\n".join(lines)
 
 
@@ -346,7 +350,7 @@ def render_proposal_confirmation(view: ProposalView, *, now: dt.datetime | None 
                 "and a fresh account snapshot. If anything moved, the proposal is invalidated "
                 "instead of re-priced."
             ),
-            esc(PHASE_NOTICE),
+            esc(AUTHORIZATION_NOTICE),
         ]
     )
 
@@ -354,9 +358,8 @@ def render_proposal_confirmation(view: ProposalView, *, now: dt.datetime | None 
 def render_terminal_status(view: ProposalView) -> str:
     """Appended to a message whose buttons have just become inert."""
     if view.status is ProposalStatus.APPROVED:
-        return (
-            f"{bold('AUTHORIZED')} — {esc(view.authorization_source or '')} · {esc(PHASE_NOTICE)}"
-        )
+        source = esc(view.authorization_source or "")
+        return f"{bold('AUTHORIZED')} — {source} · {esc(AUTHORIZATION_NOTICE)}"
     reason = f" — {trim(view.status_reason, _REASON_LIMIT)}" if view.status_reason else ""
     return f"{bold(view.status.value)}{reason}"
 
@@ -419,3 +422,95 @@ def _yes_no(value: bool) -> str:
 
 def _confidence(value: float | None) -> str:
     return "-" if value is None else f"{value:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stages
+#
+# Three different facts about one article, worded so the operator can tell them
+# apart at a glance in a chat list. "Discovered" is the firehose, "considered
+# relevant" is a judgement that cost one classifier call, and "promoted" is the
+# moment the pipeline is about to spend real research money -- which is why the
+# third carries the scores the promotion was made on and the first does not.
+# ---------------------------------------------------------------------------
+
+_STAGE_HEADLINES: dict[PipelineEvent, str] = {
+    PipelineEvent.EVENT_DISCOVERED: "Article discovered",
+    PipelineEvent.EVENT_RELEVANT: "Considered relevant",
+    PipelineEvent.EVENT_CANDIDATE: "Promoted to research candidate",
+    PipelineEvent.RESEARCH_STARTED: "Research started",
+    PipelineEvent.RESEARCH_COMPLETED: "Research completed",
+}
+
+
+def stage_headline(event: PipelineEvent) -> str:
+    return _STAGE_HEADLINES[event]
+
+
+def render_event_stage(view: EventView, event: PipelineEvent) -> str:
+    """One article, at one stage of the pipeline.
+
+    Carries no link.  Untrusted headlines never become clickable destinations
+    (see :mod:`stockbrain.telegram.formatting`), and a chat preview of a page
+    StockBrain has not vouched for is not something this bot should generate.
+    """
+    lines = [
+        f"{bold(esc(_STAGE_HEADLINES[event]))} — {esc(view.status.value)}",
+        trim(view.title, _TITLE_LIMIT),
+    ]
+    if view.event_type:
+        lines.append(f"Type: {esc(view.event_type)}")
+    if view.companies:
+        lines.append("Companies: " + esc(", ".join(view.companies)))
+    scores: list[str] = []
+    if view.importance is not None:
+        scores.append(f"importance {view.importance:.2f}")
+    if view.candidate_score is not None:
+        scores.append(f"candidate {view.candidate_score:.2f}")
+    if scores and event is not PipelineEvent.EVENT_DISCOVERED:
+        lines.append(esc(" · ".join(scores)))
+    lines.append(f"First seen {esc(stamp(view.first_seen_at))}")
+    if event is PipelineEvent.EVENT_CANDIDATE:
+        lines.append(
+            esc(
+                "Queued for research. Research is advisory and never authorizes a trade on its own."
+            )
+        )
+    return "\n".join(lines)
+
+
+def render_research_stage(view: ResearchRunView, event: PipelineEvent) -> str:
+    """One research run, starting or finished.
+
+    A finished run reports its action and confidence and nothing else from the
+    model: hidden reasoning is not stored anywhere in StockBrain and therefore
+    cannot be rendered here, and the confidence is a ranking rather than a
+    calibrated probability -- which the message says, because a number in a chat
+    reads as certainty unless it is told not to.
+    """
+    subject = view.company or view.broker_ticker or str(view.id)
+    lines = [
+        f"{bold(esc(_STAGE_HEADLINES[event]))} — {esc(subject)}",
+    ]
+    if view.broker_ticker and view.company:
+        lines.append(f"Listing: {code(view.broker_ticker)}")
+    if view.event_title:
+        lines.append(f"Trigger: {trim(view.event_title, _TITLE_LIMIT)}")
+    if event is PipelineEvent.RESEARCH_STARTED:
+        lines.append(esc("Research is advisory. It never authorizes a trade on its own."))
+        return "\n".join(lines)
+
+    lines.append(f"Outcome: {esc(view.status.value)}")
+    if view.action:
+        confidence = f" · {view.confidence:.0%} confidence" if view.confidence is not None else ""
+        horizon = f" · horizon {esc(view.horizon)}" if view.horizon else ""
+        lines.append(f"Thesis: {bold(esc(view.action))}{esc(confidence)}{horizon}")
+        lines.append(esc("Confidence is a model ranking, not a calibrated probability."))
+    if view.summary:
+        lines.append(trim(view.summary, _TEXT_LIMIT))
+    if view.error_class:
+        lines.append(f"Error: {esc(view.error_class)}")
+    if view.estimated_cost_usd is not None:
+        lines.append(f"Estimated cost: {esc(f'${view.estimated_cost_usd}')}")
+    lines.append(esc(AUTHORIZATION_NOTICE))
+    return "\n".join(lines)

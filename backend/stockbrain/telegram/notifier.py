@@ -20,6 +20,14 @@ Anti-spam is a rule, not a rate limiter: terminal announcements (rejected,
 invalidated, expired, refused) are sent **only for proposals the operator was
 actually told about**.  A proposal that was born blocked, or that expired before
 anyone saw it, produces no chatter.
+
+The same machinery carries *pipeline* stages -- an article discovered, judged
+relevant, promoted to a research candidate, and the research run that follows.
+They use the same claim-then-send shape, the same unique index and the same
+never-resend rule, keyed ``telegram:pipeline:<entity>:<stage>``; only the
+rendering and the entity type differ.  Which of them are delivered at all is a
+per-category operator preference (:mod:`stockbrain.telegram.preferences`), and
+the noisy ones ship switched off.
 """
 
 from __future__ import annotations
@@ -49,10 +57,23 @@ from stockbrain.proposals.state_machine import assert_transition, can_transition
 from stockbrain.telegram import messages
 from stockbrain.telegram.approvals import ApprovalCoordinator
 from stockbrain.telegram.formatting import bold, chunk, code, esc, trim
+from stockbrain.telegram.preferences import (
+    NotificationCategory,
+    NotificationPreferences,
+    PipelineEvent,
+    category_for_event,
+    category_for_pipeline_event,
+)
 from stockbrain.telegram.service import ProposalView, TelegramService
 from stockbrain.telegram.transport import MessageSender
 
-__all__ = ["CHANNEL", "NotificationResult", "ProposalNotifier", "dedupe_key"]
+__all__ = [
+    "CHANNEL",
+    "NotificationResult",
+    "ProposalNotifier",
+    "dedupe_key",
+    "pipeline_dedupe_key",
+]
 
 log = get_logger(__name__)
 
@@ -123,8 +144,37 @@ _TITLES: dict[NotificationEvent, str] = {
 }
 
 
+#: Which entity a pipeline stage is about.  Recorded on the notification row so
+#: the Notifications table stays joinable back to the thing it described.
+_PIPELINE_ENTITY: dict[PipelineEvent, str] = {
+    PipelineEvent.EVENT_DISCOVERED: "event",
+    PipelineEvent.EVENT_RELEVANT: "event",
+    PipelineEvent.EVENT_CANDIDATE: "event",
+    PipelineEvent.RESEARCH_STARTED: "research_run",
+    PipelineEvent.RESEARCH_COMPLETED: "research_run",
+}
+
+_PIPELINE_TITLES: dict[PipelineEvent, str] = {
+    PipelineEvent.EVENT_DISCOVERED: "Article discovered",
+    PipelineEvent.EVENT_RELEVANT: "Event considered relevant",
+    PipelineEvent.EVENT_CANDIDATE: "Event promoted to research candidate",
+    PipelineEvent.RESEARCH_STARTED: "Research started",
+    PipelineEvent.RESEARCH_COMPLETED: "Research completed",
+}
+
+
 def dedupe_key(proposal_id: uuid.UUID, event: NotificationEvent) -> str:
     return f"{CHANNEL}:proposal:{proposal_id}:{event.value}"
+
+
+def pipeline_dedupe_key(entity_id: uuid.UUID, event: PipelineEvent) -> str:
+    """One message per entity per stage, forever.
+
+    Distinct namespace from the proposal key so a research run and a proposal
+    that share an id space cannot collide, and so a future change to the
+    proposal key shape leaves pipeline history alone.
+    """
+    return f"{CHANNEL}:pipeline:{entity_id}:{event.value}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,12 +195,17 @@ class ProposalNotifier:
         service: TelegramService,
         coordinator: ApprovalCoordinator,
         sender: MessageSender | None = None,
+        preferences: NotificationPreferences | None = None,
     ) -> None:
         self._database = database
         self._settings = settings
         self._service = service
         self._coordinator = coordinator
         self._sender = sender
+        # Defaulted rather than required so a test that only exercises proposal
+        # delivery does not have to build one; the defaults it falls back to are
+        # exactly the shipped ones.
+        self._preferences = preferences or NotificationPreferences(database)
 
     def bind(self, sender: MessageSender | None) -> None:
         """Attach (or detach) the live bot.  Detached, notifications suppress."""
@@ -238,6 +293,107 @@ class ProposalNotifier:
         return NotificationResult(NotificationStatus.SENT, delivered=delivered)
 
     # ------------------------------------------------------------------
+    async def deliver_pipeline(
+        self,
+        entity_id: uuid.UUID,
+        event: PipelineEvent,
+        *,
+        now: dt.datetime | None = None,
+    ) -> NotificationResult:
+        """Announce one pipeline stage.  Idempotent, and never a broker action.
+
+        Reads the entity out of the database rather than trusting a payload: a
+        job that was enqueued four minutes ago describes a world that may have
+        moved, and the message should describe the world.
+        """
+        moment = now or utcnow()
+        category = category_for_pipeline_event(event)
+        entity_type = _PIPELINE_ENTITY[event]
+
+        title, body, text = await self._render_pipeline(entity_id, event)
+        if text is None:
+            return NotificationResult(
+                NotificationStatus.SUPPRESSED, reason=f"{entity_type} not found"
+            )
+
+        claimed = await self._claim_row(
+            dedupe=pipeline_dedupe_key(entity_id, event),
+            notification_class=NotificationClass.PORTFOLIO_EVENT,
+            title=title,
+            body=body,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            now=moment,
+        )
+        if claimed is None:
+            METRICS.inc("stockbrain_telegram_notifications_total", labels={"result": "duplicate"})
+            return NotificationResult(NotificationStatus.SUPPRESSED, reason="already recorded")
+
+        reason = await self._channel_reason(category)
+        if reason is not None:
+            await self._finish(claimed, NotificationStatus.SUPPRESSED, error=reason, now=moment)
+            METRICS.inc("stockbrain_telegram_notifications_total", labels={"result": "suppressed"})
+            return NotificationResult(NotificationStatus.SUPPRESSED, reason=reason)
+
+        assert self._sender is not None  # implied by _channel_reason
+        delivered = 0
+        failures: list[str] = []
+        reference: str | None = None
+        for chat_id in self.targets:
+            try:
+                for part in chunk(text):
+                    message_id = await self._sender.send_message(chat_id, part)
+            except TelegramSendError as exc:
+                failures.append(f"{chat_id}: {exc.category}")
+                continue
+            delivered += 1
+            reference = reference or str(message_id)
+
+        if delivered == 0:
+            await self._finish(
+                claimed,
+                NotificationStatus.FAILED,
+                error="; ".join(failures)[:500] or "no configured target chats",
+                now=moment,
+            )
+            METRICS.inc("stockbrain_telegram_notifications_total", labels={"result": "failed"})
+            return NotificationResult(NotificationStatus.FAILED, reason="; ".join(failures))
+
+        await self._finish(
+            claimed,
+            NotificationStatus.SENT,
+            reference=reference,
+            error="; ".join(failures)[:500] or None,
+            now=moment,
+        )
+        METRICS.inc("stockbrain_telegram_notifications_total", labels={"result": "sent"})
+        log.info(
+            "telegram_pipeline_notification_sent",
+            entity_type=entity_type,
+            entity_id=str(entity_id),
+            pipeline_event=event.value,
+            chats=delivered,
+        )
+        return NotificationResult(NotificationStatus.SENT, delivered=delivered)
+
+    async def _render_pipeline(
+        self, entity_id: uuid.UUID, event: PipelineEvent
+    ) -> tuple[str, str, str | None]:
+        """``(title, body, rendered)`` for one stage, or a ``None`` rendering."""
+        title = _PIPELINE_TITLES[event]
+        if _PIPELINE_ENTITY[event] == "event":
+            view = await self._service.event(entity_id)
+            if view is None:
+                return (title, "", None)
+            return (title, trim(view.title, 400), messages.render_event_stage(view, event))
+        run = await self._service.research_run(entity_id)
+        if run is None:
+            return (title, "", None)
+        subject = run.company or run.broker_ticker or str(run.id)
+        body = f"{subject} — {run.status.value}"
+        return (title, body[:400], messages.render_research_stage(run, event))
+
+    # ------------------------------------------------------------------
     async def _claim(
         self,
         proposal_id: uuid.UUID,
@@ -251,21 +407,47 @@ class ProposalNotifier:
         ``ON CONFLICT DO NOTHING`` against the unique dedupe index rather than a
         select-then-insert: check-then-act is a race, a unique index is not.
         """
-        title = _TITLES[event]
         body = f"{proposal.broker_ticker} {proposal.side} {proposal.quantity}"
         if detail:
             body = f"{body} — {detail[:400]}"
+        return await self._claim_row(
+            dedupe=dedupe_key(proposal_id, event),
+            notification_class=_CLASSES[event],
+            title=_TITLES[event],
+            body=body,
+            entity_type="trade_proposal",
+            entity_id=proposal_id,
+            now=now,
+        )
+
+    async def _claim_row(
+        self,
+        *,
+        dedupe: str,
+        notification_class: NotificationClass,
+        title: str,
+        body: str,
+        entity_type: str,
+        entity_id: uuid.UUID,
+        now: dt.datetime,
+    ) -> uuid.UUID | None:
+        """The insert both delivery paths share.
+
+        One implementation, because the dedupe *shape* is what makes "at most one
+        message" a unique-index guarantee, and two spellings of an insert against
+        one index is two chances to get the ``ON CONFLICT`` clause wrong.
+        """
         statement = (
             pg_insert(Notification)
             .values(
-                notification_class=_CLASSES[event],
+                notification_class=notification_class,
                 channel=CHANNEL,
                 title=title,
                 body=body,
                 status=NotificationStatus.PENDING,
-                entity_type="trade_proposal",
-                entity_id=proposal_id,
-                dedupe_key=dedupe_key(proposal_id, event),
+                entity_type=entity_type,
+                entity_id=entity_id,
+                dedupe_key=dedupe,
                 created_at=now,
             )
             # `uq_notifications_dedupe_key` is a *partial* unique index
@@ -308,15 +490,31 @@ class ProposalNotifier:
     async def _suppression_reason(
         self, proposal: ProposalView, event: NotificationEvent
     ) -> str | None:
+        channel = await self._channel_reason(category_for_event(event))
+        if channel is not None:
+            return channel
+        if event in _FOLLOW_UP_EVENTS and not await self._was_announced(proposal.id):
+            # Never announce the death of something nobody was told was born.
+            return "the proposal was never announced, so its outcome is not announced either"
+        return None
+
+    async def _channel_reason(self, category: NotificationCategory) -> str | None:
+        """Every reason a message of this category cannot be delivered.
+
+        Checked in order of how much the operator can do about it: a master
+        switch first, then the bot, then a destination, then the per-category
+        preference. The category check is last because a deployment with no bot
+        should read "the Telegram bot is not running", not "you switched this
+        category off".
+        """
         if not self._settings.telegram_notifications_enabled:
             return "TELEGRAM_NOTIFICATIONS_ENABLED is false"
         if self._sender is None:
             return "the Telegram bot is not running"
         if not self.targets:
             return "no Telegram chat is configured to notify"
-        if event in _FOLLOW_UP_EVENTS and not await self._was_announced(proposal.id):
-            # Never announce the death of something nobody was told was born.
-            return "the proposal was never announced, so its outcome is not announced either"
+        if not await self._preferences.enabled(category):
+            return f"the {category.value} notification category is switched off"
         return None
 
     async def _was_announced(self, proposal_id: uuid.UUID) -> bool:
@@ -375,7 +573,7 @@ class ProposalNotifier:
                 )
             )
         elif event not in _EXECUTION_EVENTS:
-            lines.append(esc(messages.PHASE_NOTICE))
+            lines.append(esc(messages.AUTHORIZATION_NOTICE))
         return "\n".join(lines)
 
     async def _send(

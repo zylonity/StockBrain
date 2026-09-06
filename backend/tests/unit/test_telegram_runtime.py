@@ -271,4 +271,7 @@ def test_the_runtime_never_receives_a_broker_credential() -> None:
         "health",
         "proposals",
         "control",
+        # Which notification categories are switched on. Reads and writes one
+        # `app_settings` row; it is not a client of anything.
+        "preferences",
     }

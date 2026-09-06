@@ -53,6 +53,7 @@ from stockbrain.telegram.approvals import ApprovalCoordinator, Button
 from stockbrain.telegram.auth import TelegramAuthorizer
 from stockbrain.telegram.handlers import ALLOWED_UPDATES, TelegramHandlers, to_markup
 from stockbrain.telegram.notifier import ProposalNotifier
+from stockbrain.telegram.preferences import NotificationPreferences
 from stockbrain.telegram.service import TelegramService
 from stockbrain.telegram.tokens import TokenService
 from telegram import InlineKeyboardMarkup, LinkPreviewOptions
@@ -129,6 +130,7 @@ class TelegramRuntime:
         health: ProviderHealthRegistry,
         proposals: ProposalService | None,
         control: ControlStateService,
+        preferences: NotificationPreferences | None = None,
     ) -> None:
         self._settings = settings
         self._database = database
@@ -150,11 +152,17 @@ class TelegramRuntime:
             service=self._service,
             control=control,
         )
+        # Shared with the ingestion and classification paths through the service
+        # container: they consult the same preferences to decide whether to
+        # enqueue a notification job at all, and a second instance would be a
+        # second cache that could disagree with this one.
+        self.preferences = preferences or NotificationPreferences(database)
         self.notifier = ProposalNotifier(
             database,
             settings,
             service=self._service,
             coordinator=self._coordinator,
+            preferences=self.preferences,
         )
 
         self._application: Application[Any, Any, Any, Any, Any, Any] | None = None

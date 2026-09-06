@@ -417,8 +417,12 @@ class ApprovalCoordinator:
         proposal = await self._service.proposal(proposal_id)
         suffix = messages.render_terminal_status(proposal) if proposal else None
         return CallbackResult(
-            alert="Authorized. No broker order sent (Phase 8).",
-            text=(f"{bold('AUTHORIZED')}\n{esc(messages.PHASE_NOTICE)}"),
+            # Authorizing is not transmitting. Whether an order follows depends
+            # on the execution gates, which this handler cannot read and must
+            # not guess at: the old wording ("no broker order sent") became a
+            # lie the moment the transmission path existed.
+            alert="Authorized. Transmission is separately gated.",
+            text=(f"{bold('AUTHORIZED')}\n{esc(messages.AUTHORIZATION_NOTICE)}"),
             clear_original_keyboard=True,
             original_suffix=suffix,
             proposal_id=proposal_id,

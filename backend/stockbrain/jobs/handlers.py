@@ -19,6 +19,7 @@ from stockbrain.db.models.companies import Company
 from stockbrain.db.models.sources import Source
 from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic, Notification
 from stockbrain.enums import (
+    EventStatus,
     ExtractionMethod,
     JobType,
     NotificationEvent,
@@ -39,10 +40,12 @@ from stockbrain.extraction.base import ExtractionFailure, ExtractionResult
 from stockbrain.ingestion.provider_budget import estimate_firecrawl_scrape_credits
 from stockbrain.ingestion.service import IngestionOutcome
 from stockbrain.ingestion.web_search import WebSearchQuery, to_raw_document
+from stockbrain.jobs.notifications import enqueue_pipeline_notification
 from stockbrain.jobs.registry import HandlerContext, JobRegistry
 from stockbrain.logging import get_logger
 from stockbrain.observability.health import ProviderName
 from stockbrain.observability.metrics import METRICS
+from stockbrain.telegram.preferences import PipelineEvent
 
 __all__ = [
     "QueryPlan",
@@ -610,6 +613,37 @@ async def handle_sec_refresh(context: HandlerContext) -> None:
     log.info("sec_refresh_complete", companies=len(ciks), created=total_created, failures=failures)
 
 
+async def _announce_stage(
+    context: HandlerContext, entity_id: uuid.UUID, event: PipelineEvent
+) -> None:
+    """Queue one pipeline notification, if this deployment has the parts for it.
+
+    Both dependencies are read with ``getattr`` for the same reason
+    ``handle_send_notification`` reads the Telegram runtime that way: a handler
+    must degrade to "told nobody" rather than raise when an optional subsystem
+    is absent. A research run that succeeded must not be recorded as failed
+    because there was no notification preference row to consult.
+    """
+    queue = getattr(context.services, "queue", None)
+    preferences = getattr(context.services, "notification_preferences", None)
+    if queue is None or preferences is None:
+        return
+    async with context.database.transaction() as session:
+        await enqueue_pipeline_notification(
+            session, queue, preferences, entity_id=entity_id, event=event
+        )
+
+
+#: Which classification outcome announces which stage.  ``IRRELEVANT`` is
+#: absent on purpose: "we read it and it does not matter" is the pipeline
+#: working, and a message for every article the classifier dismissed would be
+#: the firehose with extra steps.
+_CLASSIFICATION_STAGES: dict[EventStatus, PipelineEvent] = {
+    EventStatus.CLASSIFIED: PipelineEvent.EVENT_RELEVANT,
+    EventStatus.CANDIDATE: PipelineEvent.EVENT_CANDIDATE,
+}
+
+
 async def handle_classify_event(context: HandlerContext) -> None:
     """Classify one ingested event with the LLM classifier.
 
@@ -654,6 +688,14 @@ async def handle_classify_event(context: HandlerContext) -> None:
                 dedupe_key=f"resolve:{target}",
                 priority=30,
             )
+
+    # Two distinct facts, announced as two distinct stages. "Considered
+    # relevant" is a judgement the classifier made; "promoted to candidate" is
+    # the moment this story is about to cost research money. An operator who
+    # wants only the second must not have to subscribe to the first.
+    stage = _CLASSIFICATION_STAGES.get(result.status)
+    if stage is not None:
+        await _announce_stage(context, result.merged_into or event_id, stage)
 
     log.info(
         "classify_event_complete",
@@ -833,6 +875,29 @@ async def handle_send_notification(context: HandlerContext) -> None:
     the job simply succeeds having told nobody, which is the truth.
     """
     runtime = getattr(context.services, "telegram", None)
+    if "pipeline_event" in context.payload:
+        # A discovery, classification or research stage rather than a proposal
+        # transition. Same job type because the durability, the dedupe key and
+        # the never-auto-resend rule are identical; only the rendering differs.
+        entity_id = uuid.UUID(str(context.payload["entity_id"]))
+        stage = PipelineEvent(str(context.payload["pipeline_event"]))
+        if runtime is None:
+            log.debug(
+                "pipeline_notification_skipped",
+                entity_id=str(entity_id),
+                pipeline_event=stage.value,
+                reason="telegram disabled",
+            )
+            return
+        outcome = await runtime.notifier.deliver_pipeline(entity_id, stage)
+        log.info(
+            "pipeline_notification_job_complete",
+            entity_id=str(entity_id),
+            pipeline_event=stage.value,
+            status=outcome.status.value,
+            delivered=outcome.delivered,
+        )
+        return
     if "notification_id" in context.payload:
         # An operational alert rather than a proposal transition. Delivered by
         # the same job type because the durability, the dedupe key and the
@@ -1054,7 +1119,16 @@ async def handle_run_research(context: HandlerContext) -> None:
     if context.services.research is None:
         raise RuntimeError("research is not configured")
     run_id = uuid.UUID(str(context.payload["run_id"]))
-    await context.services.research.run(run_id, job_id=context.job_id)
+
+    await _announce_stage(context, run_id, PipelineEvent.RESEARCH_STARTED)
+    try:
+        await context.services.research.run(run_id, job_id=context.job_id)
+    finally:
+        # In a ``finally`` on purpose: a run that raised still finished, and its
+        # failure is exactly the outcome an operator wants to hear about. The
+        # notifier reads the run's recorded status, so the message says what
+        # happened rather than assuming success.
+        await _announce_stage(context, run_id, PipelineEvent.RESEARCH_COMPLETED)
 
     # The pipeline continues: a published thesis becomes a proposal candidate.
     # The dedupe key means a redelivered research job cannot queue a second

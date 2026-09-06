@@ -164,7 +164,11 @@ async def test_stage_two_authorizes_through_the_shared_service(
 
     result = await coordinator.handle(confirm, user_id=OWNER, chat_id=OWNER)
     assert "Authorized" in result.alert
-    assert "Phase 8" in result.alert or "Phase 8" in (result.text or "")
+    # Authorizing is not transmitting, and the message must say so without
+    # claiming to know which. The old wording asserted "no broker order sent",
+    # which stopped being true the moment the transmission path existed.
+    assert "separately gated" in result.alert
+    assert "Transmission is a separate" in (result.text or "")
 
     async with clean_tables.session() as session:
         proposal = await session.get(TradeProposal, proposal_id)

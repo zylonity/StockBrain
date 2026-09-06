@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -76,6 +77,12 @@ METADATA_ONLY_PROVIDERS: frozenset[SourceProvider] = frozenset(
 _UNTITLED = "(untitled source)"
 
 
+#: Called with the open session and the new event's id, once per event that is
+#: actually created.  Deliberately not called for a duplicate source or for a
+#: source linked onto an existing event: those are not new stories.
+EventCreatedHook = Callable[[AsyncSession, uuid.UUID], Awaitable[None]]
+
+
 class IngestionOutcome(StrEnum):
     CREATED_EVENT = "CREATED_EVENT"
     """New source, new canonical event."""
@@ -105,10 +112,17 @@ class IngestionService:
         queue: JobQueue | None = None,
         event_match_window: dt.timedelta = DEFAULT_EVENT_MATCH_WINDOW,
         classification_enabled: bool = False,
+        on_event_created: EventCreatedHook | None = None,
     ) -> None:
         self._database = database
         self._queue = queue or JobQueue()
         self._event_match_window = event_match_window
+        # A callback rather than a notifier, so ingestion knows nothing about
+        # Telegram, preferences or notification categories. It reports that an
+        # event exists; whoever wired the hook decides whether that is worth
+        # telling anyone. Called inside the ingestion transaction, so an
+        # announcement cannot outlive the event it announces.
+        self._on_event_created = on_event_created
         # Only enqueue classification when a handler actually exists to run it.
         # Creating jobs that nothing can process would fill the queue with rows
         # destined to fail their retry budget.
@@ -294,6 +308,9 @@ class IngestionService:
                 dedupe_key=f"classify:{event.id}",
                 priority=20,
             )
+
+        if self._on_event_created is not None:
+            await self._on_event_created(session, event.id)
 
         METRICS.inc("stockbrain_events_created_total", labels={"provider": document.provider.value})
         log.info(

@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 
 import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.broker.account_state import AccountStateService
 from stockbrain.broker.instrument_sync import InstrumentSyncService
@@ -77,6 +79,7 @@ from stockbrain.jobs.handlers import (
     effective_query_interval_minutes,
     register_ingestion_handlers,
 )
+from stockbrain.jobs.notifications import enqueue_pipeline_notification
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.jobs.registry import JobRegistry
 from stockbrain.jobs.runner import JobRunner
@@ -93,6 +96,7 @@ from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
 from stockbrain.proposals.service import ProposalService
 from stockbrain.risk.config import RiskConfig, risk_config_from_settings
+from stockbrain.telegram.preferences import NotificationPreferences, PipelineEvent
 from stockbrain.telegram.runtime import TelegramRuntime
 
 __all__ = ["DISCOVERY_PAUSED_KEY", "ServiceContainer"]
@@ -166,6 +170,12 @@ class ServiceContainer:
     control: ControlStateService = field(init=False)
     alerts: OperationalAlerts | None = field(default=None, init=False)
     telegram: TelegramRuntime | None = field(default=None, init=False)
+    notification_preferences: NotificationPreferences = field(init=False)
+    """Which notification categories are switched on.
+
+    Constructed unconditionally, even with no bot: the pipeline consults it
+    before enqueueing a notification job, and a deployment without Telegram
+    should not be filling its queue with work nothing can claim."""
 
     t212_orders: Trading212OrderClient | None = field(default=None, init=False)
     execution: ExecutionService | None = field(default=None, init=False)
@@ -181,6 +191,7 @@ class ServiceContainer:
         # execution control that only exists when some optional provider is
         # configured is not an execution control.
         self.control = ControlStateService(self.database)
+        self.notification_preferences = NotificationPreferences(self.database)
         self._build_providers()
         if self.settings.alerts_enabled:
             # Constructed after the providers so it can read their budgets.
@@ -216,13 +227,18 @@ class ServiceContainer:
                 # posture the line exists to report.
                 automatic_mode_permitted=self.settings.automatic_authorization_permitted,
                 automation_blockers=self.settings.automation_blockers,
-                broker_order_transmission="not implemented until phase 8",
+                # Reports the gate, not a hardcoded answer: transmission has
+                # existed for some time and this line still said it did not.
+                broker_order_transmission=(
+                    "permitted" if self.settings.order_transmission_permitted else "blocked"
+                ),
             )
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
             # Only enqueue classification when something can actually run it.
             classification_enabled=self.classification is not None,
+            on_event_created=self._announce_discovered_event,
         )
 
         # The execution layer is built only when there is something to transmit
@@ -268,7 +284,23 @@ class ServiceContainer:
                 health=self.health,
                 proposals=self.proposals,
                 control=self.control,
+                preferences=self.notification_preferences,
             )
+
+    async def _announce_discovered_event(self, session: AsyncSession, event_id: uuid.UUID) -> None:
+        """Ingestion's hook: a brand-new canonical event exists.
+
+        Enqueues nothing unless the operator has switched the (noisy, off by
+        default) ``EVENT_DISCOVERED`` category on, so a busy discovery day costs
+        no queue rows in the normal configuration.
+        """
+        await enqueue_pipeline_notification(
+            session,
+            self.queue,
+            self.notification_preferences,
+            entity_id=event_id,
+            event=PipelineEvent.EVENT_DISCOVERED,
+        )
 
     # ------------------------------------------------------------------
     # Construction

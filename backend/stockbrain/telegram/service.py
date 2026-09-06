@@ -28,7 +28,7 @@ from stockbrain.control.state import ControlSnapshot, ControlStateService
 from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
 from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
 from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
-from stockbrain.db.models.research import Thesis
+from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.models.sources import Event
 from stockbrain.db.session import Database
 from stockbrain.enums import (
@@ -36,6 +36,7 @@ from stockbrain.enums import (
     ExecutionPolicy,
     ProposalStatus,
     ProviderStatus,
+    ResearchStatus,
 )
 from stockbrain.observability.health import ProviderHealthRegistry
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES, AUTHORIZABLE_STATUSES
@@ -45,6 +46,7 @@ __all__ = [
     "PortfolioView",
     "PositionView",
     "ProposalView",
+    "ResearchRunView",
     "ResearchView",
     "StatusView",
     "TelegramService",
@@ -173,6 +175,31 @@ class EventView:
     importance: float | None
     candidate_score: float | None
     companies: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchRunView:
+    """One research run, as a pipeline notification renders it.
+
+    Distinct from :class:`ResearchView`, which is the *thesis* the ``/research``
+    command answers with. A run has a lifecycle and a cost; a thesis has an
+    argument.
+    """
+
+    id: uuid.UUID
+    status: ResearchStatus
+    company: str | None
+    broker_ticker: str | None
+    event_id: uuid.UUID | None
+    event_title: str | None
+    action: str | None
+    confidence: float | None
+    horizon: str | None
+    summary: str | None
+    error_class: str | None
+    estimated_cost_usd: Decimal | None
+    started_at: dt.datetime | None
+    completed_at: dt.datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +422,78 @@ class TelegramService:
             )
             for event in events
         ]
+
+    async def event(self, event_id: uuid.UUID) -> EventView | None:
+        """One event, with the company hints the classifier attached to it."""
+        async with self._database.session() as session:
+            record = await session.get(Event, event_id)
+            if record is None:
+                return None
+            companies = [
+                str(name)
+                for name in (
+                    await session.execute(
+                        sa.select(EventCompanyImpact.company_name_hint)
+                        .where(EventCompanyImpact.event_id == event_id)
+                        .order_by(EventCompanyImpact.materiality_score.desc())
+                        .limit(4)
+                    )
+                ).scalars()
+            ]
+        return EventView(
+            id=record.id,
+            title=record.title,
+            status=record.status,
+            event_type=record.event_type,
+            first_seen_at=record.first_seen_at,
+            importance=record.importance_score,
+            candidate_score=record.candidate_score,
+            companies=companies,
+        )
+
+    async def research_run(self, run_id: uuid.UUID) -> ResearchRunView | None:
+        """One research run and the thesis it published, if it published one."""
+        async with self._database.session() as session:
+            row = (
+                await session.execute(
+                    sa.select(ResearchRun, Company, Event, Thesis)
+                    .outerjoin(Company, Company.id == ResearchRun.company_id)
+                    .outerjoin(Event, Event.id == ResearchRun.event_id)
+                    .outerjoin(Thesis, Thesis.research_run_id == ResearchRun.id)
+                    .where(ResearchRun.id == run_id)
+                    .order_by(Thesis.created_at.desc())
+                )
+            ).first()
+            if row is None:
+                return None
+            run, company, event, thesis = row
+            ticker = (
+                (
+                    await session.execute(
+                        sa.select(BrokerInstrument.broker_ticker).where(
+                            BrokerInstrument.id == run.broker_instrument_id
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+        return ResearchRunView(
+            id=run.id,
+            status=run.status,
+            company=company.name if company else None,
+            broker_ticker=str(ticker) if ticker else None,
+            event_id=run.event_id,
+            event_title=event.title if event else None,
+            action=thesis.action.value if thesis else None,
+            confidence=thesis.confidence if thesis else None,
+            horizon=thesis.time_horizon.value if thesis else None,
+            summary=thesis.summary if thesis else None,
+            error_class=run.error_class,
+            estimated_cost_usd=run.estimated_cost_usd,
+            started_at=run.started_at,
+            completed_at=run.completed_at,
+        )
 
     # ------------------------------------------------------------------
     async def research(self, query: str) -> ResearchView | None:
