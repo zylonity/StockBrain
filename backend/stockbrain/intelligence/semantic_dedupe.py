@@ -39,7 +39,7 @@ from stockbrain.intelligence.schemas import (
     example_dedupe_payload,
 )
 from stockbrain.llm.base import ChatMessage, CompletionRequest, CompletionResult, LlmProvider
-from stockbrain.llm.deepseek import extract_json
+from stockbrain.llm.openai_compat import extract_json
 from stockbrain.logging import get_logger
 
 __all__ = [
@@ -356,6 +356,8 @@ class SemanticDeduplicator:
                 max_output_tokens=self._max_output_tokens,
                 temperature=0.0,
                 json_object=True,
+                json_schema=SemanticDedupeResult.model_json_schema(),
+                json_schema_name="SemanticDedupeResult",
                 thinking=False,
                 timeout_seconds=self._timeout_seconds,
                 purpose=DEDUPE_PURPOSE,

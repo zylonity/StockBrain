@@ -121,7 +121,7 @@ _ALERTABLE_PROVIDERS: tuple[ProviderName, ...] = (
     ProviderName.POSTGRES,
     ProviderName.TRADING212,
     ProviderName.ALPACA_MARKET_DATA,
-    ProviderName.DEEPSEEK,
+    ProviderName.LLM,
 )
 
 

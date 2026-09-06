@@ -639,7 +639,7 @@ async def handle_classify_event(context: HandlerContext) -> None:
         )
         return
 
-    services.health.record(ProviderName.DEEPSEEK, ProviderStatus.HEALTHY)
+    services.health.record(ProviderName.LLM, ProviderStatus.HEALTHY)
 
     # The pipeline continues here: a classified event with affected companies
     # gets its hints resolved to verified instruments. The dedupe key means a

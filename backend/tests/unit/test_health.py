@@ -83,7 +83,7 @@ def test_unconfigured_providers_are_marked_disabled_not_unknown() -> None:
     register_static_provider_states(settings, registry)
 
     for provider in (
-        ProviderName.DEEPSEEK,
+        ProviderName.LLM,
         ProviderName.ALPACA_NEWS,
         ProviderName.FIRECRAWL,
         ProviderName.FRED,

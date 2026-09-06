@@ -82,7 +82,8 @@ stockbrain/
   extraction/firecrawl.py        the paid fallback, and nothing else
   jobs/              PostgreSQL queue, worker pool, scheduler, handlers
 
-  llm/               provider interface, DeepSeek client, pricing, budget, telemetry
+  llm/               provider interface, provider profiles, generic OpenAI-compatible
+                     client, DeepSeek adapter, pricing, budget, telemetry
   intelligence/      classifier, semantic dedupe, prompts, classification service
   instruments/       resolution ladder, curated aliases, resolve service
   market_data/       provider protocol, Alpaca adapter, sessions, price reaction
@@ -265,9 +266,47 @@ network, so a successful prompt injection has nothing to reach for. Everything a
 model returns is validated against a Pydantic schema before any code acts on it —
 JSON that parses is not JSON that is correct.
 
-`thinking` is sent explicitly on every call because DeepSeek's API default is
-*enabled*; the classifier is the cheap high-volume path and must not silently
+`thinking` is sent explicitly on every DeepSeek call because that API's default
+is *enabled*; the classifier is the cheap high-volume path and must not silently
 become a reasoning call.
+
+### The LLM backend is one client and a table of provider profiles
+
+StockBrain talks to any endpoint that speaks `POST /chat/completions` with a
+bearer token. "OpenAI-compatible" is a family resemblance rather than a
+specification, though, and the endpoints disagree about exactly the fields this
+codebase depends on: the name of the output-token cap, how to ask for JSON,
+how (or whether) to turn reasoning off, and where cached prompt tokens are
+reported.
+
+`llm/profiles.py` holds those differences as data. `llm/openai_compat.py` is a
+single request builder and a single response parser driven entirely by a
+profile — no provider names, no `if provider ==` ladders. Adding an endpoint
+means adding a profile.
+
+Three properties are load-bearing and each has a test:
+
+* **No dialect leaks between providers.** DeepSeek's `thinking` object,
+  `reasoning_content` and `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+  live behind the DeepSeek profile and are never sent to, or expected from,
+  anything else.
+* **An unpriced provider cannot run.** `BudgetGuard` sums estimated cost from
+  `llm_calls`, and an unpriced model estimates `None` rather than `0` — so
+  shipping one would not raise the spend caps, it would silently exempt that
+  provider from them. Startup refuses a configured provider whose models have
+  no rates. Where a provider reports no cache split, every prompt token bills
+  at the uncached rate: over-estimating trips a cap early, under-estimating
+  spends past it, and only the first is recoverable.
+* **There is no failover between providers.** A configured backend that fails,
+  fails visibly. Automatic failover would hide an outage, change the cost
+  profile of whatever ran next, and make `llm_calls` ambiguous about which
+  model produced a stored classification. This is the same rule the discovery
+  layer already enforces for paid search providers.
+
+DeepSeek remains the default, and an existing installation needs no new
+configuration: `LLM_PROVIDER` defaults to `deepseek` and the `DEEPSEEK_*`
+settings still apply. Quick and deep roles resolve to one model where a
+provider serves one — nothing downstream requires a Flash/Pro split.
 
 ### Why classification is idempotent in three places
 

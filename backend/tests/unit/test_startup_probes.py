@@ -110,7 +110,7 @@ class _FakeServices:
 
     brave: Any = None
     exa: Any = None
-    deepseek: Any = None
+    llm: Any = None
     sec: Any = None
     fred: Any = None
     t212_account: Any = None
@@ -141,11 +141,11 @@ def test_only_configured_providers_appear_in_the_plan() -> None:
     list of enabled providers, because a client that was never constructed is
     already the answer.
     """
-    services = _FakeServices(brave=_StubVerifier(), deepseek=_StubVerifier())
+    services = _FakeServices(brave=_StubVerifier(), llm=_StubVerifier())
 
     plan = build_probe_plan(services)  # type: ignore[arg-type]
 
-    assert set(plan) == {ProviderName.BRAVE, ProviderName.DEEPSEEK}
+    assert set(plan) == {ProviderName.BRAVE, ProviderName.LLM}
     assert ProviderName.EXA not in plan
     assert ProviderName.FIRECRAWL not in plan
 
@@ -197,7 +197,7 @@ async def test_one_broken_provider_does_not_stop_the_others_being_probed() -> No
     registry = ProviderHealthRegistry()
 
     await probe_enabled_providers(
-        _FakeServices(brave=bad, exa=good, deepseek=good),  # type: ignore[arg-type]
+        _FakeServices(brave=bad, exa=good, llm=good),  # type: ignore[arg-type]
         registry,
     )
 
@@ -205,7 +205,7 @@ async def test_one_broken_provider_does_not_stop_the_others_being_probed() -> No
     assert good.calls == 2, "the healthy providers were still asked"
     assert registry.get(ProviderName.BRAVE).status is ProviderStatus.DOWN
     assert registry.get(ProviderName.EXA).status is ProviderStatus.HEALTHY
-    assert registry.get(ProviderName.DEEPSEEK).status is ProviderStatus.HEALTHY
+    assert registry.get(ProviderName.LLM).status is ProviderStatus.HEALTHY
 
 
 async def test_a_sweep_with_nothing_to_probe_is_a_no_op() -> None:
@@ -232,7 +232,7 @@ async def test_probes_run_concurrently_rather_than_one_after_another() -> None:
             live -= 1
 
     await probe_enabled_providers(
-        _FakeServices(brave=_Slow(), exa=_Slow(), deepseek=_Slow()),  # type: ignore[arg-type]
+        _FakeServices(brave=_Slow(), exa=_Slow(), llm=_Slow()),  # type: ignore[arg-type]
         ProviderHealthRegistry(),
     )
 

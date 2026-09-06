@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
-from pydantic import SecretStr, ValidationError
+from pydantic import SecretStr
 
 from stockbrain.errors import (
     ProviderAuthError,
@@ -26,12 +26,14 @@ from stockbrain.intelligence.research import (
     ResearchToolError,
     ResearchValidationError,
 )
-from stockbrain.intelligence.research_transport import ResearchTransport, Usage
+from stockbrain.intelligence.research_transport import ResearchTransport, validate_usage
 from stockbrain.intelligence.tradingagents_adapter import (
     CONTEXT_TOOL,
     SYSTEM_POLICY,
     TradingAgentsResearchEngine,
 )
+from stockbrain.llm.openai_compat import parse_usage
+from stockbrain.llm.profiles import DEEPSEEK
 from stockbrain.llm.telemetry import LlmCallRecord
 from tests.research_helpers import completion, decision, packet
 
@@ -42,17 +44,20 @@ async def allowed() -> None:
 
 @pytest.mark.parametrize("hits", [0, 60, 100])
 def test_partial_cache_split_accounts_for_all_prompt_tokens(hits: int) -> None:
-    usage = Usage.model_validate(
+    usage = parse_usage(
         {
             "prompt_tokens": 100,
             "completion_tokens": 20,
             "total_tokens": 120,
             "prompt_cache_hit_tokens": hits,
             "completion_tokens_details": {"reasoning_tokens": 10},
-        }
+        },
+        DEEPSEEK,
     )
-    assert usage.prompt_cache_miss_tokens == 100 - hits
-    assert usage.completion_tokens_details.reasoning_tokens == 10
+    assert usage.cache_miss_tokens == 100 - hits
+    assert usage.billable_cache_miss == 100 - hits
+    assert usage.reasoning_tokens == 10
+    validate_usage(usage)
 
 
 @pytest.mark.parametrize(
@@ -65,8 +70,8 @@ def test_partial_cache_split_accounts_for_all_prompt_tokens(hits: int) -> None:
     ],
 )
 def test_inconsistent_provider_accounting_rejected(extra: dict[str, Any]) -> None:
-    with pytest.raises(ValidationError):
-        Usage.model_validate({**completion()["usage"], **extra})
+    with pytest.raises(ValueError):
+        validate_usage(parse_usage({**completion()["usage"], **extra}, DEEPSEEK))
 
 
 @pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])

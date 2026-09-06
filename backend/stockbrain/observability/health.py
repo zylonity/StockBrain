@@ -43,7 +43,7 @@ log = get_logger(__name__)
 
 class ProviderName(StrEnum):
     POSTGRES = "postgres"
-    DEEPSEEK = "deepseek"
+    LLM = "llm"
     ALPACA_NEWS = "alpaca_news"
     ALPACA_MARKET_DATA = "alpaca_market_data"
     BRAVE = "brave"
@@ -83,7 +83,7 @@ SUBSYSTEM_PROVIDERS: dict[Subsystem, tuple[ProviderName, ...]] = {
         ProviderName.FIRECRAWL,
         ProviderName.SEC,
     ),
-    Subsystem.RESEARCH: (ProviderName.DEEPSEEK, ProviderName.TRADINGAGENTS),
+    Subsystem.RESEARCH: (ProviderName.LLM, ProviderName.TRADINGAGENTS),
     Subsystem.EXECUTION: (ProviderName.TRADING212,),
     Subsystem.NOTIFICATIONS: (ProviderName.TELEGRAM,),
 }

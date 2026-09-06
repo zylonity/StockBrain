@@ -29,9 +29,11 @@ class ChatMessage:
 class TokenUsage:
     """Token accounting from one response.
 
-    DeepSeek splits prompt tokens into cache *hit* and *miss* counts, which is
-    not cosmetic: the two are priced roughly thirty times apart, so a cost
-    estimate that ignores the split is meaningless.
+    Providers that report prompt caching split prompt tokens into cache *hit*
+    and *miss* counts, which is not cosmetic: the two are priced tens to
+    hundreds of times apart, so a cost estimate that ignores the split is
+    meaningless. Each provider spells the split differently; normalising it into
+    these two counters is the job of the provider adapter, not of the callers.
     """
 
     prompt_tokens: int = 0
@@ -58,9 +60,11 @@ class TokenUsage:
 class CompletionRequest:
     """One completion, fully specified.
 
-    ``json_object`` requests provider-native JSON mode. ``thinking`` is explicit
-    rather than defaulted because DeepSeek's API default is *enabled*, and the
-    classifier must run without it.
+    ``json_object`` requests provider-native structured output; how that is
+    spelled on the wire depends on the provider profile. ``thinking`` is
+    explicit rather than defaulted because at least one supported API defaults
+    it to *enabled*, and the classifier must run without it wherever the
+    provider permits that.
     """
 
     messages: list[ChatMessage]
@@ -71,6 +75,17 @@ class CompletionRequest:
     thinking: bool = False
     timeout_seconds: float | None = None
     purpose: str = "UNSPECIFIED"
+
+    json_schema: dict[str, Any] | None = None
+    """JSON Schema for providers whose structured output is schema-based.
+
+    Ignored by ``json_object`` providers, which take the schema from the prompt.
+    Supplying it is what lets one caller serve both dialects: the schema is
+    derived from the same Pydantic model that validates the reply, so the two
+    cannot drift apart.
+    """
+
+    json_schema_name: str | None = None
 
 
 @dataclass(slots=True)

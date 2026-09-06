@@ -82,7 +82,8 @@ from stockbrain.jobs.registry import JobRegistry
 from stockbrain.jobs.runner import JobRunner
 from stockbrain.jobs.scheduler import ScheduledTask, Scheduler
 from stockbrain.llm.budget import BudgetGuard, BudgetStatus
-from stockbrain.llm.deepseek import DeepSeekClient
+from stockbrain.llm.factory import build_llm_client, build_pricing_table
+from stockbrain.llm.openai_compat import OpenAICompatibleClient
 from stockbrain.llm.telemetry import LlmTelemetry
 from stockbrain.logging import get_logger
 from stockbrain.market_data.alpaca import AlpacaMarketDataClient
@@ -144,7 +145,7 @@ class ServiceContainer:
     content_extractor: ContentExtractor | None = field(default=None, init=False)
     firecrawl_extractor: FirecrawlContentExtractor | None = field(default=None, init=False)
 
-    deepseek: DeepSeekClient | None = field(default=None, init=False)
+    llm: OpenAICompatibleClient | None = field(default=None, init=False)
     classification: ClassificationService | None = field(default=None, init=False)
     budget: BudgetGuard | None = field(default=None, init=False)
 
@@ -415,9 +416,9 @@ class ServiceContainer:
         # with no broker credentials; it then honestly reports NOT_FOUND.
         self.resolution = ResolutionService(self.database, broker=Broker.TRADING212)
 
-        if settings.classifier_enabled and settings.deepseek_api_key.get_secret_value():
-            self.deepseek = DeepSeekClient(settings, max_attempts=settings.deepseek_max_attempts)
-            telemetry = LlmTelemetry()
+        if settings.classifier_enabled and settings.active_llm_api_key.get_secret_value():
+            self.llm = build_llm_client(settings)
+            telemetry = LlmTelemetry(build_pricing_table(settings))
             self.budget = BudgetGuard(
                 self.database,
                 daily_soft_usd=settings.llm_daily_soft_usd,
@@ -427,16 +428,16 @@ class ServiceContainer:
                 telemetry=telemetry,
             )
             classifier = EventClassifier(
-                self.deepseek,
-                model=settings.deepseek_flash_model,
-                timeout_seconds=settings.deepseek_timeout_seconds,
+                self.llm,
+                model=settings.active_llm_quick_model,
+                timeout_seconds=settings.active_llm_timeout_seconds,
             )
             deduplicator = (
                 SemanticDeduplicator(
-                    self.deepseek,
-                    model=settings.deepseek_flash_model,
+                    self.llm,
+                    model=settings.active_llm_quick_model,
                     merge_confidence=settings.semantic_dedupe_min_confidence,
-                    timeout_seconds=settings.deepseek_timeout_seconds,
+                    timeout_seconds=settings.active_llm_timeout_seconds,
                 )
                 if settings.semantic_dedupe_enabled
                 else None
@@ -450,7 +451,7 @@ class ServiceContainer:
                 telemetry=telemetry,
             )
 
-        if settings.research_enabled and settings.deepseek_api_key.get_secret_value():
+        if settings.research_enabled and settings.active_llm_api_key.get_secret_value():
             if self.budget is None:
                 self.budget = BudgetGuard(
                     self.database,
@@ -461,14 +462,17 @@ class ServiceContainer:
                 )
             try:
                 self.research_transport = ResearchTransport(
-                    settings.deepseek_api_key,
-                    timeout=settings.deepseek_timeout_seconds,
+                    settings.active_llm_api_key,
+                    profile=settings.llm_profile,
+                    base_url=settings.active_llm_base_url,
+                    timeout=settings.active_llm_timeout_seconds,
                     max_tokens=settings.research_max_output_tokens,
+                    pricing=build_pricing_table(settings),
                 )
                 engine = TradingAgentsResearchEngine(
                     self.research_transport,
-                    quick_model=settings.deepseek_flash_model,
-                    deep_model=settings.deepseek_pro_model,
+                    quick_model=settings.active_llm_quick_model,
+                    deep_model=settings.active_llm_deep_model,
                 )
                 if settings.fred_api_key.get_secret_value():
                     self.fred = FredMacroProvider(settings.fred_api_key)
@@ -498,7 +502,7 @@ class ServiceContainer:
                 )
         else:
             self.health.set_disabled(
-                ProviderName.TRADINGAGENTS, "Research disabled or DeepSeek key missing"
+                ProviderName.TRADINGAGENTS, "Research disabled or LLM key missing"
             )
 
     # ------------------------------------------------------------------
@@ -583,7 +587,7 @@ class ServiceContainer:
             self.firecrawl,
             self.content_extractor,
             self.sec,
-            self.deepseek,
+            self.llm,
             self.t212_metadata,
             self.t212_account,
             self.market_data,
@@ -1199,7 +1203,7 @@ class ServiceContainer:
             return
         state = await self.budget.state(refresh=True)
         if state.status is BudgetStatus.HARD_EXCEEDED or state.status is BudgetStatus.SOFT_EXCEEDED:
-            self.health.record(ProviderName.DEEPSEEK, ProviderStatus.DEGRADED, detail=state.reason)
+            self.health.record(ProviderName.LLM, ProviderStatus.DEGRADED, detail=state.reason)
 
     # ------------------------------------------------------------------
     # News stream

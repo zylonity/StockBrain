@@ -145,9 +145,12 @@ def register_static_provider_states(settings: Settings, registry: ProviderHealth
     Doing this at startup means the GUI shows an honest "not configured" rather
     than an alarming "unknown" for every integration that has not been set up.
     """
-    if not settings.deepseek_api_key.get_secret_value():
-        registry.set_disabled(ProviderName.DEEPSEEK, "DEEPSEEK_API_KEY is not set")
-        registry.set_disabled(ProviderName.TRADINGAGENTS, "requires a DeepSeek API key")
+    if not settings.active_llm_api_key.get_secret_value():
+        # Names the variable the operator actually has to set, which differs by
+        # provider: DeepSeek keeps its own, everything else uses LLM_API_KEY.
+        expected = "DEEPSEEK_API_KEY" if settings.llm_is_deepseek else "LLM_API_KEY"
+        registry.set_disabled(ProviderName.LLM, f"{expected} is not set")
+        registry.set_disabled(ProviderName.TRADINGAGENTS, f"requires an LLM API key ({expected})")
 
     alpaca_configured = bool(
         settings.alpaca_api_key.get_secret_value() and settings.alpaca_api_secret.get_secret_value()

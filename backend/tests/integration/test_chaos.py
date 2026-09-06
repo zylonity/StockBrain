@@ -310,7 +310,7 @@ async def test_an_optional_provider_being_down_keeps_the_service_ready(
     registry.record(ProviderName.POSTGRES, ProviderStatus.HEALTHY)
     registry.record(ProviderName.BRAVE, ProviderStatus.DOWN, detail="429")
     registry.record(ProviderName.ALPACA_NEWS, ProviderStatus.DOWN, detail="socket closed")
-    registry.record(ProviderName.DEEPSEEK, ProviderStatus.DEGRADED, detail="budget")
+    registry.record(ProviderName.LLM, ProviderStatus.DEGRADED, detail="budget")
     registry.set_schema_state(True, "at head")
 
     assert registry.get_database_status() is ProviderStatus.HEALTHY

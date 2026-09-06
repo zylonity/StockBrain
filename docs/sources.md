@@ -18,6 +18,101 @@ Last verification pass: **2026-09-05** (Phase 9; upstream/live checks began Sept
 These were checked against live provider documentation because Phase 1 encodes
 them as configuration defaults.
 
+### Meta Model API — verified 2026-09-06
+
+Checked because StockBrain's LLM backend was generalised to any
+OpenAI-compatible endpoint, and Meta's API is the worked example that proves
+the abstraction is doing real work: it is OpenAI-*shaped* while disagreeing
+with DeepSeek on four of the five fields the provider profile abstracts.
+
+Sources: <https://dev.meta.ai/docs>,
+<https://dev.meta.ai/docs/protocols/chat-completions>,
+<https://dev.meta.ai/docs/models/>,
+<https://dev.meta.ai/docs/pricing-rate-limits>,
+<https://dev.meta.ai/docs/structured-output>,
+<https://dev.meta.ai/docs/prompt-caching>,
+<https://dev.meta.ai/docs/error-handling>
+
+| Detail | Status |
+|---|---|
+| Base `https://api.meta.ai/v1`, endpoint `/chat/completions` | confirmed |
+| `Authorization: Bearer <key>`, OpenAI-compatible shape | confirmed |
+| `muse-spark-1.3` and `muse-spark-1.3-contributor` are current model ids | confirmed |
+| Context window 1,048,576 tokens | confirmed |
+| Output cap is `max_completion_tokens`; `max_tokens` is a deprecated alias | confirmed |
+| Structured output is `response_format: {"type": "json_schema", ...}` | confirmed |
+| `response_format: {"type": "json_object"}` is **not** documented | confirmed |
+| Reasoning cannot be disabled; `reasoning_effort: "none"` returns HTTP 400 | confirmed |
+| `reasoning_effort` accepts minimal / low / medium / high / xhigh | confirmed |
+| Prompt caching is automatic; `usage.prompt_tokens_details.cached_tokens` | confirmed |
+| Cached tokens are a **subset** of `prompt_tokens`, not an extra charge | confirmed |
+| `stop`, `n > 1`, `logprobs`, `logit_bias` are not supported | confirmed |
+| Error envelope `{"error": {message, type, param, code}}` | confirmed |
+| 429 and 503 are retryable and carry `Retry-After`; 400/401/402/404 are not | confirmed |
+| Contributor tier: 100 RPM / 3,000,000 TPM (standard: 3,000 / 4,000,000) | confirmed |
+| `muse-spark-1.3-contributor`: $0.10 / $0.002 / $0.20 per 1M (input / cached / output) | confirmed |
+| `muse-spark-1.3`: $1.25 / $0.15 / $4.25 per 1M | confirmed |
+
+Contributor pricing was independently corroborated on the same date against
+OpenRouter's public catalogue (`GET https://openrouter.ai/api/v1/models`,
+entry `meta/muse-spark-1.3-contributor`), which reported the same
+$0.10 / $0.002 / $0.20.
+
+**Contributor tier data use.** Meta documents this tier as "heavily discounted
+token pricing in exchange for permission to use your prompts and completions to
+train future Meta models". Article text, symbol hints, prompts and model output
+all become Meta training data. This is not a reason to avoid the tier, but it
+is a decision the operator must make deliberately, so it is stated in
+`.env.example` and in `docs/operations.md` as well as here. The
+non-contributor `muse-spark-1.3` carries no such condition.
+
+**Differences that reached the code.** Each is a field on
+`stockbrain.llm.profiles.META`, not a branch in the client:
+
+1. **Reasoning cannot be switched off.** StockBrain's classifier is the cheap
+   high-volume triage path and runs `thinking=False`, which on DeepSeek means
+   `thinking: {"type": "disabled"}`. Muse Spark has no equivalent — the
+   documented floor is `reasoning_effort: "minimal"`, which is what is sent.
+   A classifier call on this provider therefore always pays for some reasoning
+   tokens. The cost estimate stays correct because it is derived from reported
+   usage rather than from what was requested.
+2. **JSON mode is schema-based.** Only `json_schema` is documented, so the
+   caller must supply a schema. `EventClassifier` and `SemanticDeduplicator`
+   pass `model_json_schema()` from the very Pydantic model that validates the
+   reply, so the constraint and the parser cannot drift apart. A `json_schema`
+   provider given no schema raises rather than silently sending unconstrained
+   prose.
+3. **The output cap is spelled differently**, and both spellings must never be
+   sent at once.
+4. **Cached tokens are reported as a subset**, not as a second counter that
+   partitions the prompt. `parse_usage` normalises both dialects into
+   `TokenUsage.cache_hit_tokens` / `cache_miss_tokens`.
+
+`insufficient_system_resource`, `reasoning_content` and the
+`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` split are DeepSeek-only
+and are never sent to, or expected from, this endpoint. A unit test asserts the
+absence of each in every non-DeepSeek request body.
+
+### Model prices — why they are configuration, not code
+
+`python -m stockbrain.llm.rates_cli` looks up published token prices from
+OpenRouter's public, unauthenticated catalogue and prints them as ready-to-paste
+`LLM_*_USD_PER_MTOK` variables. It is an authoring aid. Nothing in the running
+application imports it and the budget guard never reaches the network.
+
+That separation was deliberate, and the catalogue itself demonstrates why.
+Queried on 2026-09-06 it reported `deepseek/deepseek-v4-flash` at
+$0.08162 / $0.16324 per 1M tokens, against the $0.44 / $1.32 peak rates
+DeepSeek publishes and StockBrain ships. Both numbers are defensible — an
+aggregator quotes its own routed, discounted, possibly off-peak price — but
+they differ by more than 5x, and a spend ceiling driven by whichever one a
+third party happened to serve that morning is not a ceiling. Publishing a price
+is also not the same as the price a particular account is billed at, which no
+public catalogue can know.
+
+So rates are pasted in by a human who checked them against the provider's own
+pricing page, and the date and source are recorded here.
+
 ### DeepSeek — API, models, JSON mode, usage, rate limits, pricing
 
 Sources: <https://api-docs.deepseek.com/>,

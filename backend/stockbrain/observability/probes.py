@@ -182,8 +182,8 @@ def build_probe_plan(services: ServiceContainer) -> dict[ProviderName, Probe]:
     if (exa := services.exa) is not None:
         plan[ProviderName.EXA] = _credential_probe(exa.verify_credentials)
 
-    if (deepseek := services.deepseek) is not None:
-        plan[ProviderName.DEEPSEEK] = _credential_probe(deepseek.verify_credentials)
+    if (llm := services.llm) is not None:
+        plan[ProviderName.LLM] = _credential_probe(llm.verify_credentials)
 
     if (sec := services.sec) is not None:
 

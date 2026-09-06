@@ -35,6 +35,8 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from stockbrain.enums import ExecutionPolicy, WebDiscoveryKind, WebDiscoveryProviderName
+from stockbrain.llm.pricing import DEFAULT_RATES, ModelRates, PricingTable
+from stockbrain.llm.profiles import ProviderProfile, profile_for
 
 __all__ = [
     "AppEnv",
@@ -197,6 +199,57 @@ class Settings(BaseSettings):
     research_enabled: bool = True
     research_timeout_seconds: float = Field(default=600, ge=30, le=3600)
     research_max_output_tokens: int = Field(default=3000, ge=256, le=16000)
+
+    # ------------------------------------------------------------------
+    # LLM backend selection
+    #
+    # StockBrain talks to any OpenAI-compatible chat-completions endpoint. The
+    # named profile in ``stockbrain.llm.profiles`` supplies the API contract --
+    # which output-token field, which structured-output dialect, whether
+    # reasoning can be disabled, where cached tokens are reported -- and the
+    # settings below supply the endpoint, the credential, the models and the
+    # rates.
+    #
+    # The default is ``deepseek`` and every DeepSeek setting above still
+    # applies, so an existing installation needs no new configuration and
+    # behaves exactly as before.
+    # ------------------------------------------------------------------
+    llm_provider: str = "deepseek"
+    """Provider profile name. Must exist in ``stockbrain.llm.profiles.PROFILES``.
+
+    An unknown name is a startup error rather than a fallback to a generic
+    profile: a typo must not silently redirect every model call onto a backend
+    with different capabilities and different prices.
+    """
+
+    llm_api_key: SecretStr = SecretStr("")
+    llm_base_url: str = ""
+    llm_model: str = ""
+    """Model used for classification, semantic dedupe and quick research roles."""
+
+    llm_deep_model: str = ""
+    """Model for deep research roles. Empty means "same as ``llm_model``".
+
+    Providers that expose one model for both depths need only set ``LLM_MODEL``;
+    nothing in the calling code requires the two to differ.
+    """
+
+    llm_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
+    llm_max_attempts: int = Field(default=3, ge=1, le=5)
+
+    # Rates in USD per 1,000,000 tokens for the configured models. Required for
+    # any provider without built-in rates, because the spend guard sums cost
+    # estimates and an unpriced model estimates None -- which would silently
+    # exempt it from the daily and monthly caps.
+    llm_input_usd_per_mtok: Decimal | None = None
+    llm_cached_input_usd_per_mtok: Decimal | None = None
+    llm_output_usd_per_mtok: Decimal | None = None
+
+    llm_deep_input_usd_per_mtok: Decimal | None = None
+    llm_deep_cached_input_usd_per_mtok: Decimal | None = None
+    llm_deep_output_usd_per_mtok: Decimal | None = None
+    """Deep-model rates. Unset means the deep model is priced like the quick one,
+    which is correct whenever they are the same model."""
 
     # ------------------------------------------------------------------
     # Classification thresholds
@@ -982,6 +1035,186 @@ class Settings(BaseSettings):
             raise ValueError("LLM_DAILY_HARD_USD must be >= LLM_DAILY_SOFT_USD")
         if self.llm_monthly_hard_usd < self.llm_monthly_soft_usd:
             raise ValueError("LLM_MONTHLY_HARD_USD must be >= LLM_MONTHLY_SOFT_USD")
+        return self
+
+    # ------------------------------------------------------------------
+    # LLM backend resolution
+    #
+    # ``LLM_*`` wins where it is set. Where it is not, and the provider is
+    # DeepSeek, the original ``DEEPSEEK_*`` settings apply -- which is what
+    # keeps an existing installation working with no new configuration.
+    # ------------------------------------------------------------------
+
+    @property
+    def llm_profile(self) -> ProviderProfile:
+        """The active provider's API contract. Raises on an unknown name."""
+        return profile_for(self.llm_provider)
+
+    @property
+    def llm_is_deepseek(self) -> bool:
+        return self.llm_provider.strip().lower() == "deepseek"
+
+    @property
+    def active_llm_api_key(self) -> SecretStr:
+        if self.llm_api_key.get_secret_value():
+            return self.llm_api_key
+        return self.deepseek_api_key if self.llm_is_deepseek else SecretStr("")
+
+    @property
+    def active_llm_base_url(self) -> str:
+        if self.llm_base_url:
+            return self.llm_base_url
+        if self.llm_is_deepseek:
+            return self.deepseek_base_url
+        return self.llm_profile.base_url
+
+    @property
+    def active_llm_quick_model(self) -> str:
+        if self.llm_model:
+            return self.llm_model
+        return self.deepseek_flash_model if self.llm_is_deepseek else ""
+
+    @property
+    def active_llm_deep_model(self) -> str:
+        """Deep-role model, defaulting to the quick model.
+
+        A provider that serves one model at both depths is the normal case, not
+        a special case: nothing downstream requires the two to differ.
+        """
+        if self.llm_deep_model:
+            return self.llm_deep_model
+        if self.llm_is_deepseek and not self.llm_model:
+            return self.deepseek_pro_model
+        return self.active_llm_quick_model
+
+    @property
+    def active_llm_timeout_seconds(self) -> float:
+        if self.llm_is_deepseek and self.llm_timeout_seconds == 120.0:
+            # Unchanged default: defer to the existing DeepSeek setting so an
+            # operator who tuned DEEPSEEK_TIMEOUT_SECONDS keeps that value.
+            return self.deepseek_timeout_seconds
+        return self.llm_timeout_seconds
+
+    @property
+    def active_llm_max_attempts(self) -> int:
+        if self.llm_is_deepseek and self.llm_max_attempts == 3:
+            return self.deepseek_max_attempts
+        return self.llm_max_attempts
+
+    def llm_model_rates(self) -> dict[str, ModelRates]:
+        """Configured rates, keyed by the model they apply to.
+
+        Empty when nothing is configured, in which case only the built-in rates
+        apply. Cached-input rate defaults to the uncached rate rather than to
+        zero: a provider that reports no cache split must not be credited with a
+        discount it never gave.
+        """
+        rates: dict[str, ModelRates] = {}
+        quick = self.active_llm_quick_model
+        if quick and self.llm_input_usd_per_mtok is not None:
+            rates[quick] = ModelRates(
+                cache_hit_input=(
+                    self.llm_cached_input_usd_per_mtok
+                    if self.llm_cached_input_usd_per_mtok is not None
+                    else self.llm_input_usd_per_mtok
+                ),
+                cache_miss_input=self.llm_input_usd_per_mtok,
+                output=(
+                    self.llm_output_usd_per_mtok
+                    if self.llm_output_usd_per_mtok is not None
+                    else self.llm_input_usd_per_mtok
+                ),
+            )
+
+        deep = self.active_llm_deep_model
+        if deep and self.llm_deep_input_usd_per_mtok is not None:
+            rates[deep] = ModelRates(
+                cache_hit_input=(
+                    self.llm_deep_cached_input_usd_per_mtok
+                    if self.llm_deep_cached_input_usd_per_mtok is not None
+                    else self.llm_deep_input_usd_per_mtok
+                ),
+                cache_miss_input=self.llm_deep_input_usd_per_mtok,
+                output=(
+                    self.llm_deep_output_usd_per_mtok
+                    if self.llm_deep_output_usd_per_mtok is not None
+                    else self.llm_deep_input_usd_per_mtok
+                ),
+            )
+        return rates
+
+    @field_validator(
+        "llm_input_usd_per_mtok",
+        "llm_cached_input_usd_per_mtok",
+        "llm_output_usd_per_mtok",
+        "llm_deep_input_usd_per_mtok",
+        "llm_deep_cached_input_usd_per_mtok",
+        "llm_deep_output_usd_per_mtok",
+        mode="before",
+    )
+    @classmethod
+    def _blank_rate_is_unset(cls, value: object) -> object:
+        """An empty variable means "not configured", not "unparseable".
+
+        ``.env.example`` ships these declared and empty so an operator can see
+        they exist, and a dotenv file supplies ``""`` rather than omitting the
+        name. Without this, the shipped example would refuse to load at all --
+        and the resulting error would point at decimal parsing rather than at
+        the missing configuration it actually represents.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _validate_llm_backend(self) -> Settings:
+        """Refuse a backend that cannot be called, or whose spend cannot be counted.
+
+        The pricing requirement is the load-bearing one. ``BudgetGuard`` sums
+        estimated cost from ``llm_calls``, and an unpriced model estimates
+        ``None`` -- so shipping an unpriced provider would not raise the spend
+        caps, it would silently exempt that provider from them. Requiring rates
+        at startup is what keeps ``LLM_DAILY_HARD_USD`` a real ceiling for every
+        endpoint rather than only for the ones this codebase happens to know.
+        """
+        profile_for(self.llm_provider)  # raises on an unknown provider name
+
+        if not (self.classifier_enabled or self.research_enabled):
+            return self
+        if not self.active_llm_api_key.get_secret_value():
+            # No credential means the LLM subsystem stays switched off, which is
+            # a supported configuration and is reported by the health board.
+            return self
+
+        if not self.active_llm_quick_model:
+            raise ValueError(
+                f"LLM_MODEL is required for LLM_PROVIDER={self.llm_provider!r} "
+                "(the profile supplies no default model)"
+            )
+        if not self.active_llm_base_url:
+            raise ValueError(
+                f"LLM_BASE_URL is required for LLM_PROVIDER={self.llm_provider!r} "
+                "(the profile supplies no default endpoint)"
+            )
+
+        pricing = PricingTable({**DEFAULT_RATES, **self.llm_model_rates()})
+        unpriced = sorted(
+            {
+                model
+                for model in (self.active_llm_quick_model, self.active_llm_deep_model)
+                if pricing.rates_for(model) is None
+            }
+        )
+        if unpriced:
+            raise ValueError(
+                "no price is configured for LLM model(s) "
+                f"{', '.join(unpriced)}; set LLM_INPUT_USD_PER_MTOK, "
+                "LLM_CACHED_INPUT_USD_PER_MTOK and LLM_OUTPUT_USD_PER_MTOK "
+                "(and the LLM_DEEP_* equivalents if the deep model differs). "
+                "Without rates the model's spend is not counted against "
+                "LLM_DAILY_HARD_USD or LLM_MONTHLY_HARD_USD"
+            )
+
         return self
 
     @field_validator("brave_result_filter", mode="after")

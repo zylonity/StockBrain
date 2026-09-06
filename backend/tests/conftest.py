@@ -33,6 +33,21 @@ TEST_DATABASE_URL = os.environ.get("DATABASE_URL_TEST") or os.environ.get("DATAB
 _CREDENTIAL_ENVIRONMENT = (
     "STOCKBRAIN_SECRET_KEY",
     "DEEPSEEK_API_KEY",
+    # The generic LLM backend. LLM_PROVIDER and the model/rate variables are
+    # scrubbed alongside the key because they change which provider profile a
+    # test resolves and whether configuration validates at all -- an operator
+    # running against a non-default endpoint must not change a test's premise.
+    "LLM_API_KEY",
+    "LLM_PROVIDER",
+    "LLM_BASE_URL",
+    "LLM_MODEL",
+    "LLM_DEEP_MODEL",
+    "LLM_INPUT_USD_PER_MTOK",
+    "LLM_CACHED_INPUT_USD_PER_MTOK",
+    "LLM_OUTPUT_USD_PER_MTOK",
+    "LLM_DEEP_INPUT_USD_PER_MTOK",
+    "LLM_DEEP_CACHED_INPUT_USD_PER_MTOK",
+    "LLM_DEEP_OUTPUT_USD_PER_MTOK",
     "ALPACA_API_KEY",
     "ALPACA_API_SECRET",
     "BRAVE_API_KEY",

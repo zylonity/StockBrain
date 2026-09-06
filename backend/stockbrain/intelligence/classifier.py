@@ -25,7 +25,7 @@ from stockbrain.errors import ProviderError, ProviderResponseError
 from stockbrain.intelligence.prompts import PromptTemplate, load_prompt, sanitize_untrusted
 from stockbrain.intelligence.schemas import ClassifiedEvent, example_classifier_payload
 from stockbrain.llm.base import ChatMessage, CompletionRequest, CompletionResult, LlmProvider
-from stockbrain.llm.deepseek import extract_json
+from stockbrain.llm.openai_compat import extract_json
 from stockbrain.logging import get_logger
 from stockbrain.observability.metrics import METRICS
 
@@ -151,8 +151,15 @@ class EventClassifier:
             max_output_tokens=self._max_output_tokens,
             temperature=0.0,
             json_object=True,
-            # Non-thinking: this is the cheap high-volume triage path, and
-            # DeepSeek's API default would otherwise enable reasoning.
+            # Derived from the same model that validates the reply, so a
+            # schema-based endpoint is constrained by exactly what the parser
+            # will accept and the two cannot drift apart. Endpoints whose JSON
+            # mode is schemaless ignore it and rely on the prompt.
+            json_schema=ClassifiedEvent.model_json_schema(),
+            json_schema_name="ClassifiedEvent",
+            # Non-thinking wherever the provider allows it: this is the cheap
+            # high-volume triage path, and at least one supported API defaults
+            # reasoning to enabled.
             thinking=False,
             timeout_seconds=self._timeout_seconds,
             purpose=CLASSIFIER_PURPOSE,

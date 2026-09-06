@@ -84,7 +84,7 @@ credential validity instead, using a request the provider is obliged to reject:
 |---|---|---|
 | Brave | search with `q` omitted → 422; a rejected token says `SUBSCRIPTION_TOKEN_INVALID` | $0 |
 | Exa | search with an empty body → 400; a rejected key says 401 | $0 |
-| DeepSeek | `GET /models` | free |
+| LLM (any provider) | `GET /models` on the configured base URL | free |
 | Trading 212 | `GET /equity/account/summary` — one per 5s, rather than the metadata endpoints the instrument sync needs (one per 30s) | free |
 | Alpaca market data | the existing capability probe | free |
 | SEC | `company_tickers()` | free |
@@ -877,3 +877,118 @@ Logs are structured JSON with correlation identifiers (`event_id`,
 Two redaction layers scrub credential-shaped keys and configured secret values.
 Never disable them to debug an integration; log the request shape instead.
 
+
+## Choosing an LLM backend
+
+StockBrain talks to any OpenAI-compatible chat-completions endpoint.
+`LLM_PROVIDER` names a *profile* — the API contract, not the model. The shipped
+default is `deepseek`, and an existing installation needs no new configuration.
+
+| Profile | Endpoint | Output cap | JSON | Reasoning off? | Cached tokens |
+|---|---|---|---|---|---|
+| `deepseek` | `api.deepseek.com` | `max_tokens` | `json_object` | yes, `thinking` | hit/miss split |
+| `meta` | `api.meta.ai/v1` | `max_completion_tokens` | `json_schema` | **no**, floor only | subset counter |
+| `openai` | `api.openai.com/v1` | `max_completion_tokens` | `json_object` | n/a | subset counter |
+| `generic` | you supply it | `max_tokens` | `json_object` | n/a | not accounted |
+| `generic-no-json` | you supply it | `max_tokens` | none | n/a | not accounted |
+
+An unknown name is a startup error, not a fallback onto `generic`: a typo must
+not silently redirect every model call onto a backend with different
+capabilities and different prices.
+
+### You must configure prices, and why
+
+Any provider other than DeepSeek requires `LLM_INPUT_USD_PER_MTOK`,
+`LLM_CACHED_INPUT_USD_PER_MTOK` and `LLM_OUTPUT_USD_PER_MTOK`, and startup
+refuses to run without them.
+
+This is not bookkeeping. `BudgetGuard` sums estimated cost from `llm_calls`, and
+`PricingTable.estimate` returns `None` — not `0` — for a model it cannot price.
+An unpriced provider is therefore not merely mis-reported in the spend panel; it
+is silently **exempt** from `LLM_DAILY_HARD_USD` and `LLM_MONTHLY_HARD_USD`.
+Requiring rates at startup is what keeps those a real ceiling for every
+endpoint rather than only for the ones the codebase happens to know.
+
+Leaving the cached-input rate unset bills cached tokens at the full input rate.
+That over-estimates, which is the safe direction: a budget that under-counts
+spends past its ceiling, and only over-counting is recoverable. Where a provider
+reports no cache split at all, StockBrain never credits it with a hit.
+
+To look up published rates:
+
+```
+python -m stockbrain.llm.rates_cli --search muse-spark
+python -m stockbrain.llm.rates_cli meta/muse-spark-1.3-contributor
+```
+
+It prints the variables ready to paste. It is an authoring aid only — the
+runtime never fetches prices, because a spend ceiling must not depend on a third
+party being reachable, current and honest. Aggregator prices also disagree with
+first-party ones: see `docs/sources.md` for a 5x discrepancy observed on
+2026-09-06. Check the provider's own pricing page, then record the date and
+source.
+
+### There is no failover between providers
+
+A configured backend that fails, fails visibly. StockBrain will not retry the
+call on a second provider. Automatic failover would hide the outage, change the
+cost characteristics of whatever ran next, and make `llm_calls` ambiguous about
+which model actually produced a stored classification — the same reasoning that
+keeps Brave and Exa on separate budgets with no fallback between them.
+
+### Switching provider
+
+1. Set `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL` and the three rate variables.
+2. Restart. The startup probe calls `GET /models` on the configured base URL,
+   which is free and proves the credential.
+3. The health board reports the backend under the provider key `llm`.
+
+To roll back, set `LLM_PROVIDER=deepseek` and clear `LLM_API_KEY`. The
+`DEEPSEEK_*` settings and the DeepSeek adapter are unchanged and still fully
+tested.
+
+### Meta Muse Spark 1.3 Contributor — data use warning
+
+If you configure `muse-spark-1.3-contributor`, be aware what the discount buys.
+Meta documents the contributor tier as offering "heavily discounted token
+pricing in exchange for permission to use your prompts and completions to train
+future Meta models".
+
+Everything StockBrain sends the classifier — article text, your symbol hints,
+your prompts — and everything the model returns becomes Meta training data.
+Nothing blocks its use; the implication is simply explicit. The non-contributor
+`muse-spark-1.3` carries no such condition at $1.25 / $0.15 / $4.25 per 1M
+tokens against the contributor tier's $0.10 / $0.002 / $0.20
+(verified 2026-09-06).
+
+Two operational differences from DeepSeek:
+
+* **Reasoning cannot be disabled.** `reasoning_effort: "none"` is a documented
+  400. The classifier — the cheap high-volume triage path — therefore always
+  pays for some reasoning tokens on this provider. StockBrain sends the
+  documented floor, `minimal`. Watch `reasoning_tokens` in `llm_calls` after
+  switching.
+* **The contributor tier is limited to 100 RPM** (standard is 3,000).
+
+### Comparing two backends before committing to one
+
+`stockbrain.llm.benchmark_cli` runs a fixed case set through two or more
+backends and prints machine-readable rows — per case and arm: schema success,
+classification, latency, input / cached / output tokens and estimated cost.
+
+```
+python -m stockbrain.llm.benchmark_cli --arms arms.json --cases cases.jsonl --limit 20
+```
+
+Arms are described in a JSON file (API keys are named by environment variable,
+never passed on the command line where they would land in shell history); cases
+are JSON Lines. It writes nothing — no `llm_calls` rows, no events — so a
+comparison run cannot pollute spend history, and it is capped at 50 cases so a
+typo cannot start an unbounded paid loop.
+
+It reports no winner. A handful of cases proves API compatibility and exposes
+obvious degradation; it does not establish that one model classifies better than
+another. If score distributions differ materially between backends, that is a
+finding to investigate — not a reason to retune
+`CLASSIFIER_MIN_IMPORTANCE`, `CLASSIFIER_MIN_CONFIDENCE` or
+`CLASSIFIER_MIN_MATERIALITY`, which are unchanged by provider choice.
