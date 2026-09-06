@@ -25,6 +25,40 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 TEST_DATABASE_URL = os.environ.get("DATABASE_URL_TEST") or os.environ.get("DATABASE_URL")
 
+# A developer's `.env` is intentionally useful to the running application, but
+# it must never change a unit or integration test's premise.  Keep this list at
+# the configuration boundary rather than teaching individual tests about the
+# local machine.  Tests that need a credential pass a harmless explicit value
+# (or set one with ``monkeypatch``) as part of their own arrange step.
+_CREDENTIAL_ENVIRONMENT = (
+    "STOCKBRAIN_SECRET_KEY",
+    "DEEPSEEK_API_KEY",
+    "ALPACA_API_KEY",
+    "ALPACA_API_SECRET",
+    "BRAVE_API_KEY",
+    "EXA_API_KEY",
+    "FIRECRAWL_API_KEY",
+    "SEC_CONTACT_EMAIL",
+    "FRED_API_KEY",
+    "T212_API_KEY",
+    "T212_API_SECRET",
+    "TELEGRAM_BOT_TOKEN",
+    "WEB_OWNER_PASSWORD_HASH",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_settings_from_local_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ordinary tests independent of process credentials and root `.env`.
+
+    Explicit ``Settings(_env_file=...)`` remains available to opt-in live tests;
+    normal tests receive only their explicit constructor values and environment
+    values they set themselves with ``monkeypatch``.
+    """
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    for name in _CREDENTIAL_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+
 
 def _settings(**overrides: object) -> Settings:
     base: dict[str, object] = {

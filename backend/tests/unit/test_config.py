@@ -30,6 +30,24 @@ def test_defaults_are_demo_and_execution_is_not_permitted() -> None:
     assert settings.t212_base_url == "https://demo.trading212.com/api/v0"
 
 
+def test_ordinary_settings_do_not_inherit_local_provider_credentials() -> None:
+    """The test fixture, not a developer's `.env`, defines the test premise."""
+    settings = _settings()
+    assert settings.stockbrain_secret_key.get_secret_value() == ""
+    assert settings.deepseek_api_key.get_secret_value() == ""
+    assert settings.alpaca_api_key.get_secret_value() == ""
+    assert settings.alpaca_api_secret.get_secret_value() == ""
+    assert settings.brave_api_key.get_secret_value() == ""
+    assert settings.exa_api_key.get_secret_value() == ""
+    assert settings.firecrawl_api_key.get_secret_value() == ""
+    assert settings.sec_contact_email == ""
+    assert settings.fred_api_key.get_secret_value() == ""
+    assert settings.t212_api_key.get_secret_value() == ""
+    assert settings.t212_api_secret.get_secret_value() == ""
+    assert settings.telegram_bot_token.get_secret_value() == ""
+    assert settings.web_owner_password_hash.get_secret_value() == ""
+
+
 def test_permitted_and_blockers_can_never_disagree() -> None:
     """The banner and the predicate must be the same fact, not two facts.
 
