@@ -20,7 +20,14 @@ from stockbrain.db.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers=False` is not a preference. `fileConfig`
+    # defaults to True, which disables every logger that already exists and is
+    # not named in `alembic.ini` -- and `alembic.ini` names only root,
+    # sqlalchemy and alembic. Run in-process (a test suite, or any future
+    # migrate-on-boot), that silences the entire `stockbrain.*` namespace for
+    # the rest of the process: the application keeps working and stops saying
+    # anything, which is the worst failure a logging change can cause.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
