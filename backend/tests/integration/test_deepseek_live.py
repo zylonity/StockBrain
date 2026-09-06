@@ -1,6 +1,6 @@
 """One minimal real DeepSeek call.
 
-Skipped unless ``DEEPSEEK_API_KEY`` is set, and excluded from CI by the ``live``
+Skipped unless a key is configured, and excluded from CI by the ``live``
 marker. Deliberately tiny: a handful of tokens, one request, no retries beyond
 the client's own bounded policy.
 
@@ -10,13 +10,20 @@ Run it with::
     DEEPSEEK_API_KEY=... .venv/bin/python -m pytest -m live -s \
         tests/integration/test_deepseek_live.py
 
-The key is read from the environment and never printed; the assertions below
-touch only the response shape.
+The credential is read from the repository ``.env`` via an explicit
+``_env_file``, the same way the other live tests do. Reading only
+``os.environ`` is not enough: the autouse isolation fixture deletes every name
+the operator's ``.env`` defines, so a live test that relied on the environment
+would build ``Settings`` with an empty key and fail inside httpx with a
+``LocalProtocolError`` rather than a useful message.
+
+The key is never printed; the assertions below touch only the response shape.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -25,11 +32,34 @@ from stockbrain.llm.base import ChatMessage, CompletionRequest
 from stockbrain.llm.deepseek import DeepSeekClient, extract_json
 from stockbrain.llm.pricing import PricingTable
 
+_ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
+
+
+def _live_settings(**overrides: object) -> Settings:
+    """Settings from the repository ``.env``.
+
+    ``_env_file`` is passed explicitly because the credentials live in the
+    git-ignored ``.env`` and the isolation fixture removes them from
+    ``os.environ`` before every test.
+    """
+    base: dict[str, object] = {"app_env": "test", "log_level": "CRITICAL"}
+    base.update(overrides)
+    if _ENV_PATH.is_file():
+        return Settings(_env_file=str(_ENV_PATH), **base)  # type: ignore[arg-type]
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+def _has_key() -> bool:
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return True
+    return bool(_ENV_PATH.is_file() and _live_settings().deepseek_api_key.get_secret_value())
+
+
 pytestmark = [
     pytest.mark.live,
     pytest.mark.skipif(
-        not os.environ.get("DEEPSEEK_API_KEY"),
-        reason="DEEPSEEK_API_KEY is not set; live provider test skipped",
+        not _has_key(),
+        reason="no DeepSeek API key configured; live provider test skipped",
     ),
 ]
 
@@ -41,7 +71,7 @@ async def test_structured_output_smoke() -> None:
     JSON mode returns parseable JSON, `thinking: disabled` is accepted, the
     usage object carries the cache hit/miss split, and a request id is returned.
     """
-    settings = Settings(app_env="test", log_level="CRITICAL")
+    settings = _live_settings()
     client = DeepSeekClient(settings, max_attempts=2)
     try:
         result = await client.complete(
