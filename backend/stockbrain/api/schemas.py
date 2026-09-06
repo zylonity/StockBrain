@@ -23,6 +23,7 @@ __all__ = [
     "ControlChangeRequest",
     "ControlFlagResponse",
     "ControlStateResponse",
+    "DiscoveryHoldResponse",
     "DiscoveryQueryResponse",
     "DiscoveryStatusResponse",
     "DiscoveryTopicResponse",
@@ -41,7 +42,15 @@ __all__ = [
     "LlmBudgetResponse",
     "LlmCallResponse",
     "LlmUsageResponse",
+    "LogEntryResponse",
+    "LogFacetsResponse",
+    "LogQueryResponse",
     "MarketDataHealthResponse",
+    "NotificationCategoryResponse",
+    "NotificationPreferencesRequest",
+    "NotificationPreferencesResponse",
+    "PortfolioPositionResponse",
+    "PortfolioResponse",
     "PriceReactionResponse",
     "ProposalExecutionResponse",
     "ProviderHealthResponse",
@@ -51,6 +60,9 @@ __all__ = [
     "ReconciliationTriggerRequest",
     "ResolutionListResponse",
     "ResolutionResponse",
+    "SettingGroupResponse",
+    "SettingResponse",
+    "SettingsResponse",
     "SourceResponse",
     "SubsystemHealth",
     "TelegramStatusResponse",
@@ -271,6 +283,20 @@ class ReconciliationTriggerRequest(ApiModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+
+class DiscoveryHoldResponse(ApiModel):
+    """The durable hold on scheduled discovery work.
+
+    Distinct from the trading pause: holding discovery stops the system spending
+    money on new information; pausing trading stops it acting on information it
+    already has.
+    """
+
+    paused: bool
+    changed_at: dt.datetime | None = None
+    actor: str | None = None
+    reason: str | None = None
 
 
 class TelegramStatusResponse(ApiModel):
@@ -867,3 +893,183 @@ class DiscoveryStatusResponse(ApiModel):
     budget: LlmBudgetResponse | None = None
     web_discovery: WebDiscoveryStatusResponse | None = None
     queue: JobQueueHealthResponse | None = None
+
+
+# ---------------------------------------------------------------------------
+# Application logs
+#
+# The wire shape of a bounded, in-memory ring of this process's own structured
+# log events.  ``captured_since`` and ``dropped`` are part of the contract
+# rather than debug extras: a page that silently shows the last four thousand
+# lines of a ten thousand line incident is worse than one that says so.
+# ---------------------------------------------------------------------------
+
+
+class LogEntryResponse(ApiModel):
+    sequence: int
+    """Process-local monotonic id.  Stable for paging; meaningless across restarts."""
+
+    timestamp: dt.datetime
+    level: str
+    logger: str
+    event: str
+    service: str
+    category: str
+    message: str = ""
+    """Rendered exception text, where the event carried one.  Scrubbed of every
+    configured credential before it was ever stored."""
+
+    fields: dict[str, str] = Field(default_factory=dict)
+
+
+class LogQueryResponse(ApiModel):
+    entries: list[LogEntryResponse]
+    total: int
+    limit: int
+    offset: int
+    capacity: int
+    stored: int
+    dropped: int
+    """Entries evicted since start-up because the buffer was full."""
+
+    captured_since: dt.datetime | None = None
+    oldest_at: dt.datetime | None = None
+    newest_at: dt.datetime | None = None
+    min_captured_level: str
+    """Nothing below this level is captured at all, whatever a filter asks for."""
+
+    enabled: bool
+
+
+class LogFacetsResponse(ApiModel):
+    services: dict[str, int]
+    categories: dict[str, int]
+    levels: dict[str, int]
+
+
+# ---------------------------------------------------------------------------
+# Configuration, as an operator reads it
+# ---------------------------------------------------------------------------
+
+
+class SettingResponse(ApiModel):
+    key: str
+    label: str
+    value: str | None = None
+    """Rendered for display.  Always ``null`` for a secret."""
+
+    mutability: str
+    description: str
+    env_var: str | None = None
+    unit: str | None = None
+    impact: str | None = None
+    control: str | None = None
+    """For runtime rows, which control changes it."""
+
+    configured: bool | None = None
+    """For secrets only: whether one is present.  Never what it is."""
+
+
+class SettingGroupResponse(ApiModel):
+    key: str
+    title: str
+    description: str
+    warning: str | None = None
+    blockers: list[str] = Field(default_factory=list)
+    settings: list[SettingResponse]
+
+
+class SettingsResponse(ApiModel):
+    """The whole configuration surface, read-only by construction.
+
+    There is deliberately no companion PUT.  The runtime state this page can
+    change -- the pause, the kill switch, the discovery hold, the notification
+    categories -- each has its own typed, audited route.
+    """
+
+    groups: list[SettingGroupResponse]
+    generated_at: dt.datetime
+
+
+# ---------------------------------------------------------------------------
+# Telegram notification preferences
+# ---------------------------------------------------------------------------
+
+
+class NotificationCategoryResponse(ApiModel):
+    category: str
+    label: str
+    description: str
+    volume: str
+    """How chatty this category is: rare, low, medium or high."""
+
+    enabled: bool
+    locked: bool = False
+    """A locked category cannot be switched off.  Only the unknown-order-state
+    message is locked, because the correct response to it is to do nothing and
+    the obvious one is to resend."""
+
+
+class NotificationPreferencesResponse(ApiModel):
+    categories: list[NotificationCategoryResponse]
+    notifications_enabled: bool
+    """The environment-level master switch.  With it off, nothing is delivered
+    whatever these categories say."""
+
+    delivery_available: bool
+    blockers: list[str] = Field(default_factory=list)
+    updated_at: dt.datetime | None = None
+    updated_by: str | None = None
+
+
+class NotificationPreferencesRequest(ApiModel):
+    """A partial update: only the named categories change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    categories: dict[str, bool] = Field(default_factory=dict, max_length=32)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio
+#
+# The stored mirror of the broker account, never a live broker request: the
+# summary endpoint allows one call every five seconds, and a page that refreshes
+# would spend that budget on nothing.
+# ---------------------------------------------------------------------------
+
+
+class PortfolioPositionResponse(ApiModel):
+    broker_ticker: str
+    name: str | None = None
+    quantity: Decimal
+    quantity_available: Decimal | None = None
+    average_price: Decimal | None = None
+    current_price: Decimal | None = None
+    ppl: Decimal | None = None
+    currency: str | None = None
+    last_synced_at: dt.datetime
+
+
+class PortfolioResponse(ApiModel):
+    available: bool
+    reason: str | None = None
+    account_id: str | None = None
+    currency: str | None = None
+    broker: str = "trading212"
+    broker_environment: str | None = None
+    total_value: Decimal | None = None
+    invested_value: Decimal | None = None
+    result_value: Decimal | None = None
+    cash_available: Decimal | None = None
+    cash_reserved: Decimal | None = None
+    cash_in_pies: Decimal | None = None
+    captured_at: dt.datetime | None = None
+    position_count: int = 0
+    positions: list[PortfolioPositionResponse] = Field(default_factory=list)
+    stale: bool = False
+    """Whether the snapshot is older than the risk engine would accept for
+    sizing.  Displayed rather than hidden: an operator reading a portfolio needs
+    to know it is the number a trade would *not* have been sized on."""
+
+    max_age_seconds: float | None = None

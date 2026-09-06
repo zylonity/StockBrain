@@ -26,8 +26,14 @@ from pydantic import SecretStr
 from structlog.types import EventDict, Processor
 
 from stockbrain.config import LogFormat, Settings, get_settings
+from stockbrain.observability.logstore import LogBuffer, LogCaptureProcessor
 
-__all__ = ["bind_correlation", "configure_logging", "get_logger"]
+__all__ = [
+    "bind_correlation",
+    "configure_logging",
+    "get_logger",
+    "log_buffer",
+]
 
 REDACTED = "***REDACTED***"
 
@@ -114,9 +120,26 @@ def _collect_secret_values(settings: Settings) -> list[str]:
     return values
 
 
+#: The process-wide log buffer the GUI reads.  Replaced wholesale by
+#: :func:`configure_logging` so its capacity follows configuration, and exposed
+#: through :func:`log_buffer` rather than imported directly, because a module
+#: that captured the object at import time would keep querying the buffer the
+#: *previous* configuration built.
+_LOG_BUFFER = LogBuffer(0)
+
+
+def log_buffer() -> LogBuffer:
+    """The buffer the current logging configuration is writing into."""
+    return _LOG_BUFFER
+
+
 def configure_logging(settings: Settings | None = None) -> None:
     """Install the structlog + stdlib logging configuration.  Idempotent."""
+    global _LOG_BUFFER
     settings = settings or get_settings()
+
+    scrubber = SecretScrubber(_collect_secret_values(settings))
+    _LOG_BUFFER = LogBuffer(settings.log_buffer_size, min_level=settings.log_level)
 
     shared: list[Processor] = [
         structlog.contextvars.merge_contextvars,
@@ -125,7 +148,7 @@ def configure_logging(settings: Settings | None = None) -> None:
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
-        SecretScrubber(_collect_secret_values(settings)),
+        scrubber,
     ]
 
     renderer: Processor
@@ -135,6 +158,11 @@ def configure_logging(settings: Settings | None = None) -> None:
     else:
         shared.append(structlog.processors.format_exc_info)
         renderer = structlog.processors.JSONRenderer()
+
+    # Last in the chain on purpose: by this point the event carries its level,
+    # its logger name, an ISO timestamp and any rendered exception, and the
+    # capture scrubs that dictionary again before keeping it.
+    shared.append(LogCaptureProcessor(_LOG_BUFFER, scrubber))
 
     structlog.configure(
         processors=[*shared, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],

@@ -1,18 +1,31 @@
-"""Discovery subsystem status and topic inspection.
+"""Discovery subsystem status, topic inspection and the discovery hold.
 
-Everything here is read-only in this phase. Editing topics from the GUI arrives
-with the settings screen; the data model already supports it.
+Almost everything here is read-only.  The one exception is the durable
+``discovery.paused`` flag, which suspends *scheduled* discovery -- the web
+searches, the SEC sweep and the news backfill -- without touching
+classification, research, proposals or broker reconciliation.
+
+That flag has always been read by the scheduler and by the status endpoint, and
+until now there was no way to set it: a runtime control that existed in the
+database, was honoured by the code, and had no switch anywhere.  These two
+routes are that switch.  They are deliberately *not* the trading pause: holding
+discovery stops the system spending money on new information, while pausing
+trading stops it acting on information it already has, and conflating them would
+mean an operator who wanted one silently got the other.
 """
 
 from __future__ import annotations
 
 import sqlalchemy as sa
 from fastapi import APIRouter
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import selectinload
 
-from stockbrain.api.dependencies import DbSession, ServicesDep, SettingsDep
+from stockbrain.api.dependencies import DatabaseDep, DbSession, ServicesDep, SettingsDep
 from stockbrain.api.schemas import (
     ContentExtractionStatusResponse,
+    ControlChangeRequest,
+    DiscoveryHoldResponse,
     DiscoveryQueryResponse,
     DiscoveryQueryUsageResponse,
     DiscoveryStatusResponse,
@@ -24,16 +37,29 @@ from stockbrain.api.schemas import (
     ProviderUsageResponse,
     WebDiscoveryStatusResponse,
 )
+from stockbrain.db.base import utcnow
 from stockbrain.db.models.sources import Source
-from stockbrain.db.models.system import AppSetting, DiscoveryQuery, DiscoveryTopic, ProviderCall
+from stockbrain.db.models.system import (
+    AppSetting,
+    AuditLog,
+    DiscoveryQuery,
+    DiscoveryTopic,
+    ProviderCall,
+)
 from stockbrain.db.repositories.events import EventRepository
-from stockbrain.enums import ExtractionMethod, ProviderCallOutcome
+from stockbrain.enums import ActorType, ExtractionMethod, ProviderCallOutcome
 from stockbrain.jobs.handlers import build_query_plan
 from stockbrain.jobs.queue import JobQueue
+from stockbrain.logging import get_logger
 from stockbrain.observability.health import ProviderName
 from stockbrain.services import DISCOVERY_PAUSED_KEY, ServiceContainer
 
 router = APIRouter(prefix="/api/v1/discovery", tags=["discovery"])
+
+log = get_logger(__name__)
+
+#: The same server-side constant every other web-originated control uses.
+WEB_ACTOR = "web:owner"
 
 
 @router.get("/status", response_model=DiscoveryStatusResponse, summary="Discovery status")
@@ -89,8 +115,12 @@ async def discovery_status(
         subsystem_running=services is not None,
         news_stream_active=services is not None and services.alpaca_news is not None,
         classifier_active=services is not None and services.classification is not None,
+        # The *active* quick model, not DeepSeek's. Since the LLM layer became
+        # provider-agnostic this panel reported `DEEPSEEK_FLASH_MODEL` whatever
+        # endpoint was actually configured, so a deployment running a different
+        # backend was told it was classifying with a model it never called.
         classifier_model=(
-            settings.deepseek_flash_model
+            settings.active_llm_quick_model
             if services is not None and services.classification is not None
             else None
         ),
@@ -340,3 +370,90 @@ async def list_topics(session: DbSession, settings: SettingsDep) -> list[Discove
         )
         for topic in topics
     ]
+
+
+@router.post(
+    "/pause",
+    response_model=DiscoveryHoldResponse,
+    summary="Hold scheduled discovery work",
+)
+async def pause_discovery(
+    body: ControlChangeRequest, database: DatabaseDep
+) -> DiscoveryHoldResponse:
+    """Stop enqueueing scheduled discovery.
+
+    Work already in the queue still runs: a job that has been claimed is a paid
+    call that may already have left, and cancelling it would lose the result
+    without unspending the money.
+    """
+    return await _set_discovery_hold(database, True, reason=body.reason)
+
+
+@router.post(
+    "/resume",
+    response_model=DiscoveryHoldResponse,
+    summary="Lift the discovery hold",
+)
+async def resume_discovery(
+    body: ControlChangeRequest, database: DatabaseDep
+) -> DiscoveryHoldResponse:
+    return await _set_discovery_hold(database, False, reason=body.reason)
+
+
+async def _set_discovery_hold(
+    database: DatabaseDep, paused: bool, *, reason: str | None
+) -> DiscoveryHoldResponse:
+    """Write the one key this route may write, and audit who did it.
+
+    The key is a module constant, never anything derived from the request: a
+    settings route whose target a client could name would be a generic
+    configuration mutation endpoint, which this deliberately is not.
+    """
+    now = utcnow()
+    payload: dict[str, object] = {
+        "paused": paused,
+        "changed_at": now.isoformat(),
+        "actor": WEB_ACTOR,
+        "reason": (reason or None) and reason[:500],
+    }
+    async with database.transaction() as db_session:
+        statement = pg_insert(AppSetting).values(
+            key=DISCOVERY_PAUSED_KEY,
+            value=payload,
+            description=(
+                "Operator hold on scheduled discovery. Does not stop classification, "
+                "research, proposals or broker reconciliation."
+            ),
+            updated_by=WEB_ACTOR,
+        )
+        await db_session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AppSetting.key],
+                set_={
+                    "value": statement.excluded.value,
+                    "description": statement.excluded.description,
+                    "updated_by": statement.excluded.updated_by,
+                    "updated_at": now,
+                },
+            )
+        )
+        db_session.add(
+            AuditLog(
+                actor_type=ActorType.USER,
+                actor_id=WEB_ACTOR,
+                action="discovery.hold." + ("engaged" if paused else "released"),
+                entity_type="app_setting",
+                details={
+                    "paused": paused,
+                    "reason": (reason or "")[:500] or None,
+                    "broker_orders_touched": False,
+                },
+            )
+        )
+    log.info("discovery_hold_changed", paused=paused, actor=WEB_ACTOR)
+    return DiscoveryHoldResponse(
+        paused=paused,
+        changed_at=now,
+        actor=WEB_ACTOR,
+        reason=(reason or "")[:500] or None,
+    )

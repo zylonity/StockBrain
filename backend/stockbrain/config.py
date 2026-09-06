@@ -146,6 +146,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: LogFormat = LogFormat.JSON
 
+    log_buffer_size: int = Field(default=4000, ge=0, le=50000)
+    """How many recent structured log events the in-process buffer keeps for the
+    GUI's Logs page.
+
+    Bounded, because an unbounded log buffer in a long-running container is a
+    memory leak with a feature request attached. Four thousand entries is a few
+    megabytes and covers hours of a quiet pipeline; ``0`` switches capture off
+    entirely for a deployment that would rather read ``docker compose logs``.
+    Entries are held in memory only and do not survive a restart."""
+
     stockbrain_secret_key: SecretStr = SecretStr("")
     """Signing key for session cookies and approval-token HMACs."""
 

@@ -1,10 +1,9 @@
 """FastAPI application factory and process entrypoint.
 
-One process owns everything: the HTTP API, and (from later phases) the Alpaca
-WebSocket task, the Telegram long-polling application, the scheduler and the
-PostgreSQL-backed job workers.  They are started and stopped by the lifespan
-handler so a failure in an optional subsystem degrades that subsystem instead of
-killing the process.
+One process owns everything: the HTTP API, the Alpaca news WebSocket task, the
+Telegram long-polling application, the scheduler and the PostgreSQL-backed job
+workers.  They are started and stopped by the lifespan handler so a failure in
+an optional subsystem degrades that subsystem instead of killing the process.
 """
 
 from __future__ import annotations
@@ -40,8 +39,11 @@ from stockbrain.api.routes import events as events_routes
 from stockbrain.api.routes import execution as execution_routes
 from stockbrain.api.routes import health as health_routes
 from stockbrain.api.routes import instruments as instrument_routes
+from stockbrain.api.routes import logs as log_routes
+from stockbrain.api.routes import portfolio as portfolio_routes
 from stockbrain.api.routes import proposals as proposal_routes
 from stockbrain.api.routes import research as research_routes
+from stockbrain.api.routes import settings as settings_routes
 from stockbrain.api.routes import system as system_routes
 from stockbrain.config import Settings, get_settings
 from stockbrain.db.base import utcnow as _utcnow
@@ -409,6 +411,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(research_routes.router)
     app.include_router(proposal_routes.router)
     app.include_router(execution_routes.router)
+    app.include_router(portfolio_routes.router)
+    app.include_router(log_routes.router)
+    app.include_router(settings_routes.router)
 
     _mount_frontend(app)
     return app

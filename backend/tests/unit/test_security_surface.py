@@ -63,11 +63,22 @@ _EXPECTED_MUTATIONS = {
     "POST /api/v1/system/resume",
     "POST /api/v1/system/kill-switch",
     "POST /api/v1/execution/attempts/{attempt_id}/reconcile",
-    # Phase 9's web authentication. These change *session* state and nothing
-    # else: neither can name a proposal, a ticker, a side or a quantity, and
-    # neither touches the database. They are listed here because the point of
-    # this set is that every mutation is accounted for -- not that mutations
-    # are rare.
+    # The durable hold on *scheduled discovery*. It stops the system spending
+    # money on new information; it cannot stop, start, size or authorize a
+    # trade, and it writes one module-constant settings key that no request
+    # body can redirect.
+    "POST /api/v1/discovery/pause",
+    "POST /api/v1/discovery/resume",
+    # Which categories of Telegram message are delivered. Writes one
+    # module-constant settings key. A notification is derived from state and is
+    # never state, so nothing here can change what the system does -- only what
+    # it says. Note there is deliberately no general settings mutation route:
+    # every gate in this system is environment-driven with a restart behind it.
+    "PUT /api/v1/system/telegram/preferences",
+    # Web authentication. These change *session* state and nothing else:
+    # neither can name a proposal, a ticker, a side or a quantity, and neither
+    # touches the database. They are listed here because the point of this set
+    # is that every mutation is accounted for -- not that mutations are rare.
     "POST /api/v1/auth/login",
     "POST /api/v1/auth/logout",
 }
