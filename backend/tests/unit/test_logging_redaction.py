@@ -23,6 +23,15 @@ import structlog
 from stockbrain.config import Settings
 from stockbrain.logging import REDACTED, SecretScrubber, configure_logging
 
+#: The credentials the end-to-end fixture configures.  Named so a test can
+#: assert on the exact value the running application would have leaked.
+_SECRETS: dict[str, str] = {
+    "t212_api_secret": "t212-secret-value-abcdef",
+    "deepseek_api_key": "sk-deepseek-abcdef123456",
+    "telegram_bot_token": "1234567:AA-telegram-token-value",
+}
+
+
 # ---------------------------------------------------------------------------
 # Processor-level tests
 # ---------------------------------------------------------------------------
@@ -103,9 +112,9 @@ def log_stream() -> Iterator[io.StringIO]:
         app_env="test",
         log_level="DEBUG",
         log_format="json",
-        t212_api_secret="t212-secret-value-abcdef",
-        deepseek_api_key="sk-deepseek-abcdef123456",
-        telegram_bot_token="1234567:AA-telegram-token-value",
+        t212_api_secret=_SECRETS["t212_api_secret"],
+        deepseek_api_key=_SECRETS["deepseek_api_key"],
+        telegram_bot_token=_SECRETS["telegram_bot_token"],
     )
     configure_logging(settings)
     buffer = io.StringIO()
@@ -153,6 +162,30 @@ def test_end_to_end_value_scrubbing_of_every_configured_secret(
         "t212-secret-value-abcdef",
     ):
         assert secret not in rendered
+
+
+def test_a_secret_inside_an_exception_message_never_reaches_stdout(
+    log_stream: io.StringIO,
+) -> None:
+    """The gap this ordering closes.
+
+    The scrubber used to run *before* the traceback was rendered -- by
+    ``format_exc_info`` in JSON mode and by the console renderer in console mode
+    -- so a credential inside an exception *message* went to stdout, and
+    therefore to ``docker logs`` and to any shipper, in the clear. A provider
+    that puts its key in an error string is not hypothetical.
+    """
+    try:
+        raise RuntimeError(f"auth rejected for {_SECRETS['telegram_bot_token']}")
+    except RuntimeError:
+        structlog.get_logger("stockbrain.llm.openai_compat").exception("llm_call_failed")
+
+    output = log_stream.getvalue()
+    assert _SECRETS["telegram_bot_token"] not in output
+    assert REDACTED in output
+    # And the traceback is still there: scrubbing must not cost the diagnosis.
+    assert "Traceback" in output
+    assert "RuntimeError" in output
 
 
 def test_end_to_end_output_is_valid_json_with_utc_timestamp(

@@ -251,6 +251,30 @@ def test_the_service_container_builds_a_runtime_when_it_is_configured() -> None:
     assert container.telegram.enabled
 
 
+def test_the_status_payload_satisfies_the_api_response_model() -> None:
+    """The bug this catches answered 500 exactly when Telegram was working.
+
+    ``TelegramStatusResponse`` forbids extra fields, and the runtime reported a
+    ``fatal`` key the model did not declare -- so ``/api/v1/system/telegram``
+    validated fine on the "no runtime" path every test exercised, and raised on
+    the path a deployment with a configured bot actually takes.
+    """
+    from stockbrain.api.schemas import TelegramStatusResponse
+
+    runtime, _ = _runtime(_settings())
+    payload = runtime.status()
+    rendered = TelegramStatusResponse.model_validate(payload)
+
+    # Every key the runtime reports is declared, and nothing else is invented.
+    assert set(payload) == set(TelegramStatusResponse.model_fields)
+    assert rendered.bot_configured is True
+    # And still no token, and no bot id -- the digits before the colon are half
+    # of the credential, which is why `bot_identified` is a boolean.
+    rendered_payload = str(payload)
+    assert TOKEN not in rendered_payload
+    assert TOKEN.split(":")[0] not in rendered_payload
+
+
 def test_the_runtime_never_receives_a_broker_credential() -> None:
     """The bot's dependencies are a database, health, control and proposals.
 

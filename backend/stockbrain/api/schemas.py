@@ -322,6 +322,16 @@ class TelegramStatusResponse(ApiModel):
     group_chats_allowed: bool = False
     blockers: list[str] = Field(default_factory=list)
 
+    fatal: str | None = None
+    """Why the bot could not start, when it could not.
+
+    Its absence here is what made this endpoint answer 500 for every deployment
+    that actually had Telegram running: the runtime reports the key, the model
+    forbids extras, and validation failed -- so the System Health panel was
+    broken in exactly the configuration anyone would look at it in. A category,
+    never a provider body: "Telegram rejected the bot token" says what to do
+    without quoting a response that echoes the request."""
+
 
 # ---------------------------------------------------------------------------
 # Discovery and events

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import warnings
 from collections.abc import Iterable, MutableMapping
 from typing import Any
 
@@ -148,20 +149,41 @@ def configure_logging(settings: Settings | None = None) -> None:
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
+        # The traceback is rendered into `exception` *before* the scrubber runs,
+        # which is the whole point of this ordering. Previously the scrubber ran
+        # first and the exception was formatted afterwards -- by the renderer in
+        # console mode, and by `format_exc_info` in JSON mode -- so a credential
+        # inside an exception *message* ("auth failed for sk-live-...") reached
+        # stdout, and therefore `docker logs` and any shipper, unredacted. Both
+        # formats now render it here so both are scrubbed.
+        structlog.dev.set_exc_info,
+        structlog.processors.format_exc_info,
         scrubber,
     ]
 
-    renderer: Processor
-    if settings.log_format is LogFormat.CONSOLE:
-        shared.append(structlog.dev.set_exc_info)
-        renderer = structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
-    else:
-        shared.append(structlog.processors.format_exc_info)
-        renderer = structlog.processors.JSONRenderer()
+    # ConsoleRenderer warns that it cannot pretty-print exceptions while
+    # `format_exc_info` is in the chain. That is the deliberate trade made
+    # above -- a plain traceback that is scrubbed beats a pretty one that
+    # leaks -- and it is not something an operator can act on.
+    warnings.filterwarnings(
+        "ignore",
+        message="Remove `format_exc_info` from your processor chain",
+        category=UserWarning,
+        module="structlog.*",
+    )
+
+    renderer: Processor = (
+        structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
+        if settings.log_format is LogFormat.CONSOLE
+        else structlog.processors.JSONRenderer()
+    )
 
     # Last in the chain on purpose: by this point the event carries its level,
-    # its logger name, an ISO timestamp and any rendered exception, and the
-    # capture scrubs that dictionary again before keeping it.
+    # its logger name, an ISO timestamp and any rendered exception. It scrubs
+    # the dictionary again before keeping it -- redundant now that the scrubber
+    # runs after `format_exc_info`, and kept because the buffer is served over
+    # HTTP and a reordering of this list must not silently turn that into a
+    # leak.
     shared.append(LogCaptureProcessor(_LOG_BUFFER, scrubber))
 
     structlog.configure(
