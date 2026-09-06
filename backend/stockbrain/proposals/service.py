@@ -811,6 +811,7 @@ class ProposalService:
                     f"{target.value.lower()}"
                 )
             assert_transition(proposal.status, target)
+            previous_status = proposal.status
             proposal.status = target
             proposal.status_reason = reason[:1000]
             proposal.updated_at = now
@@ -827,7 +828,11 @@ class ProposalService:
                     action=action,
                     entity_type="trade_proposal",
                     entity_id=proposal.id,
-                    details={"reason": reason[:1000], "previous_status": proposal.status.value},
+                    details={
+                        "reason": reason[:1000],
+                        "previous_status": previous_status.value,
+                        "new_status": proposal.status.value,
+                    },
                 )
             )
             await session.flush()

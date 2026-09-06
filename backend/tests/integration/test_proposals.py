@@ -479,6 +479,57 @@ async def test_a_rejection_is_durable_and_terminal(clean_tables: Database) -> No
         )
 
 
+@pytest.mark.parametrize(
+    "previous_status,target",
+    [
+        (ProposalStatus.READY, ProposalStatus.REJECTED),
+        (ProposalStatus.APPROVAL_PENDING, ProposalStatus.REJECTED),
+        (ProposalStatus.READY, ProposalStatus.CANCELLED),
+        (ProposalStatus.APPROVED, ProposalStatus.CANCELLED),
+    ],
+)
+async def test_termination_audit_records_both_sides_of_the_transition(
+    clean_tables: Database,
+    previous_status: ProposalStatus,
+    target: ProposalStatus,
+) -> None:
+    await ph.seed(clean_tables)
+    await ph.fund(clean_tables)
+    service = ph.service(clean_tables)
+    result = await service.generate(ph.THESIS_ID)
+    assert result.proposal_id is not None
+    if previous_status is ProposalStatus.APPROVED:
+        await service.authorize(
+            result.proposal_id, source=AuthorizationSource.HUMAN_WEB, actor="web:operator"
+        )
+    elif previous_status is ProposalStatus.APPROVAL_PENDING:
+        async with clean_tables.transaction() as session:
+            proposal = await session.get(TradeProposal, result.proposal_id)
+            assert proposal is not None
+            proposal.status = previous_status
+
+    terminate = service.reject if target is ProposalStatus.REJECTED else service.cancel
+    await terminate(result.proposal_id, actor="web:operator", reason="operator decision")
+
+    async with clean_tables.session() as session:
+        proposal = await session.get(TradeProposal, result.proposal_id)
+        audit = (
+            await session.scalars(
+                sa.select(AuditLog).where(
+                    AuditLog.entity_id == result.proposal_id,
+                    AuditLog.action == f"proposal.{target.value.lower()}",
+                )
+            )
+        ).one()
+        assert proposal is not None and proposal.status is target
+        assert audit.actor_id == "web:operator"
+        assert audit.details == {
+            "reason": "operator decision",
+            "previous_status": previous_status.value,
+            "new_status": target.value,
+        }
+
+
 async def test_every_authorization_and_refusal_reaches_the_audit_log(
     clean_tables: Database,
 ) -> None:
