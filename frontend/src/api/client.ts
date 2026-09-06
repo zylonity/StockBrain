@@ -30,14 +30,22 @@ import type {
   ExecutionStatusResponse,
   HealthResponse,
   InstrumentSyncStatus,
+  LivenessResponse,
   MarketDataHealth,
   PriceReaction,
   ProvidersResponse,
   ReadinessResponse,
+  DiscoveryHold,
+  LogFacets,
+  LogFilters,
+  LogQueryResponse,
+  NotificationPreferences,
+  PortfolioResponse,
   Resolution,
   ResolutionListResponse,
   ResolutionStatus,
   SessionView,
+  SettingsResponse,
   TelegramStatusResponse,
   FxStatus,
   WebSecurityStatus,
@@ -69,8 +77,20 @@ export function csrfToken(): string {
 }
 
 async function post<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+  return mutate<T>("POST", path, body);
+}
+
+async function put<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+  return mutate<T>("PUT", path, body);
+}
+
+async function mutate<T>(
+  method: "POST" | "PUT",
+  path: string,
+  body: Record<string, unknown>,
+): Promise<T> {
   return request<T>(path, {
-    method: "POST",
+    method,
     headers: {
       "Content-Type": "application/json",
       // Present on every state-changing call. A cross-site attacker can cause
@@ -107,6 +127,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+/**
+ * Build the log query string.
+ *
+ * Every parameter narrows. There is deliberately no path, file or container
+ * parameter to build: the backend reads a bounded in-memory ring and has no
+ * filesystem surface for this page to reach.
+ */
+export function logQuery(filters: LogFilters): string {
+  const params = new URLSearchParams();
+  if (filters.minLevel) params.set("min_level", filters.minLevel);
+  if (filters.services?.length) params.set("services", filters.services.join(","));
+  if (filters.categories?.length) params.set("categories", filters.categories.join(","));
+  if (filters.sinceMinutes) params.set("since_minutes", String(filters.sinceMinutes));
+  if (filters.search?.trim()) params.set("search", filters.search.trim());
+  params.set("limit", String(filters.limit ?? 100));
+  params.set("offset", String(filters.offset ?? 0));
+  return params.toString();
+}
+
 function eventQuery(filters: EventFilters): string {
   const params = new URLSearchParams();
   if (filters.status) params.set("status", filters.status);
@@ -125,6 +164,9 @@ export const api = {
   logout: () => post<SessionView>("/api/v1/auth/logout"),
   research: (eventId?: string) => request<ResearchRun[]>(`/api/v1/research${eventId ? `?event_id=${encodeURIComponent(eventId)}` : ""}`),
   researchRun: (id: string) => request<ResearchRun>(`/api/v1/research/${encodeURIComponent(id)}`),
+  // The cheapest read in the API: no database, no provider. Used for the build
+  // identity in the top bar, where a full health poll would be wasteful.
+  liveness: () => request<LivenessResponse>("/api/health/live"),
   health: () => request<HealthResponse>("/api/health"),
   readiness: () => request<ReadinessResponse>("/api/health/ready"),
   providers: () => request<ProvidersResponse>("/api/health/providers"),
@@ -220,6 +262,29 @@ export const api = {
   cancelProposal: (id: string, reason?: string) =>
     post<Proposal>(`/api/v1/proposals/${encodeURIComponent(id)}/cancel`,
       reason ? { reason } : {}),
+
+  logs: (filters: LogFilters = {}) =>
+    request<LogQueryResponse>(`/api/v1/system/logs?${logQuery(filters)}`),
+  logFacets: () => request<LogFacets>("/api/v1/system/logs/facets"),
+  settings: () => request<SettingsResponse>("/api/v1/system/settings"),
+  notificationPreferences: () =>
+    request<NotificationPreferences>("/api/v1/system/telegram/preferences"),
+  /**
+   * Save a *partial* set of category switches.
+   *
+   * Partial on purpose: the server merges, so two browser tabs cannot silently
+   * revert each other's untouched categories. A locked category is forced back
+   * on by the server and the response says so.
+   */
+  updateNotificationPreferences: (categories: Record<string, boolean>) =>
+    put<NotificationPreferences>("/api/v1/system/telegram/preferences", { categories }),
+  portfolio: () => request<PortfolioResponse>("/api/v1/portfolio"),
+  // Holds *scheduled discovery*: no new paid searches, filings sweeps or
+  // backfills are enqueued. Deliberately not the trading pause.
+  pauseDiscovery: (reason?: string) =>
+    post<DiscoveryHold>("/api/v1/discovery/pause", reason ? { reason } : {}),
+  resumeDiscovery: (reason?: string) =>
+    post<DiscoveryHold>("/api/v1/discovery/resume", reason ? { reason } : {}),
 
   priceReaction: (eventId: string) =>
     request<PriceReaction[]>(

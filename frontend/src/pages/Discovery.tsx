@@ -1,4 +1,7 @@
+import { Link } from "react-router-dom";
+
 import { api } from "../api/client";
+import { EmptyState, PageHeader, RefreshButton, TableWrap } from "../components/Page";
 import { StatusPill } from "../components/StatusPill";
 import { formatRelative, formatTimestamp } from "../components/formats";
 import { usePolling } from "../components/usePolling";
@@ -11,18 +14,21 @@ export function Discovery() {
 
   return (
     <>
-      <div className="refresh-row">
-        <div>
-          <h1 className="page-title">Discovery</h1>
-          <p className="page-subtitle" style={{ marginBottom: 0 }}>
-            Ingestion throughput, scheduled work, and the thematic search topics
-            that drive broad-web discovery.
-          </p>
-        </div>
-        <button onClick={status.refresh} disabled={status.loading}>
-          {status.loading ? "Refreshing…" : "Refresh"}
-        </button>
-      </div>
+      <PageHeader
+        title="Discovery"
+        subtitle="Ingestion throughput, scheduled work, what each paid provider is allowed to spend, and the thematic search topics that drive broad-web discovery."
+        actions={
+          <>
+            <Link className="button-quiet" to="/logs?categories=discovery">
+              View logs
+            </Link>
+            <Link className="button-quiet" to="/settings">
+              Settings
+            </Link>
+            <RefreshButton onClick={status.refresh} busy={status.loading} />
+          </>
+        }
+      />
 
       {status.error && <div className="error">{status.error}</div>}
 
@@ -116,6 +122,7 @@ export function Discovery() {
               {status.data.budget.reason}
             </div>
           )}
+          <TableWrap>
           <table>
             <thead>
               <tr>
@@ -152,6 +159,7 @@ export function Discovery() {
               </tr>
             </tbody>
           </table>
+          </TableWrap>
           <p className="metric-note">
             At the soft limit, optional work such as semantic deduplication is
             suppressed. At the hard limit, no new model analysis starts —
@@ -170,6 +178,7 @@ export function Discovery() {
             pending job: a stopped pipeline looks identical to a healthy one
             from every other angle.
           </p>
+          <TableWrap>
           <table>
             <tbody>
               <tr>
@@ -207,7 +216,9 @@ export function Discovery() {
               </tr>
             </tbody>
           </table>
+          </TableWrap>
           {Object.keys(status.data.queue.counts_by_type).length > 0 && (
+            <TableWrap>
             <table>
               <thead>
                 <tr>
@@ -226,6 +237,7 @@ export function Discovery() {
                   ))}
               </tbody>
             </table>
+            </TableWrap>
           )}
         </div>
       )}
@@ -244,6 +256,7 @@ export function Discovery() {
             news, SEC EDGAR, classification, research and broker reconciliation
             all continue.
           </p>
+          <TableWrap>
           <table>
             <thead>
               <tr>
@@ -285,6 +298,7 @@ export function Discovery() {
               ))}
             </tbody>
           </table>
+          </TableWrap>
           {status.data.web_discovery.providers.flatMap((provider) =>
             provider.exhausted_reasons.map((reason) => (
               <p key={`${provider.provider}:${reason}`} className="banner banner-warn">
@@ -323,6 +337,7 @@ export function Discovery() {
             </strong>
             .
           </p>
+          <TableWrap>
           <table>
             <tbody>
               <tr>
@@ -357,6 +372,7 @@ export function Discovery() {
               </tr>
             </tbody>
           </table>
+          </TableWrap>
           <ul className="reason-list">
             {status.data.web_discovery.extraction.blockers.map((blocker) => (
               <li key={blocker} className="muted">
@@ -376,6 +392,7 @@ export function Discovery() {
               written after every attempt — succeeded, failed or budget-refused —
               so a restart cannot reset a cooldown.
             </p>
+            <TableWrap>
             <table>
               <thead>
                 <tr>
@@ -419,12 +436,14 @@ export function Discovery() {
                 ))}
               </tbody>
             </table>
+            </TableWrap>
           </div>
         )}
 
       <div className="grid">
         <div className="card">
           <h2>Sources by provider</h2>
+          <TableWrap>
           <table>
             <tbody>
               {Object.entries(stats?.sources_by_provider ?? {}).map(([name, count]) => (
@@ -440,10 +459,12 @@ export function Discovery() {
               )}
             </tbody>
           </table>
+          </TableWrap>
         </div>
 
         <div className="card">
           <h2>Events by status</h2>
+          <TableWrap>
           <table>
             <tbody>
               {Object.entries(stats?.events_by_status ?? {}).map(([name, count]) => (
@@ -459,11 +480,13 @@ export function Discovery() {
               )}
             </tbody>
           </table>
+          </TableWrap>
         </div>
       </div>
 
       <div className="card" style={{ marginBottom: 18 }}>
         <h2>Scheduled tasks</h2>
+        <TableWrap>
         <table>
           <thead>
             <tr>
@@ -493,6 +516,7 @@ export function Discovery() {
             )}
           </tbody>
         </table>
+        </TableWrap>
       </div>
 
       <div className="card">
@@ -530,7 +554,13 @@ export function Discovery() {
           </div>
         ))}
         {topics.data && topics.data.length === 0 && (
-          <div className="placeholder">No topics configured.</div>
+          <EmptyState title="No discovery topics configured">
+            <p>
+              Topics are seeded on first start and stored in the database. An
+              empty list means the seed has not run or the rows were removed;
+              scheduled web discovery has nothing to search for until one exists.
+            </p>
+          </EmptyState>
         )}
       </div>
     </>

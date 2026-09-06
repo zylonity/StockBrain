@@ -1,10 +1,8 @@
+import { Link } from "react-router-dom";
+
 import type { ControlStateResponse } from "../api/types";
 import { StatusPill } from "./StatusPill";
-
-function formatMoment(value: string | null): string {
-  if (!value) return "—";
-  return new Date(value).toISOString().replace("T", " ").slice(0, 16) + "Z";
-}
+import { formatMoment, formatRelative } from "../components/formats";
 
 /**
  * Shown only while trading is halted, and then unmissable.
@@ -19,12 +17,12 @@ export function ControlBanner({ control }: { control: ControlStateResponse }) {
   const killed = control.kill_switch.active;
   const flag = killed ? control.kill_switch : control.paused;
   return (
-    <div className="banner banner-live">
+    <div className="banner banner-live" role="status">
       <div className="banner-title">
         <span>{killed ? "EMERGENCY KILL SWITCH ENGAGED" : "TRADING PAUSED"}</span>
-        <StatusPill status="DOWN" />
-        <span className="faint mono">
-          since {formatMoment(flag.changed_at)} · {flag.source ?? "unknown source"}
+        <StatusPill status="DOWN" label={killed ? "KILL SWITCH" : "PAUSED"} />
+        <span className="faint mono" title={formatMoment(flag.changed_at)}>
+          {formatRelative(flag.changed_at)} · {flag.actor ?? flag.source ?? "unknown source"}
         </span>
       </div>
       <div className="banner-body">{control.notice}</div>
@@ -33,6 +31,9 @@ export function ControlBanner({ control }: { control: ControlStateResponse }) {
           <li key={blocker}>{blocker}</li>
         ))}
       </ul>
+      <p className="banner-body">
+        <Link to="/health">Release it on System health →</Link>
+      </p>
     </div>
   );
 }

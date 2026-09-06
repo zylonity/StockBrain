@@ -9,7 +9,8 @@ import {
   CompanyImpactTable,
   LlmUsagePanel,
 } from "../components/Classification";
-import { formatTimestamp, hostOf } from "../components/formats";
+import { ErrorState, LoadingRows, PageHeader, RefreshButton } from "../components/Page";
+import { formatRelative, formatTimestamp, hostOf } from "../components/formats";
 import { usePolling } from "../components/usePolling";
 
 export function EventDetail() {
@@ -30,17 +31,28 @@ export function EventDetail() {
         ← All events
       </Link>
 
-      <p><Link to={`/research?event_id=${encodeURIComponent(eventId ?? "")}`}>Research for this event</Link></p>
-
-      {error && <div className="error">{error}</div>}
-      {!data && !error && <div className="placeholder">Loading…</div>}
+      {error && !data && (
+        <ErrorState title="Could not load this event" error={error} onRetry={refresh} />
+      )}
+      {!data && !error && <LoadingRows rows={5} label="Loading event" />}
 
       {data && (
         <>
-          <div className="refresh-row">
-            <div>
-              <h1 className="page-title">{data.event.title}</h1>
-              <div className="event-meta">
+          <PageHeader
+            title={data.event.title}
+            actions={
+              <>
+                <Link
+                  className="button-quiet"
+                  to={`/research?event_id=${encodeURIComponent(eventId ?? "")}`}
+                >
+                  Research
+                </Link>
+                <RefreshButton onClick={refresh} busy={loading} />
+              </>
+            }
+          >
+            <div className="event-meta">
                 <EventStatusBadge status={data.event.status} />
                 <CategoryBadge category={data.event.top_category} />
                 {data.event.event_type && (
@@ -55,20 +67,16 @@ export function EventDetail() {
                   </span>
                 )}
               </div>
-              {data.event.topics.length > 0 && (
-                <div className="topic-chips">
-                  {data.event.topics.map((topic) => (
-                    <span className="badge" key={topic}>
-                      {topic}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
-            <button onClick={refresh} disabled={loading}>
-              {loading ? "Refreshing…" : "Refresh"}
-            </button>
-          </div>
+            {data.event.topics.length > 0 && (
+              <div className="topic-chips">
+                {data.event.topics.map((topic) => (
+                  <span className="badge" key={topic}>
+                    {topic}
+                  </span>
+                ))}
+              </div>
+            )}
+          </PageHeader>
 
           {data.event.merged_into_event_id && (
             <div className="banner banner-warn">
@@ -89,7 +97,9 @@ export function EventDetail() {
               <h2>Timing</h2>
               <dl className="kv">
                 <dt>First seen</dt>
-                <dd>{formatTimestamp(data.event.first_seen_at)}</dd>
+                <dd title={formatTimestamp(data.event.first_seen_at)}>
+                  {formatRelative(data.event.first_seen_at)}
+                </dd>
                 <dt>Event time</dt>
                 <dd>{formatTimestamp(data.event.event_time)}</dd>
                 <dt>Sources</dt>

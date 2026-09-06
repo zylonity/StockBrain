@@ -5,7 +5,8 @@ import type {
   LlmCall,
   LlmUsage,
 } from "../api/types";
-import { formatScore, formatTimestamp } from "./formats";
+import { EmptyState, TableWrap } from "./Page";
+import { formatScore, formatTimestamp, formatUsd } from "./formats";
 
 const DIRECTION_LABEL: Record<ImpactDirection, string> = {
   POSITIVE: "▲ positive",
@@ -39,13 +40,17 @@ export function DirectionBadge({ direction }: { direction: ImpactDirection }) {
 export function CompanyImpactTable({ companies }: { companies: CompanyImpact[] }) {
   if (companies.length === 0) {
     return (
-      <div className="placeholder">
-        No affected companies identified for this event.
-      </div>
+      <EmptyState title="No affected companies identified">
+        <p>
+          The classifier read this event and attached no company to it, so
+          nothing here can be resolved to a tradable instrument.
+        </p>
+      </EmptyState>
     );
   }
   return (
     <>
+      <TableWrap>
       <table>
         <thead>
           <tr>
@@ -86,6 +91,7 @@ export function CompanyImpactTable({ companies }: { companies: CompanyImpact[] }
           ))}
         </tbody>
       </table>
+      </TableWrap>
       <p className="metric-note" style={{ marginTop: 10 }}>
         Ticker hints are the classifier's suggestion, not a resolved instrument.
         Matching a company to a tradable broker instrument is a separate,
@@ -100,8 +106,9 @@ export function ClassificationPanel({ event }: { event: EventSummary }) {
     return (
       <div className="card">
         <h2>Classification</h2>
-        <div className="error" style={{ marginBottom: 0 }}>
-          Classification failed: {event.classifier_error}
+        <div className="error" style={{ marginBottom: 0 }} role="alert">
+          <span className="error-title">Classification failed</span>
+          <span className="error-detail">{event.classifier_error}</span>
         </div>
       </div>
     );
@@ -111,10 +118,12 @@ export function ClassificationPanel({ event }: { event: EventSummary }) {
     return (
       <div className="card">
         <h2>Classification</h2>
-        <div className="placeholder">
-          Awaiting classification. Events are classified out of band by a
-          background worker.
-        </div>
+        <EmptyState title="Awaiting classification">
+          <p>
+            Events are classified out of band by a background worker. If this
+            does not clear, check the job queue and the model provider.
+          </p>
+        </EmptyState>
       </div>
     );
   }
@@ -154,17 +163,17 @@ export function LlmUsagePanel({
   usage: LlmUsage;
   calls: LlmCall[];
 }) {
-  const cost = Number(usage.estimated_cost_usd || 0);
   return (
     <div className="card">
       <h2>Model usage</h2>
-      <div className="metric">${cost.toFixed(4)}</div>
+      <div className="metric">{formatUsd(usage.estimated_cost_usd)}</div>
       <div className="metric-note">
         estimated · {usage.calls} call{usage.calls === 1 ? "" : "s"} ·{" "}
         {usage.input_tokens.toLocaleString()} in ({usage.cached_input_tokens.toLocaleString()}{" "}
         cached) / {usage.output_tokens.toLocaleString()} out
       </div>
       {calls.length > 0 && (
+        <TableWrap>
         <table style={{ marginTop: 12 }}>
           <thead>
             <tr>
@@ -202,6 +211,7 @@ export function LlmUsagePanel({
             ))}
           </tbody>
         </table>
+        </TableWrap>
       )}
       <p className="metric-note">
         Cost is estimated from recorded token counts and configured rates, for

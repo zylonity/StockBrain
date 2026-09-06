@@ -2,12 +2,22 @@
    A dense, functional operator console: this is an instrument panel for
    financial decisions, not a marketing page. Type is small and tabular,
    colour is reserved for status meaning, and nothing decorative competes
-   with the numbers. */
+   with the numbers.
+
+   Two rules run through the whole sheet:
+
+   * Colour means one thing. Red is "this is or could be losing you money",
+     amber is "degraded or deliberately restricted", green is "working". A
+     colour is never used because a panel looked plain.
+   * Nothing overflows the viewport. Every table lives inside a horizontal
+     scroller and every grid collapses, because the phone is where an alert is
+     read. */
 
 :root {
   --bg: #0e1116;
   --bg-raised: #151a21;
   --bg-inset: #10151b;
+  --bg-hover: #1b222b;
   --border: #232c37;
   --border-strong: #33404f;
   --text: #e5eaf0;
@@ -20,10 +30,20 @@
   --info: #58a6ff;
   --off: #6e7681;
 
+  /* Tinted backgrounds for banners. Kept separate from the line colours so a
+     banner never relies on a border alone to be noticed. */
+  --ok-wash: rgba(63, 185, 80, 0.09);
+  --warn-wash: rgba(210, 153, 34, 0.1);
+  --bad-wash: rgba(248, 81, 73, 0.11);
+  --info-wash: rgba(88, 166, 255, 0.09);
+
   --radius: 6px;
+  --radius-sm: 4px;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
     sans-serif;
+
+  --topbar-height: 52px;
 }
 
 @media (prefers-color-scheme: light) {
@@ -31,6 +51,7 @@
     --bg: #f6f8fa;
     --bg-raised: #ffffff;
     --bg-inset: #f0f3f6;
+    --bg-hover: #eaeef2;
     --border: #d8dee4;
     --border-strong: #b9c1ca;
     --text: #1c2128;
@@ -42,6 +63,11 @@
     --bad: #cf222e;
     --info: #0969da;
     --off: #8c959f;
+
+    --ok-wash: rgba(26, 127, 55, 0.08);
+    --warn-wash: rgba(154, 103, 0, 0.09);
+    --bad-wash: rgba(207, 34, 46, 0.08);
+    --info-wash: rgba(9, 105, 218, 0.07);
   }
 }
 
@@ -69,6 +95,12 @@ a {
   color: var(--info);
 }
 
+:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
 /* --- Layout ------------------------------------------------------------- */
 
 .app {
@@ -80,14 +112,14 @@ a {
 .topbar {
   display: flex;
   align-items: center;
-  gap: 24px;
-  padding: 0 20px;
-  height: 52px;
+  gap: 16px;
+  padding: 0 16px;
+  min-height: var(--topbar-height);
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
-  z-index: 10;
+  z-index: 20;
 }
 
 .brand {
@@ -97,6 +129,9 @@ a {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  text-decoration: none;
+  color: var(--text);
+  white-space: nowrap;
 }
 
 .brand .version {
@@ -108,8 +143,9 @@ a {
 
 .nav {
   display: flex;
-  gap: 4px;
+  gap: 2px;
   flex: 1;
+  flex-wrap: wrap;
 }
 
 .nav a {
@@ -118,6 +154,7 @@ a {
   color: var(--text-muted);
   text-decoration: none;
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .nav a:hover {
@@ -131,38 +168,173 @@ a {
   box-shadow: inset 0 -2px 0 var(--info);
 }
 
-.nav a[aria-disabled="true"] {
-  color: var(--text-faint);
-  pointer-events: none;
+/* The environment chip in the top bar. Demo and live differ by one string and
+   an irreversible consequence, so the difference is never body text. */
+.env-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.env-chip-demo {
+  color: var(--off);
+}
+
+.env-chip-live {
+  color: var(--bad);
+  background: var(--bad-wash);
+}
+
+.env-chip-halted {
+  color: var(--warn);
+  background: var(--warn-wash);
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.nav-toggle {
+  display: none;
 }
 
 main {
   flex: 1;
-  padding: 20px;
-  max-width: 1180px;
+  padding: 20px 16px 32px;
+  max-width: 1280px;
   width: 100%;
   margin: 0 auto;
 }
 
+@media (max-width: 860px) {
+  .topbar {
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    gap: 8px;
+  }
+
+  .nav-toggle {
+    display: inline-flex;
+    margin-left: auto;
+    order: 2;
+  }
+
+  .topbar-actions {
+    order: 3;
+    width: 100%;
+    margin-left: 0;
+    justify-content: space-between;
+  }
+
+  /* Collapsed by default on narrow screens: nine destinations wrapped over
+     four rows pushes the page itself below the fold. */
+  .nav {
+    order: 4;
+    display: none;
+    width: 100%;
+    flex-direction: column;
+    gap: 0;
+    border-top: 1px solid var(--border);
+    padding-top: 6px;
+    margin-top: 2px;
+  }
+
+  .nav-open .nav {
+    display: flex;
+  }
+
+  .nav a {
+    padding: 9px 8px;
+    border-radius: var(--radius-sm);
+  }
+
+  main {
+    padding: 14px 12px 28px;
+  }
+}
+
+/* --- Page header --------------------------------------------------------- */
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.page-head-text {
+  min-width: 0;
+  flex: 1 1 320px;
+}
+
+.page-head-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 .page-title {
-  font-size: 18px;
+  font-size: 19px;
   font-weight: 600;
   margin: 0 0 4px;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
 }
 
 .page-subtitle {
   color: var(--text-muted);
-  margin: 0 0 20px;
+  margin: 0;
   font-size: 13px;
+  max-width: 76ch;
 }
 
-/* --- Cards -------------------------------------------------------------- */
+.section-title {
+  font-size: 13px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin: 24px 0 10px;
+}
+
+/* --- Cards and grids ----------------------------------------------------- */
 
 .grid {
   display: grid;
   gap: 14px;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   margin-bottom: 18px;
+}
+
+.grid-wide {
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+}
+
+.grid-tight {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+@media (max-width: 520px) {
+  .grid,
+  .grid-wide,
+  .grid-tight {
+    grid-template-columns: 1fr;
+  }
 }
 
 .card {
@@ -170,6 +342,12 @@ main {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px 16px;
+  margin-bottom: 18px;
+  min-width: 0;
+}
+
+.grid > .card {
+  margin-bottom: 0;
 }
 
 .card h2 {
@@ -179,6 +357,39 @@ main {
   color: var(--text-muted);
   margin: 0 0 10px;
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.card h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin: 16px 0 8px;
+  font-weight: 600;
+}
+
+.card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* A card whose entire body is a table: the padding belongs to the cells. */
+.card-table {
+  padding: 14px 0 0;
+}
+
+.card-table > h2,
+.card-table > .card-head,
+.card-table > p {
+  padding-left: 16px;
+  padding-right: 16px;
 }
 
 .metric {
@@ -186,6 +397,11 @@ main {
   font-weight: 600;
   font-family: var(--mono);
   letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+
+.metric-sm {
+  font-size: 16px;
 }
 
 .metric-note {
@@ -194,7 +410,19 @@ main {
   margin-top: 4px;
 }
 
-/* --- Status ------------------------------------------------------------- */
+.metric-bad {
+  color: var(--bad);
+}
+
+.metric-warn {
+  color: var(--warn);
+}
+
+.metric-ok {
+  color: var(--ok);
+}
+
+/* --- Status -------------------------------------------------------------- */
 
 .status {
   display: inline-flex;
@@ -216,6 +444,7 @@ main {
   height: 6px;
   border-radius: 50%;
   background: currentColor;
+  flex: none;
 }
 
 .status-HEALTHY { color: var(--ok); }
@@ -227,7 +456,26 @@ main {
 .status-DISABLED { color: var(--off); }
 .status-UNKNOWN { color: var(--text-faint); }
 
-/* --- Tables ------------------------------------------------------------- */
+/* The one-line explanation next to a status, so the word is never the whole
+   message. "DISABLED" and "DOWN" look equally alarming without it. */
+.status-legend {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  align-items: center;
+}
+
+/* --- Tables -------------------------------------------------------------- */
+
+/* Every table is wrapped in one of these. A financial table has more columns
+   than a phone has pixels, and a page that scrolls sideways as a whole is
+   unusable in a way that a table that does is not. */
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 
 table {
   width: 100%;
@@ -244,6 +492,7 @@ th {
   font-weight: 600;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
 
 td {
@@ -252,8 +501,12 @@ td {
   vertical-align: top;
 }
 
-tr:last-child td {
+tbody tr:last-child td {
   border-bottom: none;
+}
+
+tbody tr:hover td {
+  background: var(--bg-hover);
 }
 
 td.mono,
@@ -262,12 +515,62 @@ td.mono,
   font-variant-numeric: tabular-nums;
 }
 
-td.detail {
+td.num,
+th.num {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+td.detail,
+.detail {
   color: var(--text-muted);
   font-size: 12px;
 }
 
-/* --- Banner ------------------------------------------------------------- */
+td.tight {
+  width: 1%;
+  white-space: nowrap;
+}
+
+/* A compact list rendered as a table on a wide screen and as stacked blocks on
+   a phone. A title column squeezed between a fixed-width badge and a timestamp
+   wraps a headline over six lines, which is not a table any more -- it is a
+   column of fragments. */
+@media (max-width: 560px) {
+  .stack-narrow thead {
+    display: none;
+  }
+
+  .stack-narrow,
+  .stack-narrow tbody,
+  .stack-narrow tr,
+  .stack-narrow td {
+    display: block;
+    width: auto;
+  }
+
+  .stack-narrow tr {
+    border-bottom: 1px solid var(--border);
+    padding: 8px 0;
+  }
+
+  .stack-narrow tr:last-child {
+    border-bottom: none;
+  }
+
+  .stack-narrow td {
+    border-bottom: none;
+    padding: 2px 10px;
+  }
+
+  .stack-narrow td.tight {
+    width: auto;
+  }
+}
+
+/* --- Banners ------------------------------------------------------------- */
 
 .banner {
   border: 1px solid var(--border-strong);
@@ -278,18 +581,25 @@ td.detail {
   background: var(--bg-raised);
 }
 
-.banner-safe { border-left-color: var(--ok); }
-.banner-warn { border-left-color: var(--warn); }
-
-/* A list of reasons something is unavailable. Rendered as text, never as a
-   single joined sentence: an operator acts on one blocker at a time. */
-.reason-list {
-  margin: 0 0 0.6rem;
-  padding-left: 1.1rem;
-  font-size: 12px;
-  line-height: 1.6;
+.banner-safe {
+  border-left-color: var(--ok);
+  background: var(--ok-wash);
 }
-.banner-live { border-left-color: var(--bad); }
+
+.banner-warn {
+  border-left-color: var(--warn);
+  background: var(--warn-wash);
+}
+
+.banner-live {
+  border-left-color: var(--bad);
+  background: var(--bad-wash);
+}
+
+.banner-info {
+  border-left-color: var(--info);
+  background: var(--info-wash);
+}
 
 .banner-title {
   font-weight: 650;
@@ -298,6 +608,7 @@ td.detail {
   align-items: center;
   gap: 10px;
   margin-bottom: 6px;
+  flex-wrap: wrap;
 }
 
 .banner-body {
@@ -316,16 +627,96 @@ td.detail {
   margin-bottom: 2px;
 }
 
-/* --- Misc --------------------------------------------------------------- */
+/* A list of reasons something is unavailable. Rendered as separate items,
+   never as one joined sentence: an operator acts on one blocker at a time. */
+.reason-list {
+  margin: 0 0 0.4rem;
+  padding-left: 1.1rem;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* --- State blocks -------------------------------------------------------- */
 
 .error {
   border: 1px solid var(--bad);
   border-radius: var(--radius);
   padding: 12px 14px;
   color: var(--bad);
-  background: var(--bg-raised);
+  background: var(--bad-wash);
   margin-bottom: 18px;
   font-size: 13px;
+}
+
+.error-title {
+  font-weight: 650;
+  display: block;
+  margin-bottom: 2px;
+}
+
+.error-detail {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  padding: 22px 20px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.empty-title {
+  color: var(--text);
+  font-weight: 600;
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.empty p {
+  margin: 0;
+  max-width: 70ch;
+}
+
+.empty-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Loading is a shape, not the word "Loading". A skeleton keeps the layout
+   still, so arriving data does not make the page jump under a cursor that is
+   already moving towards a button. */
+.skeleton {
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    90deg,
+    var(--bg-inset) 25%,
+    var(--bg-hover) 37%,
+    var(--bg-inset) 63%
+  );
+  background-size: 400% 100%;
+  animation: skeleton 1.4s ease infinite;
+  height: 12px;
+  margin: 8px 0;
+}
+
+.skeleton-row {
+  height: 30px;
+  margin: 6px 0;
+}
+
+@keyframes skeleton {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
 }
 
 .muted {
@@ -336,17 +727,14 @@ td.detail {
   color: var(--text-faint);
 }
 
-.placeholder {
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius);
-  padding: 24px;
-  text-align: center;
-  color: var(--text-faint);
-  font-size: 13px;
+.nowrap {
+  white-space: nowrap;
 }
 
+/* --- Footer -------------------------------------------------------------- */
+
 .footer {
-  padding: 14px 20px;
+  padding: 14px 16px;
   border-top: 1px solid var(--border);
   color: var(--text-faint);
   font-size: 12px;
@@ -356,13 +744,7 @@ td.detail {
   flex-wrap: wrap;
 }
 
-.refresh-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 20px;
-}
+/* --- Controls ------------------------------------------------------------ */
 
 button {
   font: inherit;
@@ -373,6 +755,7 @@ button {
   border-radius: var(--radius);
   padding: 5px 12px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 button:hover:not(:disabled) {
@@ -382,6 +765,114 @@ button:hover:not(:disabled) {
 button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* Reserved for an action whose consequence is in the dangerous direction:
+   engaging an emergency stop, or confirming an authorization. */
+.button-danger:hover:not(:disabled) {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.button-primary {
+  background: var(--info);
+  border-color: var(--info);
+  color: #fff;
+}
+
+.button-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.button-quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  padding: 4px 8px;
+}
+
+.button-quiet:hover:not(:disabled) {
+  background: var(--bg-inset);
+  color: var(--text);
+  border-color: transparent;
+}
+
+.button-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  font-size: 13px;
+  background: var(--bg-inset);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 5px 9px;
+  max-width: 100%;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--info);
+  outline-offset: -1px;
+}
+
+/* --- Filter bar ---------------------------------------------------------- */
+
+.filters {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.filters input[type="search"],
+.filters input[type="text"] {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.filters select {
+  flex: 0 1 auto;
+}
+
+.filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+@media (max-width: 520px) {
+  .filters {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filters > * {
+    width: 100%;
+  }
+}
+
+.filter-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
 }
 
 /* --- Badges -------------------------------------------------------------- */
@@ -423,53 +914,69 @@ button:disabled {
 
 .badge-event-NEW { color: var(--info); border-color: var(--info); }
 .badge-event-CANDIDATE { color: var(--warn); border-color: var(--warn); }
+.badge-event-RESEARCHING { color: var(--warn); border-color: var(--warn); }
 .badge-event-RESEARCHED { color: var(--ok); border-color: var(--ok); }
 .badge-event-IRRELEVANT,
 .badge-event-ARCHIVED { color: var(--text-faint); }
 .badge-event-CLASSIFICATION_FAILED { color: var(--bad); border-color: var(--bad); }
 
-/* --- Filter bar ---------------------------------------------------------- */
+.badge-dir-POSITIVE { color: var(--ok); border-color: var(--ok); }
+.badge-dir-NEGATIVE { color: var(--bad); border-color: var(--bad); }
+.badge-dir-MIXED { color: var(--warn); border-color: var(--warn); }
+.badge-dir-UNKNOWN { color: var(--text-faint); }
 
-.filters {
+.badge-path-direct { color: var(--text); border-color: var(--border-strong); }
+.badge-path-indirect { color: var(--text-muted); border-style: dashed; }
+.badge-path-unknown { color: var(--text-faint); }
+
+.badge-ok { color: var(--ok); border-color: var(--ok); }
+.badge-warn { color: var(--warn); border-color: var(--warn); }
+.badge-bad { color: var(--bad); border-color: var(--bad); }
+.badge-info { color: var(--info); border-color: var(--info); }
+
+/* Level of a captured log line. Deliberately the same palette as provider
+   health: an operator should not have to learn two colour languages. */
+.badge-level-debug { color: var(--text-faint); }
+.badge-level-info { color: var(--info); border-color: var(--info); }
+.badge-level-warning { color: var(--warn); border-color: var(--warn); }
+.badge-level-error,
+.badge-level-critical { color: var(--bad); border-color: var(--bad); }
+
+/* `.pill` predates `.status` and was used by the execution panel without ever
+   being defined, so those labels rendered as unstyled text. Defined here as an
+   alias so both spellings look the same. */
+.pill {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.pill-ok { color: var(--ok); }
+.pill-warn { color: var(--warn); }
+.pill-down { color: var(--bad); background: var(--bad-wash); }
+.pill-disabled { color: var(--off); }
+
+.chips {
   display: flex;
-  gap: 8px;
+  gap: 5px;
   flex-wrap: wrap;
   align-items: center;
-  margin-bottom: 14px;
-}
-
-.filters input[type="search"] {
-  flex: 1;
-  min-width: 200px;
-}
-
-input,
-select {
-  font: inherit;
-  font-size: 13px;
-  background: var(--bg-inset);
-  color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  padding: 5px 9px;
-}
-
-input:focus,
-select:focus {
-  outline: 2px solid var(--info);
-  outline-offset: -1px;
 }
 
 /* --- Event rows ---------------------------------------------------------- */
-
-.event-row td {
-  vertical-align: top;
-}
 
 .event-title {
   color: var(--text);
   text-decoration: none;
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .event-title:hover {
@@ -492,6 +999,11 @@ select:focus {
   margin-top: 12px;
   font-size: 12px;
   color: var(--text-muted);
+  flex-wrap: wrap;
+}
+
+.pager-count {
+  margin-right: auto;
 }
 
 /* --- Source cards -------------------------------------------------------- */
@@ -514,8 +1026,9 @@ select:focus {
 
 .source-headline {
   font-weight: 550;
-  flex: 1;
-  min-width: 240px;
+  flex: 1 1 240px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* Untrusted external text. Rendered as plain text with preserved wrapping;
@@ -537,6 +1050,7 @@ select:focus {
   grid-template-columns: max-content 1fr;
   gap: 4px 14px;
   font-size: 12px;
+  margin: 0;
 }
 
 .kv dt {
@@ -546,7 +1060,18 @@ select:focus {
 .kv dd {
   margin: 0;
   font-family: var(--mono);
-  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 420px) {
+  .kv {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .kv dd {
+    margin-bottom: 6px;
+  }
 }
 
 .back-link {
@@ -560,6 +1085,8 @@ select:focus {
 .back-link:hover {
   color: var(--info);
 }
+
+/* --- Discovery topics ---------------------------------------------------- */
 
 .topic {
   border-bottom: 1px solid var(--border);
@@ -595,14 +1122,22 @@ select:focus {
   padding: 3px 0;
   color: var(--text-muted);
   border-top: 1px dotted var(--border);
+  flex-wrap: wrap;
 }
 
 .query-text {
   font-family: var(--mono);
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
-/* --- Classification ------------------------------------------------------ */
+.topic-chips {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+/* --- Scores -------------------------------------------------------------- */
 
 .score {
   margin-bottom: 10px;
@@ -629,23 +1164,31 @@ select:focus {
   border-radius: 2px;
 }
 
-.badge-dir-POSITIVE { color: var(--ok); border-color: var(--ok); }
-.badge-dir-NEGATIVE { color: var(--bad); border-color: var(--bad); }
-.badge-dir-MIXED { color: var(--warn); border-color: var(--warn); }
-.badge-dir-UNKNOWN { color: var(--text-faint); }
+/* A budget or allowance consumed. Turns amber past the soft limit and red at
+   the ceiling, because a bar that is only ever blue makes "nearly out" and
+   "plenty left" look identical at a glance. */
+.meter {
+  height: 6px;
+  background: var(--bg-inset);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 6px 0 4px;
+}
 
-.badge-path-direct { color: var(--text); border-color: var(--border-strong); }
-.badge-path-indirect { color: var(--text-muted); border-style: dashed; }
-.badge-path-unknown { color: var(--text-faint); }
+.meter-fill {
+  height: 100%;
+  background: var(--ok);
+  border-radius: 3px;
+  transition: width 200ms ease;
+}
 
-.badge-ok { color: var(--ok); border-color: var(--ok); }
-.badge-bad { color: var(--bad); border-color: var(--bad); }
+.meter-warn .meter-fill { background: var(--warn); }
+.meter-bad .meter-fill { background: var(--bad); }
 
-.topic-chips {
-  display: flex;
-  gap: 5px;
-  flex-wrap: wrap;
-  margin-top: 6px;
+@media (prefers-reduced-motion: reduce) {
+  .meter-fill {
+    transition: none;
+  }
 }
 
 .rationale {
@@ -662,13 +1205,191 @@ select:focus {
   font-size: 12px;
   color: var(--text-muted);
   margin-top: 6px;
+  flex-wrap: wrap;
 }
 
-.research-prose { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
-.research-prose pre, pre.research-prose { max-height: 32rem; overflow: auto; }
-details.card summary { cursor: pointer; font-weight: 600; padding: .4rem 0; }
+.research-prose {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
 
-/* --- Login gate --------------------------------------------------------- */
+.research-prose pre,
+pre.research-prose {
+  max-height: 32rem;
+  overflow: auto;
+}
+
+details.card summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 0.4rem 0;
+}
+
+/* --- Logs ---------------------------------------------------------------- */
+
+.log-table td {
+  padding: 5px 10px;
+  vertical-align: top;
+}
+
+.log-event {
+  font-family: var(--mono);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* Structured fields, rendered as key=value pairs rather than raw JSON: the
+   fields are the useful part of a structured log and a JSON blob hides them. */
+.log-fields {
+  display: flex;
+  gap: 4px 10px;
+  flex-wrap: wrap;
+  margin-top: 3px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-muted);
+}
+
+.log-field-key {
+  color: var(--text-faint);
+}
+
+.log-exception {
+  white-space: pre-wrap;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--bad);
+  background: var(--bg-inset);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-top: 6px;
+  max-height: 260px;
+}
+
+.log-row-warning td { background: var(--warn-wash); }
+.log-row-error td,
+.log-row-critical td { background: var(--bad-wash); }
+
+/* --- Settings ------------------------------------------------------------ */
+
+.setting {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) 1fr;
+  gap: 4px 18px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  align-items: start;
+}
+
+.setting:last-child {
+  border-bottom: none;
+}
+
+.setting-label {
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+
+.setting-env {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.setting-value {
+  font-family: var(--mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.setting-description {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 4px 0 0;
+  max-width: 78ch;
+}
+
+.setting-impact {
+  color: var(--text-faint);
+  font-size: 12px;
+  margin: 4px 0 0;
+  max-width: 78ch;
+}
+
+@media (max-width: 700px) {
+  .setting {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}
+
+/* A toggle for a genuinely runtime-editable preference. Deliberately absent
+   from every environment-driven row: a switch that needs a restart to take
+   effect is a switch that lies. */
+.toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.toggle:last-child {
+  border-bottom: none;
+}
+
+.toggle input {
+  margin-top: 3px;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  accent-color: var(--info);
+}
+
+.toggle-body {
+  min-width: 0;
+}
+
+.toggle-label {
+  font-weight: 550;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toggle-description {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 2px 0 0;
+  max-width: 78ch;
+}
+
+.toggle-disabled .toggle-label,
+.toggle-disabled .toggle-description {
+  opacity: 0.65;
+}
+
+.save-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.save-note {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* --- Login gate ---------------------------------------------------------- */
 /* Rendered before anything else when the browser holds no session. Kept plain:
    the login screen is the one page an unauthenticated visitor can reach, so it
    carries no data and no navigation. */
@@ -677,7 +1398,7 @@ details.card summary { cursor: pointer; font-weight: 600; padding: .4rem 0; }
   align-items: center;
   justify-content: center;
   min-height: 100vh;
-  padding: 2rem;
+  padding: 2rem 1rem;
 }
 
 .auth-card {
@@ -706,11 +1427,6 @@ details.card summary { cursor: pointer; font-weight: 600; padding: .4rem 0; }
 
 .auth-card input {
   padding: 0.55rem 0.7rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-inset);
-  color: inherit;
-  font: inherit;
 }
 
 .auth-card button {
@@ -740,4 +1456,39 @@ details.card summary { cursor: pointer; font-weight: 600; padding: .4rem 0; }
   padding-left: 1.1rem;
   color: var(--warn);
   font-size: 0.85rem;
+}
+
+/* --- Utilities ----------------------------------------------------------- */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.spread {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
 }

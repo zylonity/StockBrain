@@ -3,9 +3,24 @@ import { Link, useParams } from "react-router-dom";
 
 import { ApiError, api } from "../api/client";
 import type { Proposal, RiskRule } from "../api/types";
-import { StatusPill } from "../components/StatusPill";
-import { formatRelative, formatTimestamp } from "../components/formats";
 import { ExecutionPanel } from "../components/ExecutionPanel";
+import {
+  EmptyState,
+  ErrorState,
+  LoadingRows,
+  PageHeader,
+  RefreshButton,
+  TableWrap,
+} from "../components/Page";
+import { StatusPill } from "../components/StatusPill";
+import {
+  formatDecimal,
+  formatMoney,
+  formatPercent,
+  formatQuantity,
+  formatRelative,
+  formatTimestamp,
+} from "../components/formats";
 import { usePolling } from "../components/usePolling";
 
 /**
@@ -13,9 +28,13 @@ import { usePolling } from "../components/usePolling";
  *
  * Two things this page must never let a reader assume:
  *
- * 1. **Authorization is not execution.** An APPROVED proposal means the risk
- *    engine allowed the trade and a recorded authority signed it off. No broker
- *    order exists. The banner says so on every proposal, in every state.
+ * 1. **Authorization is not transmission.** An APPROVED proposal means the risk
+ *    engine allowed the trade and a recorded authority signed it off.
+ *    Transmission is a separate, separately gated step. Whether an order
+ *    actually exists is read from the proposal's own execution record, never
+ *    asserted by this page -- the previous version printed "No broker order has
+ *    been sent" on every proposal unconditionally, which stopped being true the
+ *    moment the transmission path shipped.
  * 2. **A refusal is a result, not a gap.** Blocked rules are rendered as
  *    prominently as approved ones, with the value observed beside the threshold
  *    it was compared against, because a refusal nobody can read is
@@ -26,9 +45,9 @@ import { usePolling } from "../components/usePolling";
  * the decision was made on.
  */
 
-const NO_ORDER_NOTICE =
-  "Authorization records that deterministic risk allowed this trade and who signed it off. " +
-  "No broker order has been sent — StockBrain has no order-submission path in this phase.";
+const AUTHORIZATION_NOTICE =
+  "Authorizing records that deterministic risk allowed the trade and who signed it off. " +
+  "Transmission is a separate, separately gated step, and every order is sent at most once.";
 
 /** Proposal status mapped onto the shared health palette. */
 function statusTone(status: string) {
@@ -100,6 +119,7 @@ function ExpiryNote({ proposal }: { proposal: Proposal }) {
 function Rules({ rules }: { rules: RiskRule[] }) {
   if (rules.length === 0) return <p className="muted">No rules were recorded.</p>;
   return (
+    <TableWrap>
     <table>
       <thead>
         <tr>
@@ -128,22 +148,23 @@ function Rules({ rules }: { rules: RiskRule[] }) {
         ))}
       </tbody>
     </table>
+    </TableWrap>
   );
 }
 
+const allProposals = () => api.proposals();
+
 export function Proposals() {
-  const { data, error, loading, refresh } = usePolling(() => api.proposals(), 15_000);
-  const policy = usePolling(() => api.proposalPolicy(), 60_000);
+  const { data, error, loading, refresh } = usePolling(allProposals, 15_000);
+  const policy = usePolling(api.proposalPolicy, 60_000);
 
   return (
-    <section>
-      <div className="refresh-row">
-        <div>
-          <h1 className="page-title">Trade proposals</h1>
-          <p className="page-subtitle">{NO_ORDER_NOTICE}</p>
-        </div>
-        <button onClick={refresh}>Refresh</button>
-      </div>
+    <>
+      <PageHeader
+        title="Trade proposals"
+        subtitle={AUTHORIZATION_NOTICE}
+        actions={<RefreshButton onClick={refresh} busy={loading} />}
+      />
 
       {policy.data && (
         <div
@@ -159,7 +180,7 @@ export function Proposals() {
           </div>
           <div className="banner-body">
             {policy.data.automatic_authorization_permitted
-              ? "Proposals that clear every deterministic rule are authorized by the system without a human. No broker order is sent."
+              ? "Proposals that clear every deterministic rule are authorized by the system without a human. Transmission is separately gated."
               : "Every proposal requires an explicit human authorization."}
             {policy.data.automation_blockers.length > 0 && (
               <ul>
@@ -179,26 +200,35 @@ export function Proposals() {
         </div>
       )}
 
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
-      {loading && !data && <p className="muted">Loading proposals…</p>}
+      {error && data === null && <ErrorState error={error} onRetry={refresh} />}
+      {!data && !error && <LoadingRows rows={5} label="Loading proposals" />}
 
       {data?.items.length === 0 && (
-        <div className="card">
-          <h2>No proposals yet</h2>
-          <p className="muted">
-            A published thesis becomes a proposal only when the deterministic risk engine allows
-            it against fresh account state and a fresh execution-grade quote. Refusals are
-            recorded and are visible on the risk view of the thesis that produced them.
+        <EmptyState
+          title="No proposals yet"
+          actions={
+            <>
+              <Link className="button-quiet" to="/research">
+                Research runs
+              </Link>
+              <Link className="button-quiet" to="/settings">
+                Risk limits
+              </Link>
+            </>
+          }
+        >
+          <p>
+            A published thesis becomes a proposal only when the deterministic
+            risk engine allows it against fresh account state and a fresh
+            execution-grade quote. Refusals are recorded and are visible on the
+            risk view of the thesis that produced them.
           </p>
-        </div>
+        </EmptyState>
       )}
 
       {data && data.items.length > 0 && (
-        <div className="card">
+        <div className="card card-table">
+          <TableWrap>
           <table>
             <thead>
               <tr>
@@ -225,21 +255,25 @@ export function Proposals() {
                     </div>
                   </td>
                   <td className="mono">
-                    {proposal.side} {proposal.proposed_quantity}
+                    {proposal.side} {formatQuantity(proposal.proposed_quantity)}
                     <div className="detail">
-                      {proposal.estimated_notional} {proposal.account_currency}
+                      {formatMoney(proposal.estimated_notional, proposal.account_currency)}
                     </div>
                   </td>
                   <td className="mono">
-                    {proposal.reference_price}
+                    {formatDecimal(proposal.reference_price, { places: 2 })}{" "}
+                    {proposal.reference_currency}
                     <div className="detail">{proposal.quote_age_ms} ms old</div>
                   </td>
                   <td className="mono">
-                    {proposal.quote_spread_bps ?? "—"} bps
+                    {formatDecimal(proposal.quote_spread_bps, { places: 2 })} bps
                     <div className="detail">{proposal.quote_spread_status ?? "—"}</div>
                   </td>
                   <td>
-                    <StatusPill status={outcomeTone(proposal.risk_outcome)} />
+                    <StatusPill
+                      status={outcomeTone(proposal.risk_outcome)}
+                      label={proposal.risk_outcome ?? "not evaluated"}
+                    />
                     {proposal.blockers.length > 0 && (
                       <div className="detail">{proposal.blockers.length} blocking</div>
                     )}
@@ -248,8 +282,9 @@ export function Proposals() {
                     <PolicyBadge proposal={proposal} />
                   </td>
                   <td>
-                    <StatusPill status={statusTone(proposal.status)} />
-                    <div className="detail">{proposal.status}</div>
+                    {/* The pill previously showed the *tone* it was mapped to,
+                        so a READY proposal read "UNKNOWN" in the status column. */}
+                    <StatusPill status={statusTone(proposal.status)} label={proposal.status} />
                     <div>
                       <ExpiryNote proposal={proposal} />
                     </div>
@@ -258,9 +293,10 @@ export function Proposals() {
               ))}
             </tbody>
           </table>
+          </TableWrap>
         </div>
       )}
-    </section>
+    </>
   );
 }
 
@@ -270,8 +306,10 @@ export function ProposalDetail() {
 }
 
 function ProposalRecord({ proposalId }: { proposalId: string }) {
-  const { data, error, refresh } = usePolling(() => api.proposal(proposalId), 15_000);
-  const risk = usePolling(() => api.proposalRisk(proposalId), 30_000);
+  const fetchProposal = useCallback(() => api.proposal(proposalId), [proposalId]);
+  const fetchRisk = useCallback(() => api.proposalRisk(proposalId), [proposalId]);
+  const { data, error, refresh } = usePolling(fetchProposal, 15_000);
+  const risk = usePolling(fetchRisk, 30_000);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<"approve" | "reject" | null>(null);
@@ -300,39 +338,55 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
 
   if (!data) {
     return (
-      <section>
+      <>
         <Link className="back-link" to="/proposals">
           ← Proposals
         </Link>
-        <p role={error ? "alert" : undefined} className={error ? "error" : "muted"}>
-          {error ?? "Loading proposal…"}
-        </p>
-      </section>
+        {error ? (
+          <ErrorState title="Could not load this proposal" error={error} onRetry={refresh} />
+        ) : (
+          <LoadingRows rows={4} label="Loading proposal" />
+        )}
+      </>
     );
   }
 
   return (
-    <section>
+    <>
       <Link className="back-link" to="/proposals">
         ← Proposals
       </Link>
-      <div className="refresh-row">
-        <div>
-          <h1 className="page-title">
-            {data.side} {data.proposed_quantity} {data.company_name ?? data.broker_ticker}
-          </h1>
-          <p className="page-subtitle">
-            <StatusPill status={statusTone(data.status)} /> {data.status} ·{" "}
-            <PolicyBadge proposal={data} /> · <ExpiryNote proposal={data} />
-          </p>
-        </div>
-        <button onClick={refresh}>Refresh</button>
-      </div>
+      <PageHeader
+        title={`${data.side} ${formatQuantity(data.proposed_quantity)} ${
+          data.company_name ?? data.broker_ticker
+        }`}
+        actions={<RefreshButton onClick={refresh} />}
+      >
+        <p className="page-subtitle chips">
+          <StatusPill status={statusTone(data.status)} label={data.status} />
+          <PolicyBadge proposal={data} />
+          <ExpiryNote proposal={data} />
+        </p>
+      </PageHeader>
 
-      <div className="banner banner-safe">
-        <div className="banner-title">No broker order has been sent</div>
-        <div className="banner-body">{data.notice}</div>
-      </div>
+      {/* What is actually true about this proposal's order, read from the
+          proposal row rather than asserted. `broker_order_transmitted` means
+          bytes may have left -- it is written before the request, not after the
+          response -- so "may exist" is the honest wording. */}
+      {data.broker_order_transmitted ? (
+        <div className="banner banner-warn">
+          <div className="banner-title">An order has been transmitted for this proposal</div>
+          <div className="banner-body">
+            {data.notice} The execution record below is the authority on what
+            the broker did with it.
+          </div>
+        </div>
+      ) : (
+        <div className="banner banner-safe">
+          <div className="banner-title">No order has been transmitted</div>
+          <div className="banner-body">{data.notice}</div>
+        </div>
+      )}
 
       {data.status_reason && (
         <div className="card">
@@ -374,17 +428,21 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
             </dd>
             <dt>Quantity</dt>
             <dd className="mono">
-              {data.proposed_quantity}
-              {data.max_quantity ? ` of ${data.max_quantity} permitted` : ""}
+              {formatQuantity(data.proposed_quantity)}
+              {data.max_quantity
+                ? ` of ${formatQuantity(data.max_quantity)} permitted`
+                : ""}
             </dd>
             <dt>Notional</dt>
             <dd className="mono">
-              {data.estimated_notional} {data.account_currency}
-              {data.max_notional ? ` of ${data.max_notional} permitted` : ""}
+              {formatMoney(data.estimated_notional, data.account_currency)}
+              {data.max_notional
+                ? ` of ${formatMoney(data.max_notional, data.account_currency)} permitted`
+                : ""}
             </dd>
             <dt>Reference price</dt>
             <dd className="mono">
-              {data.reference_price} {data.reference_currency}
+              {formatDecimal(data.reference_price, { places: 2 })} {data.reference_currency}
             </dd>
             <dt>Currency</dt>
             <dd>
@@ -402,13 +460,15 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
             </dd>
             <dt>Bid / ask</dt>
             <dd className="mono">
-              {data.quote_bid ?? "—"} / {data.quote_ask ?? "—"}
+              {formatDecimal(data.quote_bid, { places: 2 })} /{" "}
+              {formatDecimal(data.quote_ask, { places: 2 })}
             </dd>
             <dt>Mid</dt>
-            <dd className="mono">{data.quote_mid ?? "—"}</dd>
+            <dd className="mono">{formatDecimal(data.quote_mid, { places: 2 })}</dd>
             <dt>Spread</dt>
             <dd className="mono">
-              {data.quote_spread ?? "—"} ({data.quote_spread_bps ?? "—"} bps ·{" "}
+              {formatDecimal(data.quote_spread, { places: 4 })} (
+              {formatDecimal(data.quote_spread_bps, { places: 2 })} bps ·{" "}
               {data.quote_spread_status ?? "—"})
             </dd>
             <dt>Age</dt>
@@ -429,11 +489,7 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
             <dt>Action</dt>
             <dd>{data.research_action ?? "—"}</dd>
             <dt>Confidence</dt>
-            <dd>
-              {data.research_confidence === null
-                ? "—"
-                : `${Math.round(data.research_confidence * 100)}%`}
-            </dd>
+            <dd>{formatPercent(data.research_confidence)}</dd>
             <dt>Horizon</dt>
             <dd>{data.time_horizon ?? "—"}</dd>
           </dl>
@@ -490,8 +546,12 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
           )}
           {confirming === "approve" ? (
             <p>
-              Authorize {data.side} {data.proposed_quantity} {data.broker_ticker} at{" "}
-              <span className="mono">{data.reference_price}</span>? The listing, account state,
+              Authorize {data.side} {formatQuantity(data.proposed_quantity)}{" "}
+              {data.broker_ticker} at{" "}
+              <span className="mono">
+                {formatDecimal(data.reference_price, { places: 2 })} {data.reference_currency}
+              </span>
+              ? The listing, account state,
               quote, spread and every risk rule are re-checked before this is recorded.{" "}
               <strong>
                 Authorizing does not itself send an order; transmission is a separate,
@@ -602,6 +662,6 @@ function ProposalRecord({ proposalId }: { proposalId: string }) {
           ))}
         </div>
       )}
-    </section>
+    </>
   );
 }

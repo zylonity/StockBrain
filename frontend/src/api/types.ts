@@ -18,6 +18,13 @@ export type ProviderStatus =
   | "DISABLED"
   | "UNKNOWN";
 
+/** The process liveness probe: no database, no provider, no work. */
+export interface LivenessResponse {
+  status: string;
+  app: string;
+  version: string;
+}
+
 export interface SubsystemHealth {
   subsystem: string;
   status: ProviderStatus;
@@ -70,7 +77,22 @@ export interface ExecutionStatusResponse {
 // Discovery and events
 // ---------------------------------------------------------------------------
 
-export type SourceProvider = "ALPACA" | "FIRECRAWL" | "SEC" | "MANUAL";
+/**
+ * Which discovery provider produced a source row.
+ *
+ * `BRAVE` and `EXA` were missing here even though the server has emitted them
+ * since the provider split, so two of the three live discovery backends could
+ * not be filtered on. `FIRECRAWL` stays because rows it discovered before the
+ * split still exist and are still valid evidence -- rewriting them to claim
+ * another provider found them would be falsifying provenance.
+ */
+export type SourceProvider =
+  | "ALPACA"
+  | "BRAVE"
+  | "EXA"
+  | "FIRECRAWL"
+  | "SEC"
+  | "MANUAL";
 
 export type EventStatus =
   | "NEW"
@@ -1010,4 +1032,167 @@ export interface SessionView {
   username: string | null;
   expires_at: string | null;
   blockers: string[];
+}
+
+/* --- Application logs ----------------------------------------------------
+ *
+ * A bounded, in-memory ring of the backend's own structured events. The
+ * envelope fields are as important as the entries: a page that silently showed
+ * the last few thousand lines of a much longer incident would be lying, so
+ * `capacity`, `dropped` and `captured_since` are rendered, not hidden.
+ * ------------------------------------------------------------------------ */
+
+export type LogLevel = "debug" | "info" | "warning" | "error" | "critical";
+
+export interface LogEntry {
+  sequence: number;
+  timestamp: string;
+  level: string;
+  logger: string;
+  event: string;
+  service: string;
+  category: string;
+  /** Rendered exception text, already scrubbed of every configured credential. */
+  message: string;
+  fields: Record<string, string>;
+}
+
+export interface LogQueryResponse {
+  entries: LogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+  capacity: number;
+  stored: number;
+  dropped: number;
+  captured_since: string | null;
+  oldest_at: string | null;
+  newest_at: string | null;
+  min_captured_level: string;
+  enabled: boolean;
+}
+
+export interface LogFacets {
+  services: Record<string, number>;
+  categories: Record<string, number>;
+  levels: Record<string, number>;
+}
+
+export interface LogFilters {
+  minLevel?: string;
+  services?: string[];
+  categories?: string[];
+  sinceMinutes?: number;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/* --- Configuration, as an operator reads it ------------------------------ */
+
+/**
+ * How a setting can be changed.
+ *
+ * `RUNTIME` rows carry a `control` naming the endpoint that changes them.
+ * Everything else is rendered read-only *on purpose*: the risk limits and the
+ * four live-execution gates are environment-driven with a restart behind them,
+ * and a switch in a browser would defeat the point of the gates.
+ */
+export type SettingMutability =
+  | "RUNTIME"
+  | "RESTART_REQUIRED"
+  | "READ_ONLY"
+  | "SECRET";
+
+export interface SettingView {
+  key: string;
+  label: string;
+  value: string | null;
+  mutability: SettingMutability;
+  description: string;
+  env_var: string | null;
+  unit: string | null;
+  impact: string | null;
+  control: string | null;
+  /** Secrets only: whether one is present. Never what it is. */
+  configured: boolean | null;
+}
+
+export interface SettingGroup {
+  key: string;
+  title: string;
+  description: string;
+  warning: string | null;
+  blockers: string[];
+  settings: SettingView[];
+}
+
+export interface SettingsResponse {
+  groups: SettingGroup[];
+  generated_at: string;
+}
+
+/* --- Telegram notification preferences ----------------------------------- */
+
+export interface NotificationCategory {
+  category: string;
+  label: string;
+  description: string;
+  volume: string;
+  enabled: boolean;
+  /** A locked category cannot be switched off. Only the unknown-order-state one is. */
+  locked: boolean;
+}
+
+export interface NotificationPreferences {
+  categories: NotificationCategory[];
+  notifications_enabled: boolean;
+  delivery_available: boolean;
+  blockers: string[];
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+/* --- Portfolio ------------------------------------------------------------ */
+
+export interface PortfolioPosition {
+  broker_ticker: string;
+  name: string | null;
+  quantity: string;
+  quantity_available: string | null;
+  average_price: string | null;
+  current_price: string | null;
+  ppl: string | null;
+  currency: string | null;
+  last_synced_at: string;
+}
+
+export interface PortfolioResponse {
+  available: boolean;
+  reason: string | null;
+  account_id: string | null;
+  currency: string | null;
+  broker: string;
+  broker_environment: string | null;
+  total_value: string | null;
+  invested_value: string | null;
+  result_value: string | null;
+  cash_available: string | null;
+  cash_reserved: string | null;
+  cash_in_pies: string | null;
+  captured_at: string | null;
+  position_count: number;
+  positions: PortfolioPosition[];
+  /** Older than the freshness the risk engine would accept for sizing. */
+  stale: boolean;
+  max_age_seconds: number | null;
+}
+
+/* --- Discovery hold ------------------------------------------------------- */
+
+export interface DiscoveryHold {
+  paused: boolean;
+  changed_at: string | null;
+  actor: string | null;
+  reason: string | null;
 }

@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { api } from "../api/client";
 import type { InstrumentCandidate, Resolution } from "../api/types";
 import { StatusPill } from "../components/StatusPill";
 import { formatRelative, formatTimestamp } from "../components/formats";
+import { TableWrap } from "../components/Page";
 import { usePolling } from "../components/usePolling";
 
 /**
@@ -96,13 +97,15 @@ function ResolutionRow({ row }: { row: Resolution }) {
 
 export function Instruments() {
   const [statusFilter, setStatusFilter] = useState<string>("");
-  const resolutions = usePolling(
+  // Memoized so a filter change refetches immediately: `usePolling` now
+  // depends on the fetcher's identity, and an inline arrow would refetch on
+  // every render instead.
+  const fetchResolutions = useCallback(
     () =>
-      api.resolutions(
-        (statusFilter || undefined) as Parameters<typeof api.resolutions>[0],
-      ),
-    30_000,
+      api.resolutions((statusFilter || undefined) as Parameters<typeof api.resolutions>[0]),
+    [statusFilter],
   );
+  const resolutions = usePolling(fetchResolutions, 30_000);
   const sync = usePolling(api.instrumentSyncStatus, 60_000);
   const marketData = usePolling(api.marketDataHealth, 60_000);
   const aliases = usePolling(api.aliases, 300_000);
@@ -111,8 +114,8 @@ export function Instruments() {
 
   return (
     <>
-      <div className="refresh-row">
-        <div>
+      <div className="page-head">
+        <div className="page-head-text">
           <h1 className="page-title">Instruments</h1>
           <p className="page-subtitle" style={{ marginBottom: 0 }}>
             How each classifier company hint mapped onto a verified broker
@@ -221,6 +224,7 @@ export function Instruments() {
       </div>
 
       <div className="card">
+        <TableWrap>
         <table>
           <thead>
             <tr>
@@ -254,11 +258,13 @@ export function Instruments() {
             )}
           </tbody>
         </table>
+        </TableWrap>
       </div>
 
       {aliases.data && aliases.data.length > 0 && (
         <div className="card">
           <h2>Alias mappings</h2>
+          <TableWrap>
           <table>
             <thead>
               <tr>
@@ -287,6 +293,7 @@ export function Instruments() {
               ))}
             </tbody>
           </table>
+          </TableWrap>
         </div>
       )}
 

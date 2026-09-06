@@ -1,13 +1,10 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { ApiError, api } from "../api/client";
 import type { ExecutionAttempt, ProposalExecution } from "../api/types";
+import { LoadingRows, TableWrap } from "./Page";
 import { StatusPill } from "./StatusPill";
-
-function moment(value: string | null): string {
-  if (!value) return "—";
-  return new Date(value).toISOString().replace("T", " ").slice(0, 19) + "Z";
-}
+import { formatRelative, formatTimestamp } from "./formats";
 
 /**
  * Whether an environment should look dangerous.
@@ -72,7 +69,9 @@ function AttemptRow({
         </span>
       </td>
       <td className="mono">{attempt.sent_to_broker ? "yes" : "no"}</td>
-      <td className="mono detail">{moment(attempt.sent_at)}</td>
+      <td className="mono detail" title={formatTimestamp(attempt.sent_at)}>
+        {formatRelative(attempt.sent_at)}
+      </td>
       <td className="mono">{attempt.broker_order_id ?? "—"}</td>
       <td className="mono">{attempt.http_status ?? "—"}</td>
       <td className="detail">
@@ -109,7 +108,7 @@ export function ExecutionPanel({ proposalId }: { proposalId: string }) {
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
-  async function load(): Promise<void> {
+  const load = useCallback(async (): Promise<void> => {
     setError(null);
     try {
       setExecution(await api.proposalExecution(proposalId));
@@ -118,35 +117,45 @@ export function ExecutionPanel({ proposalId }: { proposalId: string }) {
     } finally {
       setLoaded(true);
     }
-  }
+  }, [proposalId]);
 
-  async function reconcile(attemptId: string): Promise<void> {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.reconcileAttempt(attemptId);
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : String(cause));
-    } finally {
-      setBusy(false);
-      await load();
-    }
-  }
+  const reconcile = useCallback(
+    async (attemptId: string): Promise<void> => {
+      setBusy(true);
+      setError(null);
+      try {
+        await api.reconcileAttempt(attemptId);
+      } catch (cause) {
+        setError(cause instanceof ApiError ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+        await load();
+      }
+    },
+    [load],
+  );
 
-  if (!loaded) {
+  // In an effect, not during render. The previous version called `load()` from
+  // the render body when `loaded` was false, which sets state during render --
+  // React 19 warns, and under Strict Mode it fired the request twice on mount.
+  useEffect(() => {
     void load();
-  }
+  }, [load]);
 
   return (
     <div className="card">
-      <div className="refresh-row">
+      <div className="card-head">
         <h2>Execution</h2>
         <button onClick={() => void load()} disabled={busy}>
           Refresh
         </button>
       </div>
 
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
 
       {execution ? (
         <>
@@ -163,6 +172,7 @@ export function ExecutionPanel({ proposalId }: { proposalId: string }) {
           {execution.attempts.length === 0 ? (
             <p className="muted">No transmission has been attempted.</p>
           ) : (
+            <TableWrap>
             <table>
               <thead>
                 <tr>
@@ -188,11 +198,13 @@ export function ExecutionPanel({ proposalId }: { proposalId: string }) {
                 ))}
               </tbody>
             </table>
+            </TableWrap>
           )}
 
           {execution.orders.length > 0 && (
             <>
               <h3>Broker orders</h3>
+              <TableWrap>
               <table>
                 <thead>
                   <tr>
@@ -216,16 +228,26 @@ export function ExecutionPanel({ proposalId }: { proposalId: string }) {
                       <td className="mono detail">
                         {order.discovered_by_reconciliation ? "reconciliation" : "submission"}
                       </td>
-                      <td className="mono detail">{moment(order.last_synced_at)}</td>
+                      <td
+                        className="mono detail"
+                        title={formatTimestamp(order.last_synced_at)}
+                      >
+                        {formatRelative(order.last_synced_at)}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              </TableWrap>
             </>
           )}
         </>
+      ) : loaded ? (
+        <p className="muted">
+          No execution record for this proposal — nothing has been transmitted.
+        </p>
       ) : (
-        <p className="muted">Loading…</p>
+        <LoadingRows rows={2} label="Loading execution history" />
       )}
     </div>
   );
