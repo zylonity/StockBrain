@@ -14,6 +14,7 @@ still covers the DeepSeek dialect specifically.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -24,6 +25,7 @@ from pydantic import ValidationError
 from stockbrain.config import Settings
 from stockbrain.errors import ProviderResponseError
 from stockbrain.httpclient import ProviderHttpClient
+from stockbrain.intelligence.schemas import ClassifiedEvent
 from stockbrain.llm.base import ChatMessage, CompletionRequest, TokenUsage
 from stockbrain.llm.deepseek import DeepSeekClient
 from stockbrain.llm.factory import build_llm_client, build_pricing_table
@@ -32,6 +34,7 @@ from stockbrain.llm.openai_compat import (
     build_body,
     parse_completion,
     parse_usage,
+    strict_json_schema,
 )
 from stockbrain.llm.profiles import DEEPSEEK, GENERIC, GENERIC_NO_JSON, META, OPENAI, profile_for
 
@@ -127,7 +130,12 @@ def test_structured_output_uses_each_dialect() -> None:
     assert build_body(_request(), DEEPSEEK)["response_format"] == {"type": "json_object"}
     assert build_body(_request(), META)["response_format"] == {
         "type": "json_schema",
-        "json_schema": {"name": "Thing", "schema": {"type": "object", "properties": {}}},
+        "json_schema": {
+            "name": "Thing",
+            # Closed and enforced; see the strict-output tests below.
+            "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "strict": True,
+        },
     }
     # An endpoint with no JSON mode gets no response_format at all.
     assert "response_format" not in build_body(_request(), GENERIC_NO_JSON)
@@ -408,3 +416,87 @@ def test_a_blank_rate_variable_means_unset_rather_than_unparseable() -> None:
     assert settings.llm_model_rates() == {}
     # DeepSeek's built-in rates still price the default models.
     assert build_pricing_table(settings).rates_for("deepseek-v4-flash") is not None
+
+
+# ---------------------------------------------------------------------------
+# Strict structured output
+# ---------------------------------------------------------------------------
+
+
+def test_a_strict_provider_asks_for_the_schema_to_be_enforced() -> None:
+    """Meta documents `strict` as defaulting to false, making the schema a hint.
+
+    Observed live on 2026-09-06, an unenforced request returned corrupted key
+    escaping -- `"confidence\\": 0.95` parses as a key named `confidence"`, so
+    the real field fell back to its default and a duplicate event silently
+    failed to merge. Wrong-but-parseable is the worst failure mode available,
+    so enforcement is requested explicitly.
+    """
+    body = build_body(_request(), META)
+    assert body["response_format"]["json_schema"]["strict"] is True
+
+
+def test_a_non_strict_schema_provider_does_not_send_the_flag() -> None:
+    relaxed = replace(META, strict_structured_output=False)
+    body = build_body(_request(), relaxed)
+    assert "strict" not in body["response_format"]["json_schema"]
+
+
+def test_strict_rewriting_closes_every_object_and_requires_every_field() -> None:
+    """A field with a default is optional to Pydantic but must still be emitted.
+
+    An omitted field silently becomes its default, and a default is a real
+    value the rest of the system acts on -- a dedupe confidence of 0.0
+    suppresses a merge exactly as convincingly as a considered one.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "string"},
+            "b": {"type": "integer"},
+            "nested": {
+                "type": "object",
+                "properties": {"c": {"type": "boolean"}},
+                "required": ["c"],
+            },
+        },
+        "required": ["a"],
+    }
+    strict = strict_json_schema(schema)
+    assert strict["additionalProperties"] is False
+    assert sorted(strict["required"]) == ["a", "b", "nested"]
+    assert strict["properties"]["nested"]["additionalProperties"] is False
+    assert strict["properties"]["nested"]["required"] == ["c"]
+
+
+def test_strict_rewriting_does_not_mutate_the_callers_schema() -> None:
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    strict_json_schema(schema)
+    assert "additionalProperties" not in schema
+
+
+def test_strict_rewriting_reaches_definitions_behind_refs() -> None:
+    """Pydantic nests sub-models under $defs, which strict mode must also close."""
+    strict = strict_json_schema(ClassifiedEvent.model_json_schema())
+    company = strict["$defs"]["CompanyImpact"]
+    assert company["additionalProperties"] is False
+    assert "materiality" in company["required"]
+    assert "confidence" in company["required"]
+
+
+def test_the_real_classifier_schema_survives_strict_rewriting() -> None:
+    strict = strict_json_schema(ClassifiedEvent.model_json_schema())
+    # Fields carrying defaults are optional to Pydantic and required on the wire.
+    assert "importance" in strict["required"]
+    assert "needs_corroboration" in strict["required"]
+    # And the reply still validates against the unchanged Pydantic model.
+    assert ClassifiedEvent.model_validate(
+        {
+            "relevant_to_public_equities": True,
+            "canonical_title": "t",
+            "importance": 0.5,
+            "confidence": 0.5,
+            "needs_corroboration": False,
+            "companies": [],
+        }
+    )

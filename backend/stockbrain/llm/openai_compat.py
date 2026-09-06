@@ -24,6 +24,7 @@ message, and never returned to a caller.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
 import json
 from typing import Any
@@ -42,7 +43,13 @@ from stockbrain.llm.profiles import ProviderProfile
 from stockbrain.logging import get_logger
 from stockbrain.observability.metrics import METRICS
 
-__all__ = ["OpenAICompatibleClient", "build_body", "extract_json", "parse_completion"]
+__all__ = [
+    "OpenAICompatibleClient",
+    "build_body",
+    "extract_json",
+    "parse_completion",
+    "strict_json_schema",
+]
 
 log = get_logger(__name__)
 
@@ -125,17 +132,55 @@ def _apply_structured_output(
                 f"provider {profile.name!r} uses json_schema structured output, "
                 "but the request supplied no schema"
             )
-        body["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": request.json_schema_name or "response",
-                "schema": request.json_schema,
-            },
+        json_schema: dict[str, Any] = {
+            "name": request.json_schema_name or "response",
+            "schema": request.json_schema,
         }
+        if profile.strict_structured_output:
+            json_schema["schema"] = strict_json_schema(request.json_schema)
+            json_schema["strict"] = True
+        body["response_format"] = {"type": "json_schema", "json_schema": json_schema}
         return
 
     # profile.structured_output == "none": the prompt asks for JSON and the
     # caller's schema validation is the gate. Nothing is added to the body.
+
+
+def strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite a JSON Schema into the subset strict enforcement requires.
+
+    Every object is closed (``additionalProperties: false``) and lists all of
+    its properties as ``required``. That is what the strict subset documents,
+    and it is stricter than the Pydantic model it came from: a field with a
+    default is optional to Pydantic but must still be *emitted* by the model.
+
+    That difference is deliberate and is the point of the exercise. An omitted
+    field silently becomes its default, and a default is a real value that the
+    rest of the system will act on -- a dedupe confidence of 0.0 suppresses a
+    merge exactly as convincingly as a considered one. Requiring the model to
+    state every field turns a silent default into an explicit answer.
+
+    The input is not mutated; validation of the reply remains the caller's
+    Pydantic model, which is still the only thing that decides what is
+    acceptable.
+    """
+    closed = copy.deepcopy(schema)
+    _close_objects(closed)
+    return closed
+
+
+def _close_objects(node: Any) -> None:
+    if isinstance(node, dict):
+        if node.get("type") == "object" or "properties" in node:
+            node["additionalProperties"] = False
+            properties = node.get("properties")
+            if isinstance(properties, dict) and properties:
+                node["required"] = list(properties)
+        for value in node.values():
+            _close_objects(value)
+    elif isinstance(node, list):
+        for value in node:
+            _close_objects(value)
 
 
 def _assert_prompt_mentions_json(request: CompletionRequest, profile: ProviderProfile) -> None:

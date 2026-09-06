@@ -961,7 +961,14 @@ Nothing blocks its use; the implication is simply explicit. The non-contributor
 tokens against the contributor tier's $0.10 / $0.002 / $0.20
 (verified 2026-09-06).
 
-Two operational differences from DeepSeek:
+Three operational differences from DeepSeek:
+
+* **Structured output is enforced, not suggested.** Meta's `strict` flag
+  defaults to false. Left off, Muse returned corrupted JSON key escaping that
+  still parsed, so a dedupe confidence of 0.95 was read as the default 0.0 and
+  a duplicate event silently failed to merge. StockBrain therefore sends
+  `strict: true` and closes the schema. See `docs/sources.md` for the observed
+  output.
 
 * **Reasoning cannot be disabled.** `reasoning_effort: "none"` is a documented
   400. The classifier — the cheap high-volume triage path — therefore always
@@ -969,6 +976,12 @@ Two operational differences from DeepSeek:
   documented floor, `minimal`. Watch `reasoning_tokens` in `llm_calls` after
   switching.
 * **The contributor tier is limited to 100 RPM** (standard is 3,000).
+
+Observed live on 2026-09-06 with the shipped prompts: a full event
+classification cost **$0.000357** (2,330 input / 621 output tokens, of which
+246 were reasoning) against roughly **$0.0017** for the same token counts on
+DeepSeek V4 Flash at peak rates. Latency was 5.6s. Prompt caching reported
+zero cached tokens on first-contact requests, so nothing was assumed.
 
 ### Comparing two backends before committing to one
 

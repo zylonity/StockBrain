@@ -87,6 +87,16 @@ class ProviderProfile:
     #: is a confusing model reply rather than an API error.
     requires_json_keyword: bool = False
 
+    #: Whether a ``json_schema`` endpoint must be asked to *enforce* the schema.
+    #:
+    #: Meta documents ``strict`` as defaulting to ``false``, which makes the
+    #: schema a hint. Observed live on 2026-09-06, an unenforced request
+    #: returned corrupted key escaping -- ``"confidence\": 0.95`` parses as a
+    #: key named ``confidence"``, so the real field fell back to its default and
+    #: a duplicate event silently failed to merge. Wrong-but-parseable is the
+    #: worst failure mode available here, so the schema is enforced.
+    strict_structured_output: bool = False
+
     reasoning: ReasoningStyle = "none"
 
     #: Lowest ``reasoning_effort`` the endpoint accepts, for profiles that cannot
@@ -149,6 +159,8 @@ META = ProviderProfile(
     # Only `json_schema` is documented. `json_object` is not, so it is not used.
     structured_output="json_schema",
     requires_json_keyword=False,
+    # Verified necessary, not merely advisable: see the field's own comment.
+    strict_structured_output=True,
     # Muse Spark always reasons internally: `reasoning_effort: "none"` is a 400.
     # "minimal" is the floor, so a classifier call cannot be made non-reasoning.
     reasoning="reasoning_effort",
@@ -160,6 +172,7 @@ META = ProviderProfile(
     documented_rpm=100,  # contributor tier; standard tier is 3,000
     notes=(
         "reasoning cannot be disabled; minimal is the floor",
+        "json_schema strict defaults to false and must be requested explicitly",
         "prompt caching is automatic and reported as prompt_tokens_details.cached_tokens",
         "the -contributor model tier trains on prompts and completions",
     ),

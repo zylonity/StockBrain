@@ -41,6 +41,7 @@ Sources: <https://dev.meta.ai/docs>,
 | Context window 1,048,576 tokens | confirmed |
 | Output cap is `max_completion_tokens`; `max_tokens` is a deprecated alias | confirmed |
 | Structured output is `response_format: {"type": "json_schema", ...}` | confirmed |
+| `json_schema.strict` defaults to **false**, making the schema a hint | confirmed |
 | `response_format: {"type": "json_object"}` is **not** documented | confirmed |
 | Reasoning cannot be disabled; `reasoning_effort: "none"` returns HTTP 400 | confirmed |
 | `reasoning_effort` accepts minimal / low / medium / high / xhigh | confirmed |
@@ -76,12 +77,40 @@ non-contributor `muse-spark-1.3` carries no such condition.
    A classifier call on this provider therefore always pays for some reasoning
    tokens. The cost estimate stays correct because it is derived from reported
    usage rather than from what was requested.
-2. **JSON mode is schema-based.** Only `json_schema` is documented, so the
-   caller must supply a schema. `EventClassifier` and `SemanticDeduplicator`
-   pass `model_json_schema()` from the very Pydantic model that validates the
-   reply, so the constraint and the parser cannot drift apart. A `json_schema`
-   provider given no schema raises rather than silently sending unconstrained
-   prose.
+2. **JSON mode is schema-based, and must be asked to *enforce* the schema.**
+   Only `json_schema` is documented, so the caller must supply a schema.
+   `EventClassifier` and `SemanticDeduplicator` pass `model_json_schema()` from
+   the very Pydantic model that validates the reply, so the constraint and the
+   parser cannot drift apart. A `json_schema` provider given no schema raises
+   rather than silently sending unconstrained prose.
+
+   `strict` defaults to `false`, which makes the schema advisory. Verified live
+   on 2026-09-06, an unenforced semantic-dedupe request returned this, three
+   times out of three:
+
+   ```
+   {"verdicts": [{"candidate_id": "1", "relation": "SAME_EVENT",
+     "confidence\": 0.95, "  : 0.0, "reason\"": "..."}]}
+   ```
+
+   The escaping is corrupt: `"confidence\"` parses as a key named
+   `confidence"`, so the real `confidence` field fell back to its Pydantic
+   default of `0.0`, landed below `SEMANTIC_DEDUPE_MIN_CONFIDENCE`, and a
+   correctly-identified duplicate silently failed to merge. The model had the
+   right answer — 0.95 — and the pipeline acted on 0.0. Nothing raised, because
+   the document parsed and validated.
+
+   Wrong-but-parseable is the worst failure mode available here, so `strict` is
+   requested explicitly for this profile and the schema is rewritten into the
+   subset strict enforcement requires: every object closed with
+   `additionalProperties: false` and every property listed in `required`. With
+   enforcement on, the same request returns clean JSON and the duplicate merges
+   at 0.95.
+
+   Requiring every property is stricter than the Pydantic model it came from —
+   a field with a default is optional to Pydantic — and that is deliberate. An
+   omitted field silently becomes its default, and a default is a real value
+   the rest of the system acts on.
 3. **The output cap is spelled differently**, and both spellings must never be
    sent at once.
 4. **Cached tokens are reported as a subset**, not as a second counter that
