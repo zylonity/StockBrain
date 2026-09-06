@@ -9,6 +9,8 @@ killing the process.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -59,6 +61,7 @@ from stockbrain.startup import (
     check_database,
     check_schema_current,
     instance_identity,
+    probe_enabled_providers,
     register_static_provider_states,
 )
 
@@ -68,6 +71,32 @@ log = get_logger(__name__)
 
 #: Populated by the Docker build; absent during local backend-only development.
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "static"
+
+
+async def _probe_providers(
+    services: ServiceContainer,
+    registry: ProviderHealthRegistry,
+    database: Database,
+    settings: Settings,
+) -> None:
+    """Run the startup sweep and persist the result.
+
+    Wrapped in its own coroutine so the task has one job and one place to fail.
+    ``probe_enabled_providers`` already swallows every provider error, so the
+    only thing left to guard is the persist -- and health reporting must never
+    be the reason a container falls over.
+    """
+    try:
+        await probe_enabled_providers(
+            services,
+            registry,
+            timeout_seconds=settings.startup_probe_timeout_seconds,
+        )
+        await registry.persist(database)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("startup_probe_sweep_failed", error=f"{type(exc).__name__}: {exc}")
 
 
 @asynccontextmanager
@@ -123,6 +152,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             services = None
     app.state.services = services
 
+    # Actively test what this deployment can reach, so the health board reads as
+    # this deployment rather than as "nothing has happened yet". Scheduled after
+    # `services.start()` because the probes borrow the clients it built, and
+    # after the registry's static DISABLED pass so a switched-off provider is
+    # never probed. No probe makes a billable request.
+    #
+    # Deliberately *not* awaited. Readiness must not wait on third parties:
+    # awaiting it delayed `startup_complete` by nine seconds on a cold start,
+    # and it put the probes in contention with the backfill, instrument sync and
+    # Telegram handshake that begin at the same moment -- which is what made a
+    # FRED probe that takes under two seconds on its own time out at ten. The
+    # board fills in a moment after boot instead, which is what an operator
+    # actually needs from it.
+    probe_task: asyncio.Task[None] | None = None
+    if services is not None and settings.startup_probe_enabled:
+        probe_task = asyncio.create_task(
+            _probe_providers(services, registry, database, settings),
+            name="startup-provider-probes",
+        )
+
     log.info(
         "startup_complete",
         database_ok=database_ok,
@@ -132,6 +181,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         log.info("shutdown_begin")
+        if probe_task is not None and not probe_task.done():
+            # A shutdown during the sweep must not wait on a slow provider.
+            probe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await probe_task
         if services is not None:
             await services.stop()
         await database.dispose()

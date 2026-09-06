@@ -58,7 +58,7 @@ The application then:
 1. marks unconfigured providers `DISABLED`;
 2. checks PostgreSQL connectivity;
 3. compares the applied migration revision against the code's head;
-4. persists provider health;
+4. **probes every enabled provider** and persists what came back (see below);
 5. logs the live-execution posture and its blockers;
 6. **restores and logs the durable control state.** A process that crashed while
    paused or killed comes back paused or killed, and says so at WARNING. Silent
@@ -68,6 +68,54 @@ The application then:
 8. **sweeps execution attempts stranded mid-flight.** An attempt recorded as
    sent with no result is marked `EXECUTION_AMBIGUOUS` and queued for
    reconciliation. It is never resent.
+
+### The startup provider probe
+
+`STARTUP_PROBE_ENABLED` (default `true`) actively tests each enabled provider
+once, concurrently, and records the result. It exists because every provider
+except PostgreSQL used to reach `HEALTHY` only as a side effect of doing real
+work, so a healthy restarted container reported `DEGRADED` — `overall_status`
+degrades on any `UNKNOWN` — until something incidentally exercised each one.
+
+**No probe makes a billable request.** The metered providers are checked for
+credential validity instead, using a request the provider is obliged to reject:
+
+| Provider | Probe | Cost |
+|---|---|---|
+| Brave | search with `q` omitted → 422; a rejected token says `SUBSCRIPTION_TOKEN_INVALID` | $0 |
+| Exa | search with an empty body → 400; a rejected key says 401 | $0 |
+| DeepSeek | `GET /models` | free |
+| Trading 212 | `GET /equity/account/summary` — one per 5s, rather than the metadata endpoints the instrument sync needs (one per 30s) | free |
+| Alpaca market data | the existing capability probe | free |
+| SEC | `company_tickers()` | free |
+| FRED | the two configured macro series | free |
+| Local extraction | reports readiness; needs no credential and no third party | free |
+
+That is deliberate rather than thrifty: `EXA_MAX_SEARCHES_PER_DAY` defaults to
+**3**, so probing by searching would let a handful of restarts spend the entire
+daily semantic allowance on health checks and leave the real queries deferring
+— a health check that breaks the feature it reports on.
+
+A credential probe reports `HEALTHY` with the detail `credentials accepted; no
+billable request made`, so the board never implies a search happened when one
+did not. For end-to-end proof, run the opt-in live test — one real search per
+provider, on a human's decision:
+
+```bash
+pytest -m live -s tests/integration/test_web_discovery_live.py
+```
+
+Two providers are not probed. **Firecrawl** and anything else already
+`DISABLED` is skipped, since probing a switched-off provider spends to learn
+nothing. **Alpaca news** is a websocket rather than a request/response call; it
+shows `UNKNOWN "connecting"` and promotes itself within seconds of the stream
+landing, so blocking startup on it would trade a real signal for a slower boot.
+
+A probe can never fail or stall a boot: every exception is classified rather
+than raised, and each probe is capped by `STARTUP_PROBE_TIMEOUT_SECONDS`
+(default 10). A credential or entitlement rejection records `DOWN` — a human
+must change configuration; a timeout, rate limit or transport failure records
+`DEGRADED` — it may well fix itself.
 
 ## Health
 
@@ -828,3 +876,4 @@ Logs are structured JSON with correlation identifiers (`event_id`,
 `research_run_id`, `proposal_id`, `broker_order_id`, `job_id`, `request_id`).
 Two redaction layers scrub credential-shaped keys and configured secret values.
 Never disable them to debug an integration; log the request shape instead.
+

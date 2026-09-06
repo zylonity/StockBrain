@@ -173,6 +173,21 @@ class Settings(BaseSettings):
     # DeepSeek
     # ------------------------------------------------------------------
     deepseek_api_key: SecretStr = SecretStr("")
+    startup_probe_enabled: bool = True
+    """Actively test every enabled provider once at startup.
+
+    On by default because the alternative is a health board that reads
+    ``DEGRADED`` on every restart until unrelated work happens to exercise each
+    provider.  No probe makes a billable request -- the metered providers are
+    checked for credential validity instead -- so leaving this on costs nothing
+    but a few concurrent requests at boot.  Turn it off for an air-gapped or
+    offline start where outbound calls would simply time out.
+    """
+
+    startup_probe_timeout_seconds: float = 10.0
+    """Per-probe ceiling.  Probes run concurrently, so this is close to the
+    total time the sweep can add to startup."""
+
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_flash_model: str = "deepseek-v4-flash"
     deepseek_pro_model: str = "deepseek-v4-pro"

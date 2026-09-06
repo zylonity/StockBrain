@@ -172,6 +172,20 @@ class DeepSeekClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
+    async def verify_credentials(self) -> None:
+        """Prove the API key is accepted, spending no tokens.
+
+        ``GET /models`` is the OpenAI-compatible catalogue endpoint: it is free,
+        it takes no body, and it needs the same bearer token every completion
+        needs, so it answers the only question a startup probe should ask of a
+        metered LLM -- is this key good?  A completion would answer the same
+        question and bill for the privilege.
+
+        Raises ``ProviderAuthError`` for a rejected key, and the usual
+        transport errors when the API cannot be reached.
+        """
+        await self._http.get_json("/models", max_attempts=1)
+
     def build_body(self, request: CompletionRequest) -> dict[str, Any]:
         """Build the request body exactly as the current API documents it."""
         body: dict[str, Any] = {

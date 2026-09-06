@@ -25,7 +25,7 @@ import asyncio
 import datetime as dt
 import json
 import random
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 import websockets
@@ -155,8 +155,22 @@ class AlpacaNewsClient:
 
     name = "alpaca_news"
 
-    def __init__(self, settings: Settings, *, http: ProviderHttpClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        http: ProviderHttpClient | None = None,
+        on_connected: Callable[[], None] | None = None,
+    ) -> None:
         self._settings = settings
+        self._on_connected = on_connected
+        """Called once per successful connect, after authentication and
+        subscription.
+
+        The client stays transport-only and knows nothing about health; the
+        caller decides what a live subscription means.  It exists because
+        "connected" and "has delivered an article" are different facts, and
+        conflating them made a quiet weekend look like an outage."""
         self._http = http or ProviderHttpClient(
             provider="alpaca",
             base_url=settings.alpaca_data_base_url,
@@ -275,6 +289,12 @@ class AlpacaNewsClient:
             await self._authenticate(socket)
             await socket.send(json.dumps({"action": "subscribe", "news": ["*"]}))
             log.info("alpaca_news_subscribed", url=url)
+            if self._on_connected is not None:
+                # Authenticated and subscribed is the moment the stream is
+                # known-good. Waiting for the first article instead would leave
+                # a perfectly healthy connection looking unproven through every
+                # quiet period -- a weekend, or an overnight lull.
+                self._on_connected()
 
             async for frame in socket:
                 for message in self._decode_frame(frame):

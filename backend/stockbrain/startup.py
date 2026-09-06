@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from alembic.config import Config as AlembicConfig
 from alembic.script import ScriptDirectory
@@ -24,10 +25,12 @@ from stockbrain.db.session import Database
 from stockbrain.enums import ProviderStatus
 from stockbrain.logging import get_logger
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
+from stockbrain.observability.probes import PROBE_TIMEOUT_SECONDS, build_probe_plan, run_probe
 
 __all__ = [
     "check_database",
     "check_schema_current",
+    "probe_enabled_providers",
     "refresh_database_health",
     "register_static_provider_states",
 ]
@@ -40,6 +43,9 @@ DATABASE_HEALTH_MAX_AGE_SECONDS = 2.0
 #: A health probe must never hang the health endpoint. If the database cannot
 #: answer `SELECT 1` within this budget it is not healthy, by definition.
 DATABASE_PROBE_TIMEOUT_SECONDS = 5.0
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+    from stockbrain.services import ServiceContainer
 
 log = get_logger(__name__)
 
@@ -201,3 +207,62 @@ def register_static_provider_states(settings: Settings, registry: ProviderHealth
 def instance_identity() -> str:
     """Stable-ish identifier for this process, used to stamp job locks."""
     return f"{os.uname().nodename}:{os.getpid()}"
+
+
+async def probe_enabled_providers(
+    services: ServiceContainer,
+    registry: ProviderHealthRegistry,
+    *,
+    timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
+) -> dict[ProviderName, ProviderStatus]:
+    """Actively test every enabled provider and record what came back.
+
+    Called once at startup so the health board reflects *this* deployment
+    rather than whatever the running process has happened to do since it
+    booted.  Before this existed, only PostgreSQL was genuinely probed and
+    every other provider stayed ``UNKNOWN`` until some unrelated piece of work
+    incidentally exercised it -- which for the semantic discovery queries is a
+    day after boot.
+
+    Three properties this function must keep, in order of importance:
+
+    1. **It cannot fail startup.**  Every probe's exceptions are already
+       swallowed by :func:`run_probe`, and the gather below adds no new way to
+       raise.  A provider being down is a degraded subsystem, never a container
+       that will not boot.
+    2. **It cannot cost a billable request.**  That is enforced in the probes
+       themselves; see ``stockbrain.observability.probes``.
+    3. **It cannot meaningfully slow startup.**  Probes run concurrently, so
+       the sweep costs roughly the slowest single probe rather than their sum.
+
+    Providers already marked ``DISABLED`` are skipped: ``build_probe_plan``
+    only includes clients that were constructed, and a client is only
+    constructed when its configuration gate is open, so the two agree by
+    construction rather than by a second list that could drift.
+    """
+    plan = build_probe_plan(services)
+    if not plan:
+        log.info("provider_probes_skipped", reason="no enabled provider can be probed")
+        return {}
+
+    outcomes = await asyncio.gather(
+        *(run_probe(name, probe, timeout_seconds=timeout_seconds) for name, probe in plan.items())
+    )
+    for outcome in outcomes:
+        registry.record(
+            outcome.provider,
+            outcome.status,
+            detail=outcome.detail,
+            metrics=outcome.metrics,
+        )
+
+    statuses = {outcome.provider: outcome.status for outcome in outcomes}
+    log.info(
+        "provider_probes_complete",
+        probed=len(statuses),
+        healthy=sum(1 for s in statuses.values() if s is ProviderStatus.HEALTHY),
+        unhealthy=sorted(
+            name.value for name, s in statuses.items() if s is not ProviderStatus.HEALTHY
+        ),
+    )
+    return statuses

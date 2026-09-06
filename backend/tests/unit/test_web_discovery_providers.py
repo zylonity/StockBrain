@@ -18,6 +18,7 @@ two produced a result, so the last section asserts exactly that.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import pathlib
 from decimal import Decimal
 
@@ -33,7 +34,7 @@ from stockbrain.errors import (
     ProviderUnavailable,
 )
 from stockbrain.httpclient import ProviderHttpClient
-from stockbrain.ingestion.brave import BraveSearchClient
+from stockbrain.ingestion.brave import BraveSearchClient, refine_brave_error
 from stockbrain.ingestion.exa import ExaSearchClient
 from stockbrain.ingestion.web_search import WebSearchQuery, to_raw_document
 
@@ -468,3 +469,166 @@ def test_the_source_category_is_assigned_from_the_url_not_the_provider() -> None
     brave = BraveSearchClient(_settings()).parse_response(BRAVE_RESPONSE, ROUTINE).results[0]
     document = to_raw_document(brave, discovery_query=ROUTINE.query, kind=WebDiscoveryKind.ROUTINE)
     assert document.source_category.value == "NEWSWIRE"
+
+
+# ---------------------------------------------------------------------------
+# Credential probes: proving a key without buying a search
+# ---------------------------------------------------------------------------
+# Both bodies are what the live APIs actually returned on 2026-09-06, captured
+# by sending a deliberately invalid request with a valid and an invalid key.
+# They are here rather than paraphrased because the whole point of the probe is
+# that it reads a provider-specific body, and a paraphrase would let the real
+# shape drift away from the parser without a test noticing.
+BRAVE_REJECTED_TOKEN_BODY = {
+    "type": "ErrorResponse",
+    "error": {
+        "code": "SUBSCRIPTION_TOKEN_INVALID",
+        "detail": "The provided subscription token is invalid.",
+        "meta": {"component": "authentication"},
+        "status": 422,
+    },
+}
+
+BRAVE_MISSING_QUERY_BODY = {
+    "type": "ErrorResponse",
+    "error": {
+        "id": "ac767880-a9c9-4b26-99e1-716fd0249fa8",
+        "status": 422,
+        "detail": "Unable to validate request parameter(s)",
+        "meta": {"errors": [{"type": "missing", "loc": ["query", "q"], "msg": "Field required"}]},
+    },
+}
+
+EXA_REJECTED_KEY_BODY = {
+    "requestId": "2e2745fb5066969f5ed51841d014efbd",
+    "error": "Invalid API key",
+    "tag": "INVALID_API_KEY",
+}
+
+EXA_REJECTED_BODY_BODY = {
+    "requestId": "548d6b15d79e6a60f71400e8d66667ed",
+    "error": "Invalid request body | Validation error: Invalid input: expected string, "
+    'received undefined at "query"',
+    "tag": "INVALID_REQUEST_BODY",
+}
+
+
+def _brave_probe_client(handler: object) -> BraveSearchClient:
+    """A Brave client whose transport is stubbed but whose *refinement is real*.
+
+    ``refine_error`` has to be passed explicitly because injecting ``http``
+    bypasses the constructor that normally wires it, and the refinement is
+    precisely what these tests are about.
+    """
+    return BraveSearchClient(
+        _settings(),
+        http=_stub_client("brave", handler, refine_error=refine_brave_error, max_attempts=1),
+    )
+
+
+async def test_brave_reports_a_rejected_token_as_an_auth_error_despite_the_422() -> None:
+    """Brave answers 422 -- not 401 -- for a bad subscription token.
+
+    Without refinement the shared classifier calls that a malformed request, so
+    an operator with an expired key is told "HTTP 422" and goes looking for a
+    bug in the caller.
+    """
+    client = _brave_probe_client(
+        lambda request: httpx.Response(422, json=BRAVE_REJECTED_TOKEN_BODY)
+    )
+    try:
+        with pytest.raises(ProviderAuthError):
+            await client.verify_credentials()
+    finally:
+        await client.aclose()
+
+
+async def test_brave_reads_a_422_about_the_query_as_an_accepted_token() -> None:
+    """The other half of the same status code: parameters refused, token fine."""
+    client = _brave_probe_client(lambda request: httpx.Response(422, json=BRAVE_MISSING_QUERY_BODY))
+    try:
+        await client.verify_credentials()  # returns; a raise here is the failure
+    finally:
+        await client.aclose()
+
+
+async def test_brave_refinement_leaves_other_statuses_alone() -> None:
+    """A hook that narrows 422 must not start reclassifying everything else."""
+    client = _brave_probe_client(lambda request: httpx.Response(503, text="upstream"))
+    try:
+        with pytest.raises(ProviderUnavailable):
+            await client.verify_credentials()
+    finally:
+        await client.aclose()
+
+
+async def test_the_brave_credential_probe_never_asks_for_results() -> None:
+    """The safety property the probe rests on.
+
+    Brave bills successful requests, so a probe that could succeed would be a
+    probe that spends.  Sending no ``q`` makes success impossible rather than
+    merely unlikely.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(422, json=BRAVE_MISSING_QUERY_BODY)
+
+    client = _brave_probe_client(handler)
+    try:
+        await client.verify_credentials()
+    finally:
+        await client.aclose()
+
+    assert len(seen) == 1, "a credential probe must make exactly one request"
+    assert "q" not in httpx.QueryParams(seen[0].url.query)
+    assert seen[0].method == "GET"
+
+
+async def test_exa_reports_a_rejected_key_as_an_auth_error() -> None:
+    """Exa, unlike Brave, does answer 401 -- so no refinement is needed."""
+    client = ExaSearchClient(
+        _settings(),
+        http=_stub_client("exa", lambda request: httpx.Response(401, json=EXA_REJECTED_KEY_BODY)),
+    )
+    try:
+        with pytest.raises(ProviderAuthError):
+            await client.verify_credentials()
+    finally:
+        await client.aclose()
+
+
+async def test_exa_reads_a_400_about_the_body_as_an_accepted_key() -> None:
+    client = ExaSearchClient(
+        _settings(),
+        http=_stub_client("exa", lambda request: httpx.Response(400, json=EXA_REJECTED_BODY_BODY)),
+    )
+    try:
+        await client.verify_credentials()  # returns
+    finally:
+        await client.aclose()
+
+
+async def test_the_exa_credential_probe_sends_no_query_and_is_never_retried() -> None:
+    """One attempt, empty body.
+
+    ``max_attempts=3`` is passed deliberately: the probe must make one request
+    even when the transport would allow more, because a retried POST against a
+    metered provider is the shape this codebase refuses everywhere else.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(400, json=EXA_REJECTED_BODY_BODY)
+
+    client = ExaSearchClient(_settings(), http=_stub_client("exa", handler, max_attempts=3))
+    try:
+        await client.verify_credentials()
+    finally:
+        await client.aclose()
+
+    assert len(seen) == 1, "a credential probe must never be retried"
+    assert seen[0].method == "POST"
+    assert json.loads(seen[0].content) == {}

@@ -35,12 +35,13 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
+import httpx
 from dateutil import parser as date_parser
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from stockbrain.config import Settings
 from stockbrain.enums import SourceProvider, WebDiscoveryKind
-from stockbrain.errors import ProviderResponseError
+from stockbrain.errors import ProviderAuthError, ProviderResponseError
 from stockbrain.httpclient import ProviderHttpClient, TokenBucket
 from stockbrain.ingestion.web_search import (
     WebSearchOutcome,
@@ -58,12 +59,18 @@ __all__ = [
     "BRAVE_SEARCH_PATH",
     "BraveSearchClient",
     "brave_freshness_token",
+    "refine_brave_error",
     "trim_brave_query",
 ]
 
 log = get_logger(__name__)
 
 BRAVE_SEARCH_PATH = "/res/v1/web/search"
+
+#: Brave names an invalid subscription token in the body of a 422 rather than
+#: answering 401.  Measured 2026-09-06 against the live API.
+BRAVE_AUTH_ERROR_CODE = "SUBSCRIPTION_TOKEN_INVALID"
+BRAVE_AUTH_ERROR_COMPONENT = "authentication"
 BRAVE_MAX_QUERY_LENGTH = 400
 BRAVE_MAX_QUERY_WORDS = 50
 BRAVE_MAX_COUNT = 20
@@ -99,6 +106,40 @@ class BraveResult(BaseModel):
     extra_snippets: list[str] | None = None
 
 
+def refine_brave_error(response: httpx.Response, error: Exception) -> Exception:
+    """Promote Brave's 422-for-a-rejected-token into a ``ProviderAuthError``.
+
+    Brave answers **422** for a request whose parameters do not validate *and*
+    for a request whose subscription token is invalid; only the body tells them
+    apart.  Measured 2026-09-06 against the live API: a rejected token carries
+    ``error.code == "SUBSCRIPTION_TOKEN_INVALID"`` and
+    ``error.meta.component == "authentication"``, while a missing ``q`` carries
+    a field-validation error naming it.
+
+    The shared classifier maps 401/403 to ``ProviderAuthError`` and leaves 422
+    as a ``ProviderResponseError``, so without this hook an expired or
+    mistyped key reports as a malformed request -- pointing an operator at the
+    caller when the fault is the credential.  This narrows the classification
+    only; the retry decision is unchanged, and 422 was never retryable.
+    """
+    if response.status_code != 422:
+        return error
+    try:
+        body = response.json()
+    except ValueError:
+        return error
+    if not isinstance(body, dict):
+        return error
+    detail = body.get("error")
+    if not isinstance(detail, dict):
+        return error
+    meta = detail.get("meta")
+    component = meta.get("component") if isinstance(meta, dict) else None
+    if detail.get("code") == BRAVE_AUTH_ERROR_CODE or component == BRAVE_AUTH_ERROR_COMPONENT:
+        return ProviderAuthError("brave: subscription token rejected (HTTP 422)")
+    return error
+
+
 class BraveSearchClient:
     """Routine thematic web and news search.
 
@@ -128,6 +169,7 @@ class BraveSearchClient:
             # second. Staying under a limit is cheaper than discovering it.
             rate_limiter=TokenBucket(rate_per_second=1.0, burst=1),
             max_attempts=2,
+            refine_error=refine_brave_error,
         )
 
     async def aclose(self) -> None:
@@ -190,6 +232,32 @@ class BraveSearchClient:
             max_attempts=2,
         )
         return self.parse_response(payload, query)
+
+    async def verify_credentials(self) -> None:
+        """Prove the subscription token is accepted, without buying a search.
+
+        Brave bills only *successful* requests, so this sends one that cannot
+        succeed: a search with no ``q`` at all.  An accepted token comes back
+        422 with a parameter-validation error, which returns normally here; a
+        rejected one comes back 422 with ``SUBSCRIPTION_TOKEN_INVALID``, which
+        :func:`refine_brave_error` has already turned into a
+        ``ProviderAuthError`` by the time it reaches this method.
+
+        This exists so a restarted container can report Brave's health without
+        spending from a 12-per-day allowance on every restart.  What it proves
+        is reachability and the credential -- the failure that actually happens.
+        What it deliberately does not re-prove is response parsing, which the
+        recorded-payload unit tests and the opt-in live test cover.
+
+        ``max_attempts=1``: there is nothing here worth retrying, and a probe
+        that retries is a probe that can turn one bad key into a burst.
+        """
+        try:
+            await self._http.get_json(BRAVE_SEARCH_PATH, max_attempts=1)
+        except ProviderResponseError:
+            # The token was accepted; the request was refused on its parameters,
+            # which is exactly what a probe with no query deserves.
+            return
 
     # ------------------------------------------------------------------
     # Parsing

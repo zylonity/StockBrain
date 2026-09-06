@@ -366,7 +366,14 @@ class ServiceContainer:
             and settings.alpaca_api_secret.get_secret_value()
         )
         if alpaca_configured and settings.alpaca_news_enabled:
-            self.alpaca_news = AlpacaNewsClient(settings)
+            self.alpaca_news = AlpacaNewsClient(
+                settings,
+                # A live, authenticated subscription is what "healthy" means for
+                # a stream. Promoting only on the first article -- as this used
+                # to -- left the provider UNKNOWN through every quiet period,
+                # which is indistinguishable from broken on the health board.
+                on_connected=self._mark_news_stream_connected,
+            )
 
         self._build_web_discovery()
 
@@ -1197,6 +1204,18 @@ class ServiceContainer:
     # ------------------------------------------------------------------
     # News stream
     # ------------------------------------------------------------------
+    def _mark_news_stream_connected(self) -> None:
+        """Record the stream as healthy the moment it is subscribed.
+
+        Discards ``record``'s return value, which is why this is a method rather
+        than a lambda: the callback's contract is to return nothing.
+        """
+        self.health.record(
+            ProviderName.ALPACA_NEWS,
+            ProviderStatus.HEALTHY,
+            detail="subscribed to the news stream",
+        )
+
     async def _run_news_stream(self) -> None:
         """Consume the Alpaca news stream and ingest every article.
 

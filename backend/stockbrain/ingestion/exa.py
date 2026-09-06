@@ -184,6 +184,32 @@ class ExaSearchClient:
         )
         return self.parse_response(payload, query)
 
+    async def verify_credentials(self) -> None:
+        """Prove the API key is accepted, without buying a search.
+
+        Exa prices a *successful* search and reports it in ``costDollars``, so
+        this sends a body it cannot accept -- an empty object, with no
+        ``query``.  Measured 2026-09-06 against the live API: a valid key
+        answers **400** ``INVALID_REQUEST_BODY``, an invalid one answers
+        **401** ``INVALID_API_KEY``.  The shared classifier already maps 401 to
+        ``ProviderAuthError``, so unlike Brave no refinement is needed -- the
+        two statuses are genuinely different.
+
+        This is what lets a restarted container report Exa's health for
+        nothing.  It matters more here than for Brave: the default allowance is
+        three searches a day, so probing by searching would let a handful of
+        restarts spend the entire semantic budget on health checks and leave
+        the real queries deferring.
+
+        Never retried -- ``request_json`` without ``retry_safe`` makes exactly
+        one attempt.
+        """
+        try:
+            await self._http.request_json("POST", EXA_SEARCH_PATH, json_body={})
+        except ProviderResponseError:
+            # The key was accepted; the empty body was refused, as intended.
+            return
+
     # ------------------------------------------------------------------
     # Parsing
     # ------------------------------------------------------------------

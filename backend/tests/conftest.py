@@ -46,6 +46,67 @@ _CREDENTIAL_ENVIRONMENT = (
     "WEB_OWNER_PASSWORD_HASH",
 )
 
+#: The operator's real `.env`, one directory above `backend/`.
+REPOSITORY_ENV_FILE = BACKEND_ROOT.parent / ".env"
+
+
+def dotenv_variable_names(path: Path) -> frozenset[str]:
+    """Every variable name a dotenv file defines.
+
+    Names only.  A *value* from the operator's file must never reach a test, so
+    reading them would be the mistake this function exists to prevent -- and the
+    names are all that is needed in order to delete them.
+
+    Parsed rather than obtained from ``dotenv_values`` so that this stays a
+    pure, testable function with no dependency on the loader that caused the
+    problem in the first place.
+    """
+    if not path.is_file():
+        return frozenset()
+    names: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name = stripped.partition("=")[0].strip()
+        # `export FOO=1` is legal in a dotenv file and names the variable FOO.
+        name = name.removeprefix("export ").strip()
+        if name.isidentifier():
+            names.add(name)
+    return frozenset(names)
+
+
+#: Names the *harness itself* owns, which must survive the scrubbing below.
+#:
+#: ``alembic/env.py`` calls ``get_settings()`` and overwrites whatever
+#: ``sqlalchemy.url`` its caller configured, so a migration reaches the test
+#: database only through ``DATABASE_URL`` in the environment -- which
+#: ``migrated_database`` sets on purpose.  Deleting it would not fail loudly;
+#: it would quietly point migrations at whatever the default resolves to, which
+#: is precisely the class of accident this module exists to prevent.
+_HARNESS_OWNED_ENVIRONMENT = frozenset({"DATABASE_URL", "DATABASE_URL_TEST"})
+
+#: Deleted from ``os.environ`` before every test.
+#:
+#: Nulling ``env_file`` is not enough on its own, because by the time any
+#: fixture runs the file may already have been merged into the process.  The
+#: pinned upstream does exactly that: ``third_party/TradingAgents/
+#: tradingagents/__init__.py`` calls ``load_dotenv(find_dotenv(usecwd=True))``
+#: at *import* time, and ``usecwd=True`` walks up from ``backend/`` until it
+#: finds the repository ``.env`` -- so importing it (as the research tests do)
+#: copies the operator's entire configuration into ``os.environ`` for the rest
+#: of the session, where it is indistinguishable from a deliberate value.
+#:
+#: That went unnoticed for as long as the file happened to agree with the test
+#: defaults.  It surfaced when a developer set ``T212_LIVE_EXECUTION_ENABLED``
+#: and ``FX_PROVIDER`` for their own deployment and 144 tests began failing on
+#: their machine and nowhere else -- a suite that had been passing by luck.
+#:
+#: Deleting by *name* rather than maintaining a second hand-written list is the
+#: point: a variable added to `.env.example` and copied into a developer's
+#: `.env` is covered the day it appears, with nothing to keep in sync.
+_REPOSITORY_ENV_NAMES = dotenv_variable_names(REPOSITORY_ENV_FILE) - _HARNESS_OWNED_ENVIRONMENT
+
 
 @pytest.fixture(autouse=True)
 def isolate_settings_from_local_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -54,9 +115,15 @@ def isolate_settings_from_local_credentials(monkeypatch: pytest.MonkeyPatch) -> 
     Explicit ``Settings(_env_file=...)`` remains available to opt-in live tests;
     normal tests receive only their explicit constructor values and environment
     values they set themselves with ``monkeypatch``.
+
+    ``monkeypatch`` restores every name afterwards, so a developer's shell keeps
+    whatever it had and the live tests -- which read the file directly rather
+    than through ``os.environ`` -- are unaffected.
     """
     monkeypatch.setitem(Settings.model_config, "env_file", None)
     for name in _CREDENTIAL_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    for name in _REPOSITORY_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
 
 
