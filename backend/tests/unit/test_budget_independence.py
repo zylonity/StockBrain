@@ -1,6 +1,6 @@
 """What a budget stop must never halt.
 
-Two budgets exist — LLM spend and Firecrawl credits — and both are hard limits
+Two kinds of budget exist — LLM spend and per-provider call units — and both are hard limits
 that stop new paid work.  The property that makes them safe rather than
 dangerous is what they *cannot* stop:
 
@@ -134,9 +134,9 @@ def test_the_hard_limit_stops_even_essential_llm_work() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The Firecrawl budget
+# The provider budgets
 # ---------------------------------------------------------------------------
-def test_the_firecrawl_budget_is_consulted_only_by_firecrawl_callers() -> None:
+def test_the_provider_budget_is_consulted_only_by_paid_call_sites() -> None:
     """Budget exhaustion degrades one provider, not the application.
 
     Alpaca news continues, SEC EDGAR continues, already-ingested events keep
@@ -145,7 +145,7 @@ def test_the_firecrawl_budget_is_consulted_only_by_firecrawl_callers() -> None:
     permitted = {
         "services.py",
         "jobs/handlers.py",
-        "ingestion/firecrawl_budget.py",
+        "ingestion/provider_budget.py",
         "ingestion/service.py",  # enqueues the content-fetch job
         "observability/alerts.py",
         "api/routes/discovery.py",
@@ -156,14 +156,14 @@ def test_the_firecrawl_budget_is_consulted_only_by_firecrawl_callers() -> None:
         if relative in permitted:
             continue
         # Matched on the *import*, not on any mention: `api/schemas.py` names a
-        # `FirecrawlBudgetResponse` and `ingestion/firecrawl.py` points at the
+        # `ProviderBudgetResponse` and `ingestion/firecrawl.py` points at the
         # budget in a docstring, and neither can spend anything.
-        if "ingestion.firecrawl_budget" in _import_lines(relative):
+        if "ingestion.provider_budget" in _import_lines(relative):
             offenders.append(relative)
     assert offenders == [], offenders
 
 
-def test_no_execution_or_risk_module_can_reach_the_firecrawl_budget() -> None:
+def test_no_execution_or_risk_module_can_reach_a_provider_budget() -> None:
     for relative in (
         "execution/service.py",
         "execution/preflight.py",
@@ -173,11 +173,12 @@ def test_no_execution_or_risk_module_can_reach_the_firecrawl_budget() -> None:
         "broker/account_state.py",
     ):
         imports = _import_lines(relative)
-        assert "firecrawl" not in imports.lower(), relative
+        for provider in ("firecrawl", "provider_budget", "brave", "exa"):
+            assert provider not in imports.lower(), f"{relative} imports {provider}"
 
 
 def test_the_discovery_providers_are_independent_of_each_other() -> None:
-    """A dead Firecrawl must not stop Alpaca news or SEC EDGAR.
+    """A dead Brave must not stop Alpaca news or SEC EDGAR.
 
     Each provider is its own client with its own rate limiter and its own health
     record; the only shared thing is the ingestion entry point, which is exactly
@@ -185,7 +186,15 @@ def test_the_discovery_providers_are_independent_of_each_other() -> None:
     """
     for relative in ("ingestion/alpaca_news.py", "ingestion/sec_edgar.py"):
         imports = _import_lines(relative)
-        assert "firecrawl" not in imports.lower(), relative
+        for provider in ("firecrawl", "brave", "exa"):
+            assert provider not in imports.lower(), f"{relative} imports {provider}"
+
+    # And the two metered search backends do not import each other: neither can
+    # become the other's fallback by accident.
+    for relative in ("ingestion/brave.py", "ingestion/exa.py"):
+        imports = _import_lines(relative)
+        assert "brave" not in imports.lower() or relative == "ingestion/brave.py"
+        assert "exa" not in imports.lower() or relative == "ingestion/exa.py"
 
 
 def test_alerting_reads_both_budgets_and_changes_neither() -> None:
@@ -195,7 +204,7 @@ def test_alerting_reads_both_budgets_and_changes_neither() -> None:
     become a cost bug.
     """
     source = (SOURCE_ROOT / "observability" / "alerts.py").read_text()
-    assert "FirecrawlBudget" in source
+    assert "ProviderCallBudget" in source
     assert "BudgetGuard" in source
     # Reads only: no reservation, no work started.
     assert ".reserve(" not in source

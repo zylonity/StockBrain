@@ -212,7 +212,11 @@ def test_a_missing_password_hash_is_a_blocker_not_a_startup_failure() -> None:
     missing, and grants access to nothing. Refusing to start would leave an
     operator with no way to read the reason.
     """
-    settings = _settings()
+    # Passed explicitly as empty rather than left absent. Relying on it being
+    # missing from the environment is exactly the mistake Phase 8's bug 20
+    # recorded -- and this test did rely on it, so it started failing the moment
+    # a developer set the variable in their own `.env`.
+    settings = _settings(web_owner_password_hash="")
     blockers = web_auth_blockers(settings)
     assert any("WEB_OWNER_PASSWORD_HASH" in blocker for blocker in blockers)
     assert "hash_password" in " ".join(blockers)

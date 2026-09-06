@@ -114,7 +114,7 @@ async def clean_tables(database: Database) -> AsyncIterator[Database]:
         "company_aliases",
         "companies",
         "jobs",
-        "firecrawl_calls",
+        "provider_calls",
         "discovery_queries",
         "discovery_topics",
         "llm_calls",

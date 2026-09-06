@@ -53,7 +53,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Skeleton, config, logging, full persistence model, health, GUI shell, Docker | **done** |
-| 2 | Discovery ingestion (Alpaca news WS, Firecrawl, SEC EDGAR), dedupe, job queue | **done** |
+| 2 | Discovery ingestion (Alpaca news WS, web search, SEC EDGAR), dedupe, job queue | **done** |
 | 3 | DeepSeek event classifier, semantic dedupe, LLM telemetry and budgets | **done** |
 | 4 | Instrument resolution and market data | **done** |
 | 5 | Pinned TradingAgents research engine | **done** |
@@ -61,6 +61,7 @@ UNTRUSTED SOURCES → LLM RESEARCH → STRUCTURED THESIS → DETERMINISTIC RISK
 | 7 | Telegram control, approvals and durable pause/kill switch | **done** |
 | 8 | Trading 212 demo execution and reconciliation | **done** |
 | 9 | Production hardening: cost control, FX, web auth, backups, alerts | **done** |
+| 10 | Multi-provider web discovery: Brave + Exa search, local extraction, Firecrawl as fallback | **done** |
 
 ## Architecture
 
@@ -120,7 +121,8 @@ than an oversight:
 
 | Default | Why |
 |---|---|
-| `FIRECRAWL_ENABLED=false` | The only provider that can spend real money on a schedule with nobody watching. In Phase 2 it emptied a credit allowance in about an hour. Read the budget in `.env.example` before enabling it. |
+| `BRAVE_API_KEY=` / `EXA_API_KEY=` empty | Web discovery is off until a key is set. Brave answers routine thematic search, Exa answers semantic second-order search, and neither falls back to the other. Read the budget in `.env.example` first. |
+| `FIRECRAWL_ENABLED=false` | Firecrawl is now a *fallback extractor only* — its search path is removed. In Phase 2 it emptied a credit allowance in about an hour. It needs two switches, not one. |
 | `FX_PROVIDER=none` | Cross-currency sizing stays blocked. An invented exchange rate is a wrong position size, silently. |
 | `T212_EXECUTION_ENABLED=false` | Nothing transmits to a broker, demo included, until an operator says so. |
 
@@ -247,12 +249,13 @@ advice.
   route table to prove it. Running without it needs
   `WEB_AUTH_ENABLED=false` *and* `WEB_TRUSTED_NETWORK_ACKNOWLEDGED=true`, which
   is refused in production without the acknowledgement.
-* **Paid providers cannot run away.** Firecrawl calls are reserved against a
+* **Paid providers cannot run away.** Every metered call is reserved against a
   durable PostgreSQL ledger *before* the request leaves, so a restart cannot
   forget what today already cost and two workers cannot spend the last credit
   twice. Hard caps on searches, content fetches and estimated credits, per day
-  and per month, plus a floor on how often a topic may run. Nothing retries a
-  paid call.
+  and per month, plus a floor on how often a query may run. Nothing retries a
+  paid call except Brave, which documents that failed requests are not billed.
+  There is no automatic fallback from one paid provider to another.
 * Secrets come from the environment or mounted files; `.env` is git-ignored and
   never baked into an image layer.
 * Two independent log-redaction layers scrub credential-shaped keys and any

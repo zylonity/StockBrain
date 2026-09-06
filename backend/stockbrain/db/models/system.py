@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from decimal import Decimal
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql as pg
@@ -17,12 +18,13 @@ from stockbrain.db.base import Base, JSONDict, TimestampMixin, UUIDPrimaryKeyMix
 from stockbrain.db.models._types import pg_enum
 from stockbrain.enums import (
     ActorType,
-    FirecrawlCallKind,
-    FirecrawlCallOutcome,
     JobStatus,
     NotificationClass,
     NotificationStatus,
+    ProviderCallKind,
+    ProviderCallOutcome,
     ProviderStatus,
+    WebDiscoveryKind,
 )
 
 __all__ = [
@@ -30,9 +32,9 @@ __all__ = [
     "AuditLog",
     "DiscoveryQuery",
     "DiscoveryTopic",
-    "FirecrawlCall",
     "Job",
     "Notification",
+    "ProviderCall",
     "ProviderHealthRecord",
     "User",
 ]
@@ -136,8 +138,14 @@ class DiscoveryTopic(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
     interval_minutes: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="30")
     result_limit: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="10")
-    freshness: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="qdr:d")
-    """Firecrawl ``tbs`` freshness token."""
+    freshness_days: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="7")
+    """How far back results may be published, in days.
+
+    A number rather than a provider token.  ``qdr:d`` was Firecrawl's spelling,
+    ``pd`` is Brave's and an ISO instant is Exa's; storing one of the three in
+    the database made the column unusable by the other two.  The adapter
+    translates.
+    """
 
     include_domains: Mapped[JSONDict] = mapped_column(
         nullable=False, server_default=sa.text("'[]'::jsonb")
@@ -162,6 +170,38 @@ class DiscoveryQuery(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     query: Mapped[str] = mapped_column(sa.Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
+
+    search_kind: Mapped[WebDiscoveryKind] = mapped_column(
+        pg_enum(WebDiscoveryKind, "web_discovery_kind"),
+        nullable=False,
+        default=WebDiscoveryKind.ROUTINE,
+        server_default=WebDiscoveryKind.ROUTINE.value,
+    )
+    """Whether this is a conventional recent-news search or a second-order one.
+
+    The kind decides which provider answers it and on which schedule, so it is a
+    property of the query rather than of the deployment.  Every row that existed
+    before the provider split is ``ROUTINE``: they were keyword searches, and
+    calling them semantic afterwards would put them on Exa's price."""
+
+    provider: Mapped[str | None] = mapped_column(sa.Text)
+    """Pin this query to one backend, or ``NULL`` to use the configured default
+    for its kind.  A pin whose provider is not configured does not fall through
+    to another one -- the query simply does not run.  Silent fan-out to a second
+    paid provider is the failure mode this column exists to make impossible."""
+
+    interval_minutes: Mapped[int | None] = mapped_column(sa.Integer)
+    """Per-query cadence override, or ``NULL`` to inherit the topic's.  Always
+    subject to the configured floor, which is applied where the interval is
+    *used* so an old row cannot go faster than the operator allowed."""
+
+    result_limit: Mapped[int | None] = mapped_column(sa.Integer)
+    """Per-query result ceiling, or ``NULL`` to inherit the topic's.  Honoured
+    only as a reduction against the configured maximum."""
+
+    priority: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="100")
+    """Lower runs first when a day's budget covers only part of the backlog."""
+
     last_run_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     last_success_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(sa.Text)
@@ -191,34 +231,44 @@ class DiscoveryQuery(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
-class FirecrawlCall(UUIDPrimaryKeyMixin, Base):
-    """One paid Firecrawl operation, accounted durably.
+class ProviderCall(UUIDPrimaryKeyMixin, Base):
+    """One paid call to one metered provider, accounted durably.
 
-    This table is the Firecrawl budget. It exists because the Phase 2
-    implementation counted credits in a Python integer and a Prometheus
-    counter, neither of which survives a restart and neither of which can
-    refuse a call -- so nothing in the system could have stopped 21 searches an
-    hour from emptying the allowance.
+    This table is every provider budget.  It exists because the Phase 2
+    implementation counted Firecrawl credits in a Python integer and a
+    Prometheus counter, neither of which survives a restart and neither of which
+    can refuse a call -- so nothing in the system could have stopped 21 searches
+    an hour from emptying the allowance.
 
     The row is inserted and **committed before the HTTP request**, in the same
     spirit as ``execution_attempts.sent_to_broker``: the honest question is not
-    "what did we spend" but "what may we already have spent". A call whose
+    "what did we spend" but "what may we already have spent".  A call whose
     process died is therefore charged at its pre-call estimate rather than
-    forgotten. ``credits_charged`` is the single column the budget sums, so the
-    reconciliation from estimate to the provider's own ``creditsUsed`` happens
-    in one place.
+    forgotten.  ``units_charged`` is the single column the budgets sum, so the
+    reconciliation from estimate to whatever the provider itself reported
+    happens in one place.
+
+    Formerly ``firecrawl_calls``.  Renamed rather than replaced, and the rows
+    from the Phase 2 incident are still here under ``provider = 'firecrawl'``:
+    they are the only record of what it cost.
     """
 
-    __tablename__ = "firecrawl_calls"
+    __tablename__ = "provider_calls"
 
-    kind: Mapped[FirecrawlCallKind] = mapped_column(
-        pg_enum(FirecrawlCallKind, "firecrawl_call_kind"), nullable=False
+    provider: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    """Which metered provider this row accounts for: ``brave``, ``exa``,
+    ``firecrawl``.  Free text rather than an enum because adding a provider is a
+    configuration change, not a migration -- and because the historical rows
+    must keep naming a provider that is no longer a search backend."""
+
+    kind: Mapped[ProviderCallKind] = mapped_column(
+        pg_enum(ProviderCallKind, "provider_call_kind"), nullable=False
     )
-    outcome: Mapped[FirecrawlCallOutcome] = mapped_column(
-        pg_enum(FirecrawlCallOutcome, "firecrawl_call_outcome"),
+    outcome: Mapped[ProviderCallOutcome] = mapped_column(
+        pg_enum(ProviderCallOutcome, "provider_call_outcome"),
         nullable=False,
-        default=FirecrawlCallOutcome.RESERVED,
-        server_default=FirecrawlCallOutcome.RESERVED.value,
+        default=ProviderCallOutcome.RESERVED,
+        server_default=ProviderCallOutcome.RESERVED.value,
     )
     reserved_at: Mapped[dt.datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
@@ -248,35 +298,51 @@ class FirecrawlCall(UUIDPrimaryKeyMixin, Base):
         nullable=False,
         server_default=sa.text("'[]'::jsonb"),
     )
+    """Whatever the provider calls its result slices: Firecrawl's ``sources``,
+    Brave's ``result_filter``, Exa's ``category``."""
+
     scrape_requested: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.false()
     )
 
-    credits_reserved: Mapped[int] = mapped_column(sa.Integer, nullable=False)
-    """The worst case this call could cost, computed from the published billing
-    model before the request left."""
+    units_reserved: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    """The worst case this call could cost in the provider's own billing unit,
+    computed from its published model before the request left.  A unit is a
+    Firecrawl credit, a Brave request or an Exa request -- never comparable
+    across providers, which is why each has its own caps."""
 
-    credits_reported: Mapped[int | None] = mapped_column(sa.Integer)
-    """``creditsUsed`` as the provider reported it, when it reported one."""
+    units_reported: Mapped[int | None] = mapped_column(sa.Integer)
+    """What the provider said it charged, when it says anything."""
 
-    credits_charged: Mapped[int] = mapped_column(sa.Integer, nullable=False)
-    """What the budget counts: the provider's number when there is one, the
-    reservation otherwise. Never lower than what was actually billed as far as
-    StockBrain can tell."""
+    units_charged: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    """What the budget counts: the provider's number when there is one and it is
+    higher, the reservation otherwise.  Never lower than what was actually
+    billed as far as StockBrain can tell."""
+
+    cost_usd_reported: Mapped[Decimal | None] = mapped_column(sa.Numeric(12, 6))
+    """The provider's own price for this call.  Exa returns ``costDollars``;
+    Brave and Firecrawl report nothing per call and leave this NULL."""
+
+    cost_usd_charged: Mapped[Decimal | None] = mapped_column(sa.Numeric(12, 6))
+    """Charged cost in USD where the provider's price is knowable at all.  NULL
+    for Firecrawl, which bills credits against a monthly allowance rather than
+    dollars per call -- reporting an invented dollar figure there would be
+    worse than reporting none."""
 
     results_returned: Mapped[int | None] = mapped_column(sa.Integer)
     pages_scraped: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
     http_status: Mapped[int | None] = mapped_column(sa.Integer)
     error_category: Mapped[str | None] = mapped_column(sa.Text)
-    """The exception class name, never a provider body: a Firecrawl error body
+    """The exception class name, never a provider body: a provider error body
     can echo the request, and the request carries an Authorization header."""
 
     __table_args__ = (
-        sa.Index("ix_firecrawl_calls_reserved_at", "reserved_at"),
-        sa.Index("ix_firecrawl_calls_kind_reserved_at", "kind", "reserved_at"),
-        sa.Index("ix_firecrawl_calls_query_id", "query_id"),
-        sa.CheckConstraint("credits_reserved >= 0", name="credits_reserved_non_negative"),
-        sa.CheckConstraint("credits_charged >= 0", name="credits_charged_non_negative"),
+        sa.Index("ix_provider_calls_reserved_at", "reserved_at"),
+        sa.Index("ix_provider_calls_provider_reserved_at", "provider", "reserved_at"),
+        sa.Index("ix_provider_calls_kind_reserved_at", "kind", "reserved_at"),
+        sa.Index("ix_provider_calls_query_id", "query_id"),
+        sa.CheckConstraint("units_reserved >= 0", name="units_reserved_non_negative"),
+        sa.CheckConstraint("units_charged >= 0", name="units_charged_non_negative"),
         sa.CheckConstraint("pages_scraped >= 0", name="pages_scraped_non_negative"),
     )
 

@@ -5,9 +5,12 @@ application report itself unhealthy, because research, reconciliation and the
 approval path all keep working without it.  Only PostgreSQL is load-bearing
 enough that losing it makes the application not-ready.
 
-Statuses follow the specification: HEALTHY, DEGRADED, DOWN, DISABLED, UNKNOWN.
-``DISABLED`` means "deliberately switched off or not configured" and never
-counts as a fault; ``UNKNOWN`` means "configured but not yet checked".
+Statuses follow the specification: HEALTHY, DEGRADED, DOWN, DISABLED, UNKNOWN,
+plus BUDGET_EXHAUSTED.  ``DISABLED`` means "deliberately switched off or not
+configured" and never counts as a fault; ``UNKNOWN`` means "configured but not
+yet checked"; ``BUDGET_EXHAUSTED`` means "switched on, working, and out of
+allowance", which is a spending limit doing its job rather than a fault to
+investigate.
 """
 
 from __future__ import annotations
@@ -43,7 +46,10 @@ class ProviderName(StrEnum):
     DEEPSEEK = "deepseek"
     ALPACA_NEWS = "alpaca_news"
     ALPACA_MARKET_DATA = "alpaca_market_data"
+    BRAVE = "brave"
+    EXA = "exa"
     FIRECRAWL = "firecrawl"
+    CONTENT_EXTRACTION = "content_extraction"
     SEC = "sec"
     FRED = "fred"
     TRADING212 = "trading212"
@@ -63,11 +69,17 @@ class Subsystem(StrEnum):
 
 #: Which providers contribute to which subsystem, and whether the subsystem can
 #: survive on a subset of them.  Discovery, for example, degrades rather than
-#: fails when Alpaca news is down but Firecrawl and SEC still work.
+#: fails when Alpaca news is down but Brave and SEC still work.
+#:
+#: ``CONTENT_EXTRACTION`` is deliberately absent: failing to read one publisher's
+#: page does not mean discovery stopped working, and folding it in here would
+#: make a paywall look like an outage.
 SUBSYSTEM_PROVIDERS: dict[Subsystem, tuple[ProviderName, ...]] = {
     Subsystem.DATABASE: (ProviderName.POSTGRES,),
     Subsystem.DISCOVERY: (
         ProviderName.ALPACA_NEWS,
+        ProviderName.BRAVE,
+        ProviderName.EXA,
         ProviderName.FIRECRAWL,
         ProviderName.SEC,
     ),
@@ -80,8 +92,12 @@ _SEVERITY: dict[ProviderStatus, int] = {
     ProviderStatus.HEALTHY: 0,
     ProviderStatus.DISABLED: 0,
     ProviderStatus.UNKNOWN: 1,
-    ProviderStatus.DEGRADED: 2,
-    ProviderStatus.DOWN: 3,
+    # A spending limit doing its job sits below a fault, and above "not yet
+    # checked": the provider is definitely not working, and definitely not
+    # broken.
+    ProviderStatus.BUDGET_EXHAUSTED: 2,
+    ProviderStatus.DEGRADED: 3,
+    ProviderStatus.DOWN: 4,
 }
 
 
@@ -120,6 +136,14 @@ def aggregate_status(statuses: list[ProviderStatus], *, require_all: bool) -> Pr
         return ProviderStatus.DEGRADED
     if down == len(considered):
         return ProviderStatus.DOWN
+    if any(
+        s in (ProviderStatus.DOWN, ProviderStatus.DEGRADED, ProviderStatus.BUDGET_EXHAUSTED)
+        for s in considered
+    ):
+        # No provider is healthy and at least one has definitely stopped
+        # working. That is a degraded subsystem, not an unknown one -- reporting
+        # UNKNOWN here would hide a fully budget-exhausted discovery layer.
+        return ProviderStatus.DEGRADED
     return ProviderStatus.UNKNOWN
 
 
@@ -196,6 +220,11 @@ class ProviderHealthRegistry:
             state.consecutive_failures = 0
         elif status in (ProviderStatus.DEGRADED, ProviderStatus.DOWN):
             state.consecutive_failures += 1
+        elif status is ProviderStatus.BUDGET_EXHAUSTED:
+            # Not a failure. Counting it as one would make a provider that
+            # simply spent its allowance look like a provider that is broken,
+            # and would eventually trip the failure-count alerting.
+            state.consecutive_failures = 0
 
         METRICS.set(
             "stockbrain_provider_status",

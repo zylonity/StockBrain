@@ -230,100 +230,182 @@ export function Discovery() {
         </div>
       )}
 
-      {status.data?.firecrawl && (
+      {status.data?.web_discovery && (
         <div className="card">
-          <h2>Firecrawl budget</h2>
-          {status.data.firecrawl.blockers.length > 0 && (
-            <ul className="reason-list">
-              {status.data.firecrawl.blockers.map((blocker) => (
-                <li key={blocker} className="muted">
-                  {blocker}
-                </li>
-              ))}
-            </ul>
-          )}
-          {status.data.firecrawl.exhausted_reasons.map((reason) => (
-            <p key={reason} className="banner banner-warn">
-              {reason}
-            </p>
-          ))}
+          <h2>Web discovery providers</h2>
           <p className="metric-note">
-            Search costs 2 credits per 10 results and a content fetch costs 1
-            per page, so the caps below are the real spending limit. Budget
-            exhaustion degrades Firecrawl alone — Alpaca news, SEC EDGAR,
-            classification, research and broker reconciliation all continue.
+            Routine thematic search runs on{" "}
+            <strong>{status.data.web_discovery.routine_provider}</strong>; semantic
+            second-order search runs on{" "}
+            <strong>{status.data.web_discovery.semantic_provider}</strong>. There is
+            deliberately no automatic fallback between them — if one is
+            unavailable its queries defer rather than moving onto a provider that
+            costs more. Budget exhaustion degrades that provider alone; Alpaca
+            news, SEC EDGAR, classification, research and broker reconciliation
+            all continue.
           </p>
           <table>
             <thead>
               <tr>
-                <th>Window</th>
-                <th>Used</th>
-                <th>Cap</th>
-                <th>Remaining</th>
+                <th>Provider</th>
+                <th>Status</th>
+                <th>Today</th>
+                <th>Cap/day</th>
+                <th>Month</th>
+                <th>Cap/month</th>
+                <th>Cost so far</th>
+                <th>Last success</th>
               </tr>
             </thead>
             <tbody>
+              {status.data.web_discovery.providers.map((provider) => (
+                <tr key={provider.provider} className={provider.enabled ? "" : "muted"}>
+                  <td className="mono">{provider.provider}</td>
+                  <td>
+                    <StatusPill status={provider.status} />
+                  </td>
+                  <td className="mono">
+                    {provider.today.estimated_units} {provider.unit_label}
+                  </td>
+                  <td className="mono detail">{provider.daily_unit_cap}</td>
+                  <td className="mono">{provider.month.estimated_units}</td>
+                  <td className="mono detail">{provider.monthly_unit_cap}</td>
+                  <td className="mono detail">
+                    {/* Firecrawl bills credits against an allowance rather than
+                        dollars per call, so it reports no price and the panel
+                        says so rather than showing a fabricated $0.00. */}
+                    {provider.unit_label === "credits"
+                      ? "—"
+                      : `$${Number(provider.month.estimated_cost_usd).toFixed(3)}`}
+                  </td>
+                  <td className="mono detail">
+                    {formatRelative(provider.last_successful_call_at)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {status.data.web_discovery.providers.flatMap((provider) =>
+            provider.exhausted_reasons.map((reason) => (
+              <p key={`${provider.provider}:${reason}`} className="banner banner-warn">
+                {provider.provider}: {reason}
+              </p>
+            )),
+          )}
+          <ul className="reason-list">
+            {status.data.web_discovery.providers.flatMap((provider) =>
+              provider.blockers.map((blocker) => (
+                <li key={`${provider.provider}:${blocker}`} className="muted">
+                  {provider.provider}: {blocker}
+                </li>
+              )),
+            )}
+          </ul>
+          <p className="metric-note">
+            Cadence floors: routine{" "}
+            {status.data.web_discovery.routine_min_interval_minutes} min, semantic{" "}
+            {status.data.web_discovery.semantic_min_interval_minutes} min. No query
+            can run faster than its floor, whatever its stored interval says.
+          </p>
+        </div>
+      )}
+
+      {status.data?.web_discovery?.extraction && (
+        <div className="card">
+          <h2>Content extraction</h2>
+          <p className="metric-note">
+            Pages are read only after the classifier shortlists them, locally
+            first with {status.data.web_discovery.extraction.extractor}. The paid
+            Firecrawl fallback runs only when a local attempt failed for a reason
+            a different fetcher could fix, and is currently{" "}
+            <strong>
+              {status.data.web_discovery.extraction.fallback_enabled ? "on" : "off"}
+            </strong>
+            .
+          </p>
+          <table>
+            <tbody>
               <tr>
-                <td>Searches today</td>
-                <td className="mono">{status.data.firecrawl.today.searches}</td>
-                <td className="mono detail">{status.data.firecrawl.max_searches_per_day}</td>
+                <td>Pages read today</td>
+                <td className="mono">
+                  {status.data.web_discovery.extraction.fetched_today}
+                </td>
                 <td className="mono detail">
-                  {status.data.firecrawl.searches_remaining_today}
+                  cap {status.data.web_discovery.extraction.max_per_day}
                 </td>
               </tr>
               <tr>
-                <td>Content fetches today</td>
-                <td className="mono">{status.data.firecrawl.today.scrapes}</td>
-                <td className="mono detail">{status.data.firecrawl.max_scrapes_per_day}</td>
-                <td className="mono detail">{status.data.firecrawl.scrapes_remaining_today}</td>
+                <td>Locally (free)</td>
+                <td className="mono">
+                  {status.data.web_discovery.extraction.by_method_today.LOCAL ?? 0}
+                </td>
+                <td className="mono detail">no cost</td>
               </tr>
               <tr>
-                <td>Credits today</td>
-                <td className="mono">{status.data.firecrawl.today.estimated_credits}</td>
-                <td className="mono detail">{status.data.firecrawl.daily_credit_cap}</td>
-                <td className="mono detail">{status.data.firecrawl.daily_credits_remaining}</td>
+                <td>Firecrawl fallback (paid)</td>
+                <td className="mono">
+                  {status.data.web_discovery.extraction.firecrawl_fallbacks_today}
+                </td>
+                <td className="mono detail">1 credit each</td>
               </tr>
               <tr>
-                <td>Credits this month</td>
-                <td className="mono">{status.data.firecrawl.month.estimated_credits}</td>
-                <td className="mono detail">{status.data.firecrawl.monthly_credit_cap}</td>
-                <td className="mono detail">{status.data.firecrawl.monthly_credits_remaining}</td>
+                <td>Attempted, nothing usable</td>
+                <td className="mono">
+                  {status.data.web_discovery.extraction.local_failures_today}
+                </td>
+                <td className="mono detail">not retried</td>
               </tr>
             </tbody>
           </table>
-          <p className="metric-note">
-            Cadence floor {status.data.firecrawl.min_topic_interval_minutes} min ·
-            limit {status.data.firecrawl.search_result_limit} per source ×{" "}
-            {status.data.firecrawl.search_sources.join(", ")} · content fetches{" "}
-            {status.data.firecrawl.scrape_enabled ? "on" : "off"} · last success{" "}
-            {formatRelative(status.data.firecrawl.last_successful_call_at)} ·{" "}
-            {status.data.firecrawl.today.provider_reported_credits} of today&apos;s credits
-            confirmed by the provider
-          </p>
-          {status.data.firecrawl.per_topic.length > 0 && (
+          <ul className="reason-list">
+            {status.data.web_discovery.extraction.blockers.map((blocker) => (
+              <li key={blocker} className="muted">
+                {blocker}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {status.data?.web_discovery &&
+        status.data.web_discovery.queries.length > 0 && (
+          <div className="card">
+            <h2>Discovery queries</h2>
+            <p className="metric-note">
+              &ldquo;Next eligible&rdquo; is a stored column, not a guess: it is
+              written after every attempt — succeeded, failed or budget-refused —
+              so a restart cannot reset a cooldown.
+            </p>
             <table>
               <thead>
                 <tr>
+                  <th>Kind</th>
+                  <th>Provider</th>
                   <th>Topic</th>
                   <th>Query</th>
                   <th>Last success</th>
                   <th>Next eligible</th>
                   <th>Interval</th>
                   <th>Fails</th>
-                  <th>Credits</th>
+                  <th>Units</th>
                 </tr>
               </thead>
               <tbody>
-                {status.data.firecrawl.per_topic.map((row) => (
-                  <tr key={`${row.topic}:${row.query}`} className={row.enabled ? "" : "muted"}>
+                {status.data.web_discovery.queries.map((row) => (
+                  <tr
+                    key={`${row.topic}:${row.query}`}
+                    className={row.enabled ? "" : "muted"}
+                  >
+                    <td className="mono">{row.kind}</td>
+                    <td className="mono">{row.provider}</td>
                     <td className="mono">{row.topic}</td>
                     <td>{row.query}</td>
-                    <td className="mono">
+                    <td className="mono detail">
                       {row.last_success_at
                         ? new Date(row.last_success_at).toLocaleString()
                         : "—"}
                     </td>
-                    <td className="mono">
+                    <td className="mono detail">
                       {row.enabled
                         ? row.next_eligible_at
                           ? new Date(row.next_eligible_at).toLocaleString()
@@ -332,14 +414,13 @@ export function Discovery() {
                     </td>
                     <td className="mono">{row.effective_interval_minutes}m</td>
                     <td className="mono">{row.consecutive_failures}</td>
-                    <td className="mono">{row.credits_used}</td>
+                    <td className="mono">{row.units_used}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          )}
-        </div>
-      )}
+          </div>
+        )}
 
       <div className="grid">
         <div className="card">
@@ -423,7 +504,7 @@ export function Discovery() {
               <span className="topic-name">{topic.name}</span>
               <StatusPill status={topic.enabled ? "HEALTHY" : "DISABLED"} />
               <span className="faint mono">
-                every {topic.interval_minutes}m · {topic.freshness} · limit{" "}
+                every {topic.interval_minutes}m · last {topic.freshness_days}d · limit{" "}
                 {topic.result_limit}
               </span>
               <span className="faint mono">
@@ -438,7 +519,8 @@ export function Discovery() {
                 <li key={query.id}>
                   <span className="query-text">{query.query}</span>
                   <span className="mono faint">
-                    {query.results_seen} results · {query.credits_used} credits
+                    {query.kind} · {query.provider} · {query.results_seen} results ·{" "}
+                    {query.units_used} units
                     {query.consecutive_failures > 0 &&
                       ` · ${query.consecutive_failures} failures`}
                   </span>

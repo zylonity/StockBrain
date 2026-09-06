@@ -9,6 +9,7 @@ specific way that could go wrong.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import pathlib
 
@@ -39,7 +40,13 @@ def test_every_new_credential_is_a_secret_str() -> None:
     happens.
     """
     fields = Settings.model_fields
-    for name in ("firecrawl_api_key", "web_owner_password_hash", "stockbrain_secret_key"):
+    for name in (
+        "firecrawl_api_key",
+        "brave_api_key",
+        "exa_api_key",
+        "web_owner_password_hash",
+        "stockbrain_secret_key",
+    ):
         annotation = str(fields[name].annotation)
         assert "SecretStr" in annotation, f"{name} is not a SecretStr"
 
@@ -54,27 +61,31 @@ def test_the_password_hash_never_appears_in_a_settings_repr() -> None:
         web_auth_enabled=False,
         web_owner_password_hash=stored,
         firecrawl_api_key="fc-a-key-that-must-not-leak",
+        brave_api_key="brv-a-key-that-must-not-leak",
+        exa_api_key="exa-a-key-that-must-not-leak",
     )
     rendered = repr(settings) + str(settings)
     assert stored not in rendered
     assert "fc-a-key-that-must-not-leak" not in rendered
+    assert "brv-a-key-that-must-not-leak" not in rendered
+    assert "exa-a-key-that-must-not-leak" not in rendered
     assert "a-password-that-must-not-leak" not in rendered
 
 
-def test_the_firecrawl_budget_holds_no_credential() -> None:
+def test_the_provider_budget_holds_no_credential() -> None:
     """Structural: the budget cannot leak a key because it never has one.
 
     It takes a database and four integers. The API key lives on the client,
     which is a different object with a different job.
     """
-    from stockbrain.ingestion.firecrawl_budget import FirecrawlBudget
+    from stockbrain.ingestion.provider_budget import ProviderCallBudget
 
-    signature = inspect.signature(FirecrawlBudget.__init__)
+    signature = inspect.signature(ProviderCallBudget.__init__)
     for forbidden in ("api_key", "key", "token", "secret", "settings"):
         assert forbidden not in signature.parameters, forbidden
 
 
-def test_a_firecrawl_error_is_recorded_as_a_class_name_not_a_body() -> None:
+def test_a_search_error_is_recorded_as_a_class_name_not_a_body() -> None:
     """A Firecrawl error body can echo the request, and the request carries an
     ``Authorization: Bearer`` header.
 
@@ -82,10 +93,10 @@ def test_a_firecrawl_error_is_recorded_as_a_class_name_not_a_body() -> None:
     than on behaviour, because the failing version would look correct.
     """
     handlers = (SOURCE_ROOT / "jobs" / "handlers.py").read_text()
-    firecrawl_section = handlers[handlers.index("handle_firecrawl_topic_search") :]
-    firecrawl_section = firecrawl_section[: firecrawl_section.index("async def handle_sec_refresh")]
-    assert "error_category=type(exc).__name__" in firecrawl_section
-    assert "error_category=str(exc)" not in firecrawl_section
+    section = handlers[handlers.index("async def handle_web_discovery_search") :]
+    section = section[: section.index("async def handle_sec_refresh")]
+    assert "error_category=type(exc).__name__" in section
+    assert "error_category=str(exc)" not in section
 
 
 def test_no_module_logs_an_fx_or_firecrawl_response_body() -> None:
@@ -95,7 +106,13 @@ def test_no_module_logs_an_fx_or_firecrawl_response_body() -> None:
     shared client; what must not appear is a raw payload dumped into a log
     event, because that is how a request -- and its headers -- ends up on disk.
     """
-    for name in ("fx/alpaca.py", "fx/frankfurter.py", "ingestion/firecrawl.py"):
+    for name in (
+        "fx/alpaca.py",
+        "fx/frankfurter.py",
+        "ingestion/firecrawl.py",
+        "ingestion/brave.py",
+        "ingestion/exa.py",
+    ):
         source = (SOURCE_ROOT / name).read_text()
         assert "payload=payload" not in source, name
         assert "body=response" not in source, name
@@ -135,7 +152,11 @@ def test_no_phase_9_module_can_reach_a_broker_mutation() -> None:
         "fx/alpaca.py",
         "fx/frankfurter.py",
         "ingestion/firecrawl.py",
-        "ingestion/firecrawl_budget.py",
+        "ingestion/brave.py",
+        "ingestion/exa.py",
+        "ingestion/provider_budget.py",
+        "extraction/local.py",
+        "extraction/ssrf.py",
         "observability/alerts.py",
         "api/auth.py",
         "hash_password.py",
@@ -178,45 +199,62 @@ def test_the_alert_scanner_cannot_change_anything() -> None:
         assert f".{verb}" not in source, verb
 
 
-def test_firecrawl_makes_exactly_two_kinds_of_paid_call() -> None:
-    """Search and scrape.  No crawl, no map, no extract, no agent.
+def test_firecrawl_makes_exactly_one_kind_of_paid_call() -> None:
+    """Scrape, and nothing else.  No search, no crawl, no map, no extract, no
+    agent.
 
     Each of those is a separate Firecrawl product with its own billing, and
-    ``/v2/crawl`` in particular can spend an allowance in one request.
+    ``/v2/crawl`` in particular can spend an allowance in one request. ``/v2/search``
+    is on the list now too: it was the primary discovery path through Phase 9
+    and it is *removed*, not merely unscheduled -- a paid path left in the tree
+    is a paid path that gets called again.
     """
+    # Path *constants*, not prose: the module docstring names ``/v2/search``
+    # precisely to record that it was removed, and a bare substring match would
+    # trip on that.
     source = (SOURCE_ROOT / "ingestion" / "firecrawl.py").read_text()
-    for forbidden in ("/v2/crawl", "/v2/map", "/v2/extract", "/v2/agent", "/v1/"):
-        assert forbidden not in source, forbidden
-    assert source.count('"/v2/search"') == 1
-    assert source.count('"/v2/scrape"') == 1
+    constants = [
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    paths = {value for value in constants if value.startswith("/v")}
+    assert paths == {"/v2/scrape"}, paths
+    # And no client method offers the removed endpoints under another name.
+    assert "def search" not in source
 
 
-def test_no_firecrawl_call_site_retries() -> None:
-    """A retry is a second *paid* call.
+def test_no_paid_search_or_scrape_call_site_retries() -> None:
+    """A retry is a second *paid* call on any provider that bills failures.
 
-    ``retry_safe`` defaults to ``False`` and both Firecrawl call sites leave it
-    there. The Phase 2 version passed ``retry_safe=True, max_attempts=3``, and
-    with the queue's own three attempts that was up to nine billable requests
-    per scheduled search.
+    ``retry_safe`` defaults to ``False`` and the Firecrawl and Exa call sites
+    leave it there. The Phase 2 version passed ``retry_safe=True,
+    max_attempts=3``, and with the queue's own three attempts that was up to
+    nine billable requests per scheduled search.
+
+    Brave is the documented exception and is asserted separately: it publishes
+    that only successful requests are billed, so a bounded retry there costs
+    nothing.
     """
-    source = (SOURCE_ROOT / "ingestion" / "firecrawl.py").read_text()
-    assert "retry_safe=True" not in source
-    assert "max_attempts=" not in source
+    for name in ("firecrawl.py", "exa.py"):
+        source = (SOURCE_ROOT / "ingestion" / name).read_text()
+        assert "retry_safe=True" not in source, name
+        assert "get_json(" not in source, name
 
 
 def test_the_paid_job_types_get_one_attempt() -> None:
-    """Both Firecrawl job enqueues cap attempts at one.
+    """Both paid job enqueues cap attempts at one.
 
     The durable cooldown is the retry; the queue's retry would be a second
-    reservation for the same search.
+    reservation for the same search or the same page.
     """
     services = (SOURCE_ROOT / "services.py").read_text()
-    search_block = services[services.index("JobType.FIRECRAWL_TOPIC_SEARCH") :][:1200]
+    search_block = services[services.index("JobType.WEB_DISCOVERY_SEARCH") :][:1600]
     assert "max_attempts=1" in search_block
 
     ingestion = (SOURCE_ROOT / "ingestion" / "service.py").read_text()
-    enrich_block = ingestion[ingestion.index("JobType.FIRECRAWL_ENRICH") :][:1200]
-    assert "max_attempts=1" in enrich_block
+    extract_block = ingestion[ingestion.index("JobType.CONTENT_EXTRACT") :][:1200]
+    assert "max_attempts=1" in extract_block
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +389,7 @@ def test_the_budget_windows_are_computed_by_postgresql() -> None:
     ``reserved_at`` defaults to the database clock and the window boundaries are
     computed with the same ``now()``, so the two cannot disagree.
     """
-    source = (SOURCE_ROOT / "ingestion" / "firecrawl_budget.py").read_text()
+    source = (SOURCE_ROOT / "ingestion" / "provider_budget.py").read_text()
     assert "date_trunc('day', now() AT TIME ZONE 'UTC')" in source
     assert "date_trunc('month', now() AT TIME ZONE 'UTC')" in source
 
@@ -364,14 +402,14 @@ def test_the_discovery_cadence_uses_the_database_clock() -> None:
     would make a cooldown negotiable by container clock skew.
     """
     handlers = (SOURCE_ROOT / "jobs" / "handlers.py").read_text()
-    block = handlers[handlers.index("handle_firecrawl_topic_search") :]
+    block = handlers[handlers.index("async def handle_web_discovery_search") :]
     block = block[: block.index("async def handle_sec_refresh")]
     assert "next_eligible_at=sa.func.now()" in block
     assert "last_run_at=sa.func.now()" in block
 
     services = (SOURCE_ROOT / "services.py").read_text()
-    sweep = services[services.index("async def _enqueue_due_topic_searches") :]
-    sweep = sweep[: sweep.index("async def _enqueue_firecrawl_enrichment")]
+    sweep = services[services.index("async def _enqueue_due_searches") :]
+    sweep = sweep[: sweep.index("async def _enqueue_content_extraction")]
     # The sweep reads the clock from PostgreSQL and compares `next_eligible_at`
     # against it, rather than against `datetime.now()` in this process.
     assert "sa.select(sa.func.now())" in sweep

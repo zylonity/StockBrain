@@ -6,7 +6,7 @@ The question is never "did it work" but "did the wrong thing become possible".
 
 The three properties everything in this file circles around:
 
-1. **No duplicate paid work.**  Not a second broker POST, not a second Firecrawl
+1. **No duplicate paid work.**  Not a second broker POST, not a second search
    search, not a second LLM call for the same event.
 2. **No reservation lost, no reservation held forever.**  An ambiguous order
    keeps its exposure reserved; a definitively unsent one releases it.
@@ -28,15 +28,15 @@ import sqlalchemy as sa
 from stockbrain.config import Settings
 from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
 from stockbrain.db.models.sources import Event
-from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic, FirecrawlCall, Job
+from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic, Job, ProviderCall
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     EventStatus,
     ExecutionFailure,
     ExecutionOutcome,
-    FirecrawlCallKind,
     JobStatus,
     ProposalStatus,
+    ProviderCallKind,
     ProviderStatus,
 )
 from stockbrain.errors import (
@@ -44,7 +44,7 @@ from stockbrain.errors import (
     DefinitePreSendFailure,
     ProviderUnavailable,
 )
-from stockbrain.ingestion.firecrawl_budget import FirecrawlBudget
+from stockbrain.ingestion.provider_budget import ProviderCallBudget
 from stockbrain.observability.health import ProviderHealthRegistry
 from stockbrain.proposals.quotes import QuoteFetcher
 from stockbrain.services import ServiceContainer
@@ -301,14 +301,14 @@ async def test_an_optional_provider_being_down_keeps_the_service_ready(
 ) -> None:
     """Readiness is about the database and the schema, not about the news feed.
 
-    A dead Firecrawl, a dead Alpaca and an exhausted LLM budget must all leave
+    A dead Brave, a dead Alpaca and an exhausted LLM budget must all leave
     the service ready: they degrade their own subsystem and nothing else.
     """
     registry = ProviderHealthRegistry()
     from stockbrain.observability.health import ProviderName
 
     registry.record(ProviderName.POSTGRES, ProviderStatus.HEALTHY)
-    registry.record(ProviderName.FIRECRAWL, ProviderStatus.DOWN, detail="402")
+    registry.record(ProviderName.BRAVE, ProviderStatus.DOWN, detail="429")
     registry.record(ProviderName.ALPACA_NEWS, ProviderStatus.DOWN, detail="socket closed")
     registry.record(ProviderName.DEEPSEEK, ProviderStatus.DEGRADED, detail="budget")
     registry.set_schema_state(True, "at head")
@@ -335,7 +335,7 @@ async def test_two_workers_racing_one_proposal_transmit_once(
     assert len([a for a in await _attempts(clean_tables) if a.sent_to_broker]) == 1
 
 
-async def test_two_firecrawl_budgets_racing_the_last_credit_grant_one(
+async def test_two_provider_budgets_racing_the_last_unit_grant_one(
     clean_tables: Database,
 ) -> None:
     """Two processes, one allowance.
@@ -344,23 +344,25 @@ async def test_two_firecrawl_budgets_racing_the_last_credit_grant_one(
     Phase 2 counter lived on a client object and held across nothing.
     """
     guards = [
-        FirecrawlBudget(
+        ProviderCallBudget(
             clean_tables,
+            provider="brave",
+            unit_label="requests",
             enabled=True,
             max_searches_per_day=1,
             max_scrapes_per_day=1,
-            daily_credit_cap=100,
-            monthly_credit_cap=100,
+            daily_unit_cap=100,
+            monthly_unit_cap=100,
         )
         for _ in range(6)
     ]
     results = await asyncio.gather(
-        *(guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) for guard in guards)
+        *(guard.reserve(ProviderCallKind.SEARCH, units_needed=1) for guard in guards)
     )
     assert len([item for item in results if item is not None]) == 1
     async with clean_tables.session() as session:
         count = (
-            await session.execute(sa.select(sa.func.count()).select_from(FirecrawlCall))
+            await session.execute(sa.select(sa.func.count()).select_from(ProviderCall))
         ).scalar_one()
     assert count == 1
 
@@ -380,7 +382,7 @@ async def test_a_duplicate_scheduler_does_not_double_enqueue(
             enabled=True,
             interval_minutes=720,
             result_limit=5,
-            freshness="qdr:d",
+            freshness_days=7,
             include_domains=[],
             exclude_domains=[],
         )
@@ -393,8 +395,7 @@ async def test_a_duplicate_scheduler_does_not_double_enqueue(
         log_level="CRITICAL",
         web_auth_enabled=False,
         database_url=clean_tables.engine.url.render_as_string(hide_password=False),
-        firecrawl_api_key="fc-test",
-        firecrawl_enabled=True,
+        brave_api_key="brv-test",
         alpaca_news_enabled=False,
         sec_enabled=False,
         t212_metadata_enabled=False,
@@ -405,14 +406,12 @@ async def test_a_duplicate_scheduler_does_not_double_enqueue(
         container = ServiceContainer(
             settings=settings, database=clean_tables, health=ProviderHealthRegistry()
         )
-        await container._enqueue_due_topic_searches()
+        await container._enqueue_due_routine_searches()
 
     async with clean_tables.session() as session:
         jobs = list(
             (
-                await session.execute(
-                    sa.select(Job).where(Job.job_type == "FIRECRAWL_TOPIC_SEARCH")
-                )
+                await session.execute(sa.select(Job).where(Job.job_type == "WEB_DISCOVERY_SEARCH"))
             ).scalars()
         )
     assert len(jobs) == 1
@@ -469,11 +468,11 @@ async def test_a_dead_workers_job_is_reclaimed_within_its_retry_budget(
     assert statuses == ["FAILED", "PENDING"]
 
 
-async def test_a_paid_firecrawl_job_is_not_reclaimed_into_a_second_call(
+async def test_a_paid_search_job_is_not_reclaimed_into_a_second_call(
     clean_tables: Database,
 ) -> None:
-    """A Firecrawl search job has ``max_attempts=1`` precisely so that a dying
-    worker does not turn into a second billable request.
+    """A web-discovery search job has ``max_attempts=1`` precisely so that a
+    dying worker does not turn into a second billable request.
 
     Reclamation respects the budget, so the row goes straight to FAILED and the
     durable cooldown decides when to try again.
@@ -483,7 +482,7 @@ async def test_a_paid_firecrawl_job_is_not_reclaimed_into_a_second_call(
     async with clean_tables.transaction() as session:
         session.add(
             Job(
-                job_type="FIRECRAWL_TOPIC_SEARCH",
+                job_type="WEB_DISCOVERY_SEARCH",
                 payload={},
                 status=JobStatus.RUNNING,
                 locked_by="dead-worker#0",

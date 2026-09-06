@@ -1394,3 +1394,208 @@ could ignore it because the two currencies were required to match; with FX in
 play it is 35% too small on a GBP/USD pair and silently becomes the binding cap.
 It is now converted, and omitted entirely rather than guessed when no usable
 rate exists.
+
+---
+
+# Provider split — Brave, Exa, and Firecrawl as a fallback extractor
+
+**Verified 2026-09-05.** Firecrawl stops being StockBrain's primary discovery
+provider. Brave answers routine thematic search, Exa answers semantic
+second-order search, and Firecrawl keeps one job: a paid page fetch when free
+local extraction cannot read a page.
+
+Everything in this section was read from each vendor's current documentation on
+that date. Where a fact contradicts something StockBrain previously assumed, the
+contradiction is stated rather than quietly corrected.
+
+## Brave Search API
+
+<https://api-dashboard.search.brave.com/api-reference/web/search/get>,
+`/documentation/guides/rate-limiting`, <https://brave.com/search/api/>
+
+| Fact | Value |
+|---|---|
+| Endpoint | `GET https://api.search.brave.com/res/v1/web/search` |
+| Auth | header **`X-Subscription-Token`** — *not* a bearer token |
+| `q` | max **400 characters and 50 words** |
+| `count` | 1–20, default 20, **web results only** |
+| `offset` | 0–9 |
+| `freshness` | `pd` / `pw` / `pm` / `py`, or `YYYY-MM-DDtoYYYY-MM-DD` |
+| `result_filter` | comma list of `discussions`, `faq`, `infobox`, `news`, `query`, `summarizer`, `videos`, `web`, `locations` |
+| `country` | 2-character code, default `US` |
+| `safesearch` | `off` / `moderate` (default) / `strict` |
+| Response | `{"type", "query", "web": {"results": [...]}, "news": {"results": [...]}, ...}` |
+| Web result | `title`, `url`, `description`, `page_age`, `age`, `meta_url.hostname`, `profile.name`, `extra_snippets` |
+| News result | the same, plus `breaking` |
+| Rate limit | **429**; every response carries `X-RateLimit-Limit`, `X-RateLimit-Policy` (e.g. `1;w=1, 15000;w=2592000`), `X-RateLimit-Remaining`, `X-RateLimit-Reset` (seconds from now) |
+
+Three of these are load-bearing and each changes the design:
+
+* **One request returns both clusters.** `result_filter=web,news` gives the web
+  and news results together, so the separate `/res/v1/news/search` endpoint —
+  which would be a *second billable request* — is deliberately not used.
+* **`count` does not multiply the price.** This is the opposite of Firecrawl's
+  `limit`, which is per *source* and turned `limit=10` with two sources into
+  twenty billed results. On Brave, one request is one billable request however
+  many results come back. `count` is a relevance knob, not a cost knob.
+* **"Only successful requests (non-error responses) are counted against your
+  quota and billed."** Also the opposite of Firecrawl. This is why a Brave GET
+  is allowed the shared client's bounded retry, and why the ledger *refunds* a
+  classified Brave provider error — but not a transport failure, because a
+  timeout is exactly the case where nobody knows whether the far side served it.
+
+### Pricing, and a discrepancy worth recording
+
+<https://brave.com/search/api/> states: Search plan **$5 per 1,000 requests**,
+**$5 in free monthly credits (automatically applied)**, rate limit **50 queries
+per second**, and a credit card required "for identity verification" on free
+plans which "will not be charged".
+
+**Discrepancy.** Third-party reporting (e.g. implicator.ai, February 2026) says
+Brave *removed* its standing free tier — previously 2,000 queries/month at 1
+query/second, raised to 5,000 in August 2025 — and replaced it with the credit
+model above, and that the $5 monthly credit is retained **only if you publicly
+attribute Brave**. Brave's own pricing page does not mention an attribution
+condition. StockBrain does not rely on the free credit being unconditional:
+
+* the caps are set at **320 requests/month** (~$1.60 at the published rate),
+  which is affordable even if the credit turns out not to apply;
+* the rate limiter is pinned at **1 request/second**, the documented entry-plan
+  burst ceiling, rather than at the 50 QPS the paid plan advertises.
+
+An operator who wants the credit should check Brave's current terms for an
+attribution requirement. That is a business decision, not a code one.
+
+## Exa
+
+<https://exa.ai/docs/reference/search>, `/reference/pricing`,
+`/reference/rate-limits`, `/reference/quickstart`
+
+| Fact | Value |
+|---|---|
+| Endpoint | `POST https://api.exa.ai/search` |
+| Auth | **`Authorization: Bearer <key>`** with `Content-Type: application/json` |
+| `type` | `instant` / `fast` / `auto` (default) / `deep-lite` / `deep` / `deep-reasoning` |
+| `numResults` | 1–100, default 10 |
+| `category` | `company`, `publication`, `news`, `personal site`, `financial report`, `people` |
+| Date filters | `startPublishedDate` / `endPublishedDate`, ISO-8601 |
+| Contents | **must nest under `contents`**; a top-level `text` is a 400 |
+| Response | `{"requestId", "results": [...], "costDollars": {...}, "searchTime"}` |
+| Result | `id`, `title`, `url`, `publishedDate`, `author`, `image`, `favicon`, and `text` / `highlights` / `summary` when requested |
+| Rate limit | `/search` **10 QPS**, `/contents` 100 QPS, `/answer` 10 QPS |
+
+`publishedDate` is documented as "an estimate of the creation date, from parsing
+HTML content" — a claim about the page rather than a fact from a publisher. It
+is carried through and never treated as authoritative.
+
+`costDollars` is **the provider's own price for the call**, which no other
+provider here reports. It is recorded on the ledger row, and the budget charges
+the larger of it and StockBrain's estimate. Exa documents it as an estimate
+rather than an invoice, which is why it supplements the estimate rather than
+replacing it.
+
+### Pricing
+
+| Item | Price |
+|---|---|
+| `/search` | **$7 / 1,000 requests**, up to 10 results |
+| Each result above 10 | $1 / 1,000 results |
+| `/contents` | $1 / 1,000 pages, **per content type** |
+| AI page summaries | $1 / 1,000 pages |
+| `deep-lite` / `deep` | $12 / 1,000 |
+| `deep-reasoning` | $15 / 1,000 |
+| Free credit | **$20 on signup**, plus **$10/month** on the free tier |
+
+Two consequences:
+
+* **`contents` is Exa's `scrapeOptions`.** It is the field that quietly turns a
+  metadata call into a per-result page fetch. `EXA_FETCH_CONTENTS` exists so the
+  decision is visible and **off**, and the scheduler never sets it. Extraction
+  happens after triage, locally, and is free.
+* **`numResults` stays at 10.** Eleven results is the base price plus an overage
+  line, for a semantic query whose value is in its first few hits.
+
+## Firecrawl — what is still used
+
+<https://docs.firecrawl.dev/api-reference/endpoint/scrape>, `/billing`.
+Re-verified 2026-09-05; unchanged from Phase 9.
+
+* `POST https://api.firecrawl.dev/v2/scrape`, `Authorization: Bearer`
+* body `{"url", "formats", "onlyMainContent", "timeout"}`; `timeout` is
+  milliseconds, 1000–300000
+* response `{"success", "data": {"markdown", "metadata": {"title",
+  "description", "url", "sourceURL", "statusCode", "contentType", "language"}}}`
+  — and it carries **no `creditsUsed`**, so the reservation stands as the charge
+* `title` and `description` are documented as `string | string[]` on this
+  endpoint (unlike on search); both are collapsed to the first value
+* **1 credit per page.** `json` extraction is +4, a prompt-injection check is +4,
+  zero-data-retention is +1, PDF parsing is +1/page. None is requested.
+* **"Credits are charged whenever Firecrawl's infrastructure processes a
+  request, even if the target site returns an HTTP error status code."** A retry
+  is not a free second chance; it is a second paid call.
+
+`/v2/search` — 2 credits per 10 results, `limit` per *source* — is **removed from
+the codebase**, not disabled behind a flag. The Phase 9 analysis of that endpoint
+is preserved above; a paid primary-discovery path left in the tree is a paid path
+that gets scheduled again.
+
+## Local extraction — trafilatura
+
+`trafilatura` **2.2.0**, released **2026-07-31**, `requires-python >=3.10`,
+actively maintained (PyPI, verified 2026-09-05). Dependencies: `certifi`,
+`charset_normalizer>=3.4.9`, `courlan>=1.4.0`, `htmldate>=1.10.0`,
+`justext>=3.0.2`, `lxml>=6.1.1`, `urllib3`.
+
+Chosen over `readability-lxml` and a hand-rolled BeautifulSoup pass because it is
+the one option that is both maintained and evaluated against a public benchmark,
+and because `lxml` (6.1.3) and `charset-normalizer` (3.5.1) are already pinned in
+this image via yfinance — the marginal additions are four small pure-Python
+packages.
+
+**Its network stack is deliberately not used.** `trafilatura.fetch_url` has its
+own urllib3 downloader with its own redirect handling and no notion of SSRF. Only
+`bare_extraction` is called, on bytes StockBrain fetched itself through
+`stockbrain.extraction.ssrf`. A test asserts the module contains no call to the
+downloader.
+
+One API note found by using it: `max_tree_size` is **deprecated in 2.x and
+raises** if passed as an argument. The bound is set through `settings.cfg`
+instead.
+
+## Measured behaviour — 2026-09-05
+
+* **`https://www.sec.gov/` answers HTTP 403** to the generic extractor's honest
+  `User-Agent`. SEC EDGAR requires a contact address inside the User-Agent and
+  refuses anything else. This is exactly the `HTTP_ERROR` case the paid fallback
+  exists for, and it is asserted as a live test. SEC *filings* are unaffected:
+  they come from the SEC client, which sends the required header.
+* **`https://en.wikipedia.org/wiki/Electric_power_transmission`** extracted
+  cleanly: 570,486 bytes read, 63,086 characters of article text, title and
+  canonical URL both recovered, no script content in the output.
+
+## Cost model at the shipped defaults
+
+Computed from the verified prices above and the seeded schedule. Asserted in
+`tests/unit/test_provider_budget.py` and
+`tests/integration/test_web_discovery_scheduler.py`, so changing a default fails
+a test rather than a bill.
+
+| | Per day | Per month | At the cap |
+|---|---|---|---|
+| Brave routine searches (seeded) | 10 | ~300 | — |
+| Brave cap | 12 | **320** | **$1.60** |
+| Exa semantic searches (seeded) | 0 — the topic ships **disabled** | 0 | — |
+| Exa cap | 3 | **70** | **$0.49** |
+| Firecrawl fallback scrapes | 0 — ships **off** | 0 | — |
+| Firecrawl cap | 5 scrapes / 10 credits | 200 credits | — |
+| Local extraction | ≤60 pages | ~1,800 | **$0.00** |
+
+**Ceiling if every cap were reached every day: $2.09/month.** Free allowances
+available: $5/month (Brave) + $10/month (Exa) = **$15/month**, plus $20 of Exa
+signup credit. Expected steady-state spend at the shipped defaults, with the
+semantic topic disabled and Firecrawl off: **$0.00**.
+
+Firecrawl contributes no dollar figure because it bills credits against a monthly
+allowance rather than dollars per call; its 200-credit monthly cap sits inside a
+1,000-credit allowance. Reporting an invented per-call dollar figure for it would
+put a number nobody can check in the one table that exists to be believed.

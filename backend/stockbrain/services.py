@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import datetime as dt
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import sqlalchemy as sa
 
@@ -43,19 +44,27 @@ from stockbrain.enums import (
     NotificationStatus,
     ProviderStatus,
     ResolutionStatus,
+    WebDiscoveryKind,
+    WebDiscoveryProviderName,
 )
 from stockbrain.errors import ProviderAuthError, ProviderEntitlementError
 from stockbrain.execution.base import Trading212ExecutionProvider
 from stockbrain.execution.reconciliation import ReconciliationService
 from stockbrain.execution.service import ExecutionService
+from stockbrain.extraction.base import ContentExtractor
+from stockbrain.extraction.firecrawl import FirecrawlContentExtractor
+from stockbrain.extraction.local import LocalContentExtractor
 from stockbrain.fx.base import FxRateProvider
 from stockbrain.fx.service import FxService, build_fx_provider
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
+from stockbrain.ingestion.brave import BraveSearchClient
+from stockbrain.ingestion.exa import ExaSearchClient
 from stockbrain.ingestion.firecrawl import FirecrawlClient
-from stockbrain.ingestion.firecrawl_budget import FirecrawlBudget
+from stockbrain.ingestion.provider_budget import ProviderCallBudget
 from stockbrain.ingestion.sec_edgar import SecEdgarClient
 from stockbrain.ingestion.service import IngestionOutcome, IngestionService
-from stockbrain.ingestion.topics import seed_default_topics
+from stockbrain.ingestion.topics import seed_default_topics, seed_semantic_topic
+from stockbrain.ingestion.web_search import WebDiscoveryProvider
 from stockbrain.instruments.service import ResolutionService
 from stockbrain.intelligence.classifier import EventClassifier
 from stockbrain.intelligence.research_data import AlpacaResearchProvider, FredMacroProvider
@@ -65,7 +74,7 @@ from stockbrain.intelligence.semantic_dedupe import SemanticDeduplicator
 from stockbrain.intelligence.service import ClassificationService
 from stockbrain.intelligence.tradingagents_adapter import TradingAgentsResearchEngine
 from stockbrain.jobs.handlers import (
-    effective_topic_interval_minutes,
+    effective_query_interval_minutes,
     register_ingestion_handlers,
 )
 from stockbrain.jobs.queue import JobQueue
@@ -117,9 +126,23 @@ class ServiceContainer:
     scheduler: Scheduler | None = field(default=None, init=False)
 
     alpaca_news: AlpacaNewsClient | None = field(default=None, init=False)
-    firecrawl: FirecrawlClient | None = field(default=None, init=False)
-    firecrawl_budget: FirecrawlBudget | None = field(default=None, init=False)
     sec: SecEdgarClient | None = field(default=None, init=False)
+
+    brave: BraveSearchClient | None = field(default=None, init=False)
+    exa: ExaSearchClient | None = field(default=None, init=False)
+    firecrawl: FirecrawlClient | None = field(default=None, init=False)
+
+    budgets: dict[str, ProviderCallBudget] = field(default_factory=dict, init=False)
+    """One durable budget per metered provider, keyed by provider name.
+
+    Constructed for every known provider whether or not its client is, so the
+    GUI and the health endpoint can report yesterday's usage and today's caps
+    for a provider that is currently switched off. Constructing one does not
+    permit a call: ``enabled`` carries the configuration blockers, and a
+    disabled budget refuses every reservation."""
+
+    content_extractor: ContentExtractor | None = field(default=None, init=False)
+    firecrawl_extractor: FirecrawlContentExtractor | None = field(default=None, init=False)
 
     deepseek: DeepSeekClient | None = field(default=None, init=False)
     classification: ClassificationService | None = field(default=None, init=False)
@@ -168,7 +191,7 @@ class ServiceContainer:
                 self.settings,
                 health=self.health,
                 llm_budget=self.budget,
-                firecrawl_budget=self.firecrawl_budget,
+                budgets=self.budgets,
                 queue=self.queue,
             )
         if self.settings.proposals_enabled:
@@ -249,6 +272,92 @@ class ServiceContainer:
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
+    def _build_web_discovery(self) -> None:
+        """Construct the search providers, their budgets and the extractors.
+
+        Three rules hold here and nowhere else needs to know them:
+
+        * a provider with no key is simply not constructed, its budget reports
+          the blockers, and the rest of the application is unaffected
+        * a budget exists for every metered provider even when its client does
+          not, so a panel can show "12 searches a day, 0 used, disabled because
+          BRAVE_API_KEY is not set" rather than an empty card
+        * the paid extractor is built only when *both* its own switch and the
+          fallback switch are on, because "the credential exists" and "spend it
+          on this page" are two decisions
+        """
+        settings = self.settings
+
+        self.budgets["brave"] = ProviderCallBudget(
+            self.database,
+            provider="brave",
+            unit_label="requests",
+            # Verified 2026-09-05: $5 per 1,000 requests.
+            unit_cost_usd=Decimal("0.005"),
+            enabled=settings.brave_available,
+            blockers=tuple(settings.brave_blockers),
+            max_searches_per_day=settings.brave_max_searches_per_day,
+            max_scrapes_per_day=0,
+            daily_unit_cap=settings.brave_max_searches_per_day,
+            monthly_unit_cap=settings.brave_max_searches_per_month,
+        )
+        self.budgets["exa"] = ProviderCallBudget(
+            self.database,
+            provider="exa",
+            unit_label="requests",
+            # Verified 2026-09-05: $7 per 1,000 requests for up to 10 results.
+            unit_cost_usd=Decimal("0.007"),
+            enabled=settings.exa_available,
+            blockers=tuple(settings.exa_blockers),
+            max_searches_per_day=settings.exa_max_searches_per_day,
+            max_scrapes_per_day=0,
+            daily_unit_cap=settings.exa_max_searches_per_day,
+            monthly_unit_cap=settings.exa_max_searches_per_month,
+        )
+        self.budgets["firecrawl"] = ProviderCallBudget(
+            self.database,
+            provider="firecrawl",
+            unit_label="credits",
+            # Deliberately no dollar price: Firecrawl bills credits against a
+            # monthly allowance, and reporting an invented per-call dollar
+            # figure would be worse than reporting none.
+            unit_cost_usd=None,
+            enabled=settings.firecrawl_available,
+            blockers=tuple(settings.firecrawl_blockers),
+            max_searches_per_day=0,
+            max_scrapes_per_day=settings.firecrawl_max_scrapes_per_day,
+            daily_unit_cap=settings.firecrawl_daily_credit_cap,
+            monthly_unit_cap=settings.firecrawl_monthly_credit_cap,
+        )
+
+        if settings.brave_available:
+            self.brave = BraveSearchClient(settings)
+        if settings.exa_available:
+            self.exa = ExaSearchClient(settings)
+
+        if settings.content_extraction_available:
+            self.content_extractor = LocalContentExtractor(settings)
+        if settings.firecrawl_available:
+            self.firecrawl = FirecrawlClient(settings)
+            self.firecrawl_extractor = FirecrawlContentExtractor(self.firecrawl)
+
+    def web_discovery_provider(self, name: WebDiscoveryProviderName) -> WebDiscoveryProvider | None:
+        """The configured client for a provider name, or ``None``.
+
+        ``None`` means "this deployment cannot make that call". The caller
+        defers the query; it does **not** try a different provider. Silent
+        fan-out onto a second paid backend is the surprise-spending shape this
+        whole design exists to rule out.
+        """
+        if name is WebDiscoveryProviderName.BRAVE:
+            return self.brave
+        if name is WebDiscoveryProviderName.EXA:
+            return self.exa
+        return None
+
+    def provider_budget(self, name: str) -> ProviderCallBudget | None:
+        return self.budgets.get(name)
+
     def _build_providers(self) -> None:
         settings = self.settings
 
@@ -259,22 +368,7 @@ class ServiceContainer:
         if alpaca_configured and settings.alpaca_news_enabled:
             self.alpaca_news = AlpacaNewsClient(settings)
 
-        # The budget is constructed whether or not the client is, so the GUI and
-        # the health endpoint can report yesterday's usage and today's caps for a
-        # provider that is currently switched off. Constructing it does not
-        # permit a call; `enabled` carries the configuration blockers, and a
-        # disabled budget refuses every reservation.
-        self.firecrawl_budget = FirecrawlBudget(
-            self.database,
-            enabled=settings.firecrawl_available,
-            blockers=tuple(settings.firecrawl_blockers),
-            max_searches_per_day=settings.firecrawl_max_searches_per_day,
-            max_scrapes_per_day=settings.firecrawl_max_scrapes_per_day,
-            daily_credit_cap=settings.firecrawl_daily_credit_cap,
-            monthly_credit_cap=settings.firecrawl_monthly_credit_cap,
-        )
-        if settings.firecrawl_available:
-            self.firecrawl = FirecrawlClient(settings)
+        self._build_web_discovery()
 
         # data.sec.gov needs no key, but it does need a contact in the
         # User-Agent or it answers 403.
@@ -420,7 +514,13 @@ class ServiceContainer:
         await self.control.log_restored_state()
 
         async with self.database.transaction() as session:
-            await seed_default_topics(session)
+            inserted = await seed_default_topics(session)
+            if not inserted:
+                # A deployment upgraded from Phase 9 already has the routine
+                # topics and would never reach the seeder again, so the one
+                # genuinely new thing the provider split introduces would never
+                # appear. Added at most once, and stays deleted if deleted.
+                await seed_semantic_topic(session)
 
         self.runner = JobRunner(
             self.database,
@@ -471,7 +571,10 @@ class ServiceContainer:
         for client in (
             self.t212_orders,
             self.alpaca_news,
+            self.brave,
+            self.exa,
             self.firecrawl,
+            self.content_extractor,
             self.sec,
             self.deepseek,
             self.t212_metadata,
@@ -498,28 +601,41 @@ class ServiceContainer:
                     initial_delay_seconds=35,
                 )
             )
-        if self.firecrawl is not None:
+        if self.brave is not None:
             # The sweep ticks often and decides *nothing* about cadence: the
             # durable `next_eligible_at` column does. Ticking every five minutes
             # rather than every minute is simply five times less pointless work
             # for a provider whose cadence is measured in hours.
             scheduler.add(
                 ScheduledTask(
-                    name="firecrawl_topic_sweep",
+                    name="web_discovery_routine_sweep",
                     interval_seconds=300.0,
-                    run=self._enqueue_due_topic_searches,
+                    run=self._enqueue_due_routine_searches,
                     initial_delay_seconds=120.0,
                 )
             )
-            if self.settings.firecrawl_scrape_enabled:
-                scheduler.add(
-                    ScheduledTask(
-                        name="firecrawl_enrichment_sweep",
-                        interval_seconds=300.0,
-                        run=self._enqueue_firecrawl_enrichment,
-                        initial_delay_seconds=180.0,
-                    )
+        if self.exa is not None:
+            # A separate loop on a slower tick, and separately budgeted. One
+            # sweep serving both kinds would let a routine backlog consume the
+            # semantic allowance -- and the semantic allowance is the expensive
+            # one.
+            scheduler.add(
+                ScheduledTask(
+                    name="web_discovery_semantic_sweep",
+                    interval_seconds=900.0,
+                    run=self._enqueue_due_semantic_searches,
+                    initial_delay_seconds=240.0,
                 )
+            )
+        if self.content_extractor is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="content_extraction_sweep",
+                    interval_seconds=300.0,
+                    run=self._enqueue_content_extraction,
+                    initial_delay_seconds=180.0,
+                )
+            )
         if self.sec is not None:
             scheduler.add(
                 ScheduledTask(
@@ -665,10 +781,18 @@ class ServiceContainer:
             await self.research.sweep()
             await self.research.enqueue_event()
 
-    async def _enqueue_due_topic_searches(self) -> None:
-        """Enqueue every enabled query whose durable cooldown has elapsed.
+    async def _enqueue_due_routine_searches(self) -> None:
+        """Enqueue every enabled routine query whose durable cooldown has elapsed."""
+        await self._enqueue_due_searches(WebDiscoveryKind.ROUTINE)
 
-        Three properties this has that the Phase 2 version did not:
+    async def _enqueue_due_semantic_searches(self) -> None:
+        """The same, for semantic queries, on their own budget and cadence."""
+        await self._enqueue_due_searches(WebDiscoveryKind.SEMANTIC)
+
+    async def _enqueue_due_searches(self, kind: WebDiscoveryKind) -> None:
+        """Enqueue the due queries of one kind, bounded by that provider's budget.
+
+        Four properties this has that the Phase 2 version did not:
 
         * **Eligibility is a column, not a subtraction.**  ``next_eligible_at``
           is written by the handler after every attempt -- succeeded, failed or
@@ -681,43 +805,64 @@ class ServiceContainer:
         * **The budget is consulted before anything is enqueued.**  Queueing
           work that will refuse itself is noise; it also churns the dedupe key
           and the queue depth for no benefit.
+        * **Kinds are swept separately.**  A routine backlog cannot consume the
+          semantic allowance, and vice versa.
 
         The scheduler still only *enqueues*.  It makes no HTTP call and spends
         nothing, and the dedupe key is what stops a slow provider from
-        accumulating a backlog of identical searches.
+        accumulating a backlog of identical searches -- or two scheduler loops
+        from paying for one search twice.
         """
         if not self.settings.discovery_enabled or await self._discovery_paused():
             return
-        if self.firecrawl is None or self.firecrawl_budget is None:
+        provider_name = self.settings.provider_for_kind(kind)
+        provider = self.web_discovery_provider(provider_name)
+        budget = self.provider_budget(provider_name.value)
+        if provider is None or budget is None:
             return
 
-        budget = await self.firecrawl_budget.state()
-        if budget.search_exhausted:
-            # Not an error and not a global failure: Alpaca news and SEC EDGAR
-            # are unaffected and keep filling the pipeline.
+        state = await budget.state()
+        if state.search_exhausted:
+            # Not an error and not a global failure: Alpaca news, SEC EDGAR and
+            # the other query kind are unaffected and keep filling the pipeline.
             log.info(
-                "firecrawl_sweep_skipped",
+                "web_discovery_sweep_skipped",
+                provider=provider_name.value,
+                kind=kind.value,
                 reason="budget",
-                searches_today=budget.today.searches,
-                credits_today=budget.today.credits,
+                searches_today=state.today.searches,
+                units_today=state.today.units,
+            )
+            self.health.record(
+                ProviderName.EXA
+                if provider_name is WebDiscoveryProviderName.EXA
+                else ProviderName.BRAVE,
+                ProviderStatus.BUDGET_EXHAUSTED,
+                detail="; ".join(state.exhausted_reasons)[:300] or "budget exhausted",
             )
             return
 
         # How many searches may still be enqueued today. Bounding the enqueue by
         # the remaining budget keeps the queue from holding jobs that exist only
         # to be refused.
-        allowance = budget.searches_remaining
+        allowance = state.searches_remaining
 
         async with self.database.transaction() as session:
             rows = (
                 await session.execute(
                     sa.select(DiscoveryQuery, DiscoveryTopic)
                     .join(DiscoveryTopic, DiscoveryTopic.id == DiscoveryQuery.topic_id)
-                    .where(DiscoveryQuery.enabled.is_(True), DiscoveryTopic.enabled.is_(True))
-                    # Oldest first, so a budget that only covers part of the
-                    # backlog spends it on the queries that have waited longest
-                    # rather than on whichever row PostgreSQL returned first.
+                    .where(
+                        DiscoveryQuery.enabled.is_(True),
+                        DiscoveryTopic.enabled.is_(True),
+                        DiscoveryQuery.search_kind == kind,
+                    )
+                    # Priority first, then oldest, so a budget that only covers
+                    # part of the backlog spends it on what the operator ranked
+                    # highest and then on what has waited longest -- rather than
+                    # on whichever row PostgreSQL returned first.
                     .order_by(
+                        DiscoveryQuery.priority.asc(),
                         DiscoveryQuery.next_eligible_at.asc().nullsfirst(),
                         DiscoveryQuery.created_at.asc(),
                     )
@@ -733,7 +878,9 @@ class ServiceContainer:
                 if enqueued >= allowance:
                     break
                 interval = dt.timedelta(
-                    minutes=effective_topic_interval_minutes(topic.interval_minutes, self.settings)
+                    minutes=effective_query_interval_minutes(
+                        query.interval_minutes or topic.interval_minutes, kind, self.settings
+                    )
                 )
                 eligible_at = query.next_eligible_at
                 if eligible_at is None and query.last_run_at is not None:
@@ -747,12 +894,17 @@ class ServiceContainer:
                     continue
                 job_id = await self.queue.enqueue(
                     session,
-                    JobType.FIRECRAWL_TOPIC_SEARCH,
-                    payload={"query_id": str(query.id), "topic": topic.slug},
+                    JobType.WEB_DISCOVERY_SEARCH,
+                    payload={
+                        "query_id": str(query.id),
+                        "topic": topic.slug,
+                        "kind": kind.value,
+                        "provider": provider_name.value,
+                    },
                     # One outstanding job per query: a slow provider must not let
                     # a backlog of identical searches build up, and two workers
                     # must not pay for the same search twice.
-                    dedupe_key=f"firecrawl:{query.id}",
+                    dedupe_key=f"web-discovery:{query.id}",
                     priority=60,
                     # A paid call. One attempt only -- the queue's retry would be
                     # a second reservation for the same search, and the durable
@@ -767,27 +919,27 @@ class ServiceContainer:
                     query.next_eligible_at = now + interval
             if enqueued:
                 log.info(
-                    "firecrawl_searches_enqueued",
+                    "web_discovery_searches_enqueued",
+                    provider=provider_name.value,
+                    kind=kind.value,
                     count=enqueued,
                     searches_remaining_today=allowance - enqueued,
                 )
 
-    async def _enqueue_firecrawl_enrichment(self) -> None:
-        """Offer triaged Firecrawl sources for a paid content fetch.
+    async def _enqueue_content_extraction(self) -> None:
+        """Offer triaged sources for a content fetch.
 
-        Stage two of the two-stage model.  Bounded twice: by the batch size
-        here, and by the durable scrape budget inside the handler.
+        Bounded twice: by the free daily extraction allowance here, and by the
+        durable Firecrawl budget inside the handler if the free attempt fails
+        and the paid fallback is switched on.
         """
         if not self.settings.discovery_enabled or await self._discovery_paused():
             return
-        if self.firecrawl is None or self.firecrawl_budget is None:
+        if self.content_extractor is None:
             return
-        if not self.settings.firecrawl_scrape_enabled:
-            return
-        budget = await self.firecrawl_budget.state()
-        if budget.scrape_exhausted:
-            return
-        await self.ingestion.enqueue_content_fetches(limit=budget.scrapes_remaining)
+        await self.ingestion.enqueue_content_fetches(
+            limit=self.settings.content_extract_max_per_day
+        )
 
     async def _enqueue_sec_refresh(self) -> None:
         if not self.settings.discovery_enabled or await self._discovery_paused():
@@ -1049,7 +1201,7 @@ class ServiceContainer:
         """Consume the Alpaca news stream and ingest every article.
 
         Entitlement failures move discovery into a degraded state and stop the
-        stream; they never crash the process. Firecrawl continues to run, which
+        stream; they never crash the process. Web discovery continues to run, which
         is the documented fallback for exactly this case.
         """
         assert self.alpaca_news is not None
@@ -1077,7 +1229,7 @@ class ServiceContainer:
             log.error(
                 "alpaca_news_stream_fatal",
                 error_type=type(exc).__name__,
-                remediation="discovery continues via Firecrawl and SEC",
+                remediation="discovery continues via web search and SEC",
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.health.record(ProviderName.ALPACA_NEWS, ProviderStatus.DOWN, detail=str(exc)[:300])

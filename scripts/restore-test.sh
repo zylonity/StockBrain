@@ -76,6 +76,7 @@ for table in \
   events \
   sources \
   llm_calls \
+  provider_calls \
   firecrawl_calls \
   app_settings
 do

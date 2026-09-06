@@ -34,7 +34,7 @@ from stockbrain.enums import (
     ProposalStatus,
     ProviderStatus,
 )
-from stockbrain.ingestion.firecrawl_budget import FirecrawlBudget
+from stockbrain.ingestion.provider_budget import ProviderCallBudget
 from stockbrain.observability.alerts import AlertCondition, OperationalAlerts
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 
@@ -58,14 +58,14 @@ def _alerts(
     database: Database,
     *,
     health: ProviderHealthRegistry | None = None,
-    firecrawl: FirecrawlBudget | None = None,
+    firecrawl: ProviderCallBudget | None = None,
     **overrides: object,
 ) -> OperationalAlerts:
     return OperationalAlerts(
         database,
         _settings(database, **overrides),
         health=health or ProviderHealthRegistry(),
-        firecrawl_budget=firecrawl,
+        budgets={"firecrawl": firecrawl} if firecrawl is not None else {},
     )
 
 
@@ -177,17 +177,19 @@ async def test_a_disabled_firecrawl_budget_is_never_an_alert(
     Its budget looks exhausted the moment the caps are zero, and a message
     about it every twelve hours would be pure noise.
     """
-    budget = FirecrawlBudget(
+    budget = ProviderCallBudget(
         clean_tables,
+        provider="firecrawl",
+        unit_label="credits",
         enabled=False,
         blockers=("FIRECRAWL_ENABLED is false",),
         max_searches_per_day=0,
         max_scrapes_per_day=0,
-        daily_credit_cap=0,
-        monthly_credit_cap=0,
+        daily_unit_cap=0,
+        monthly_unit_cap=0,
     )
     scan = await _alerts(clean_tables, firecrawl=budget).scan()
-    assert AlertCondition.FIRECRAWL_BUDGET_EXHAUSTED not in scan.active
+    assert AlertCondition.DISCOVERY_BUDGET_EXHAUSTED not in scan.active
 
 
 async def test_fx_is_not_an_alert_when_no_provider_is_configured(
@@ -372,26 +374,29 @@ async def test_an_exhausted_firecrawl_budget_fires_and_says_what_still_works(
     The message says so explicitly, because the operator's first question on
     reading it is "has discovery stopped".
     """
-    from stockbrain.enums import FirecrawlCallKind
+    from stockbrain.enums import ProviderCallKind
 
-    budget = FirecrawlBudget(
+    budget = ProviderCallBudget(
         clean_tables,
+        provider="firecrawl",
+        unit_label="credits",
         enabled=True,
         max_searches_per_day=1,
         max_scrapes_per_day=1,
-        daily_credit_cap=100,
-        monthly_credit_cap=100,
+        daily_unit_cap=100,
+        monthly_unit_cap=100,
     )
-    assert await budget.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
+    assert await budget.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
 
     alerts = _alerts(
         clean_tables,
         firecrawl=budget,
         firecrawl_enabled=True,
+        firecrawl_fallback_extraction_enabled=True,
         firecrawl_api_key="fc-test",
     )
     scan = await alerts.scan()
-    assert AlertCondition.FIRECRAWL_BUDGET_EXHAUSTED in scan.active
+    assert AlertCondition.DISCOVERY_BUDGET_EXHAUSTED in scan.active
     body = (await _notifications(clean_tables))[0].body
     assert "Alpaca news and SEC EDGAR are unaffected" in body
 

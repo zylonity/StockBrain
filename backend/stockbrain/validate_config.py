@@ -55,21 +55,59 @@ def main() -> int:
     for blocker in auth_blockers:
         print(f"    - {blocker}")
 
-    print(f"  firecrawl:                {'enabled' if settings.firecrawl_available else 'off'}")
+    print(f"  routine search:           {settings.web_discovery_routine_provider.value}")
+    for blocker in settings.brave_blockers:
+        print(f"    - {blocker}")
+    if settings.brave_available:
+        # The projection, so an operator sees the spend before it happens rather
+        # than after a 429 or a surprise invoice.
+        monthly = min(
+            settings.brave_max_searches_per_month,
+            settings.brave_max_searches_per_day * 31,
+        )
+        print(
+            f"    caps: {settings.brave_max_searches_per_day} searches/day, "
+            f"{settings.brave_max_searches_per_month} searches/month "
+            f"(<= ${monthly * 0.005:.2f}/month at $5 per 1,000)"
+        )
+        print(
+            f"    cadence: no routine query faster than "
+            f"{settings.web_discovery_min_query_interval_minutes} minutes"
+        )
+
+    print(f"  semantic search:          {settings.web_discovery_semantic_provider.value}")
+    for blocker in settings.exa_blockers:
+        print(f"    - {blocker}")
+    if settings.exa_available:
+        monthly_exa = min(
+            settings.exa_max_searches_per_month,
+            settings.exa_max_searches_per_day * 31,
+        )
+        print(
+            f"    caps: {settings.exa_max_searches_per_day} searches/day, "
+            f"{settings.exa_max_searches_per_month} searches/month "
+            f"(<= ${monthly_exa * 0.007:.2f}/month at $7 per 1,000)"
+        )
+        print(
+            f"    cadence: no semantic query faster than "
+            f"{settings.web_discovery_min_semantic_interval_minutes} minutes"
+        )
+
+    print(
+        f"  local extraction:         "
+        f"{'enabled' if settings.content_extraction_available else 'off'}"
+    )
+    for blocker in settings.content_extraction_blockers:
+        print(f"    - {blocker}")
+
+    print(f"  firecrawl fallback:       {'enabled' if settings.firecrawl_available else 'off'}")
     for blocker in settings.firecrawl_blockers:
         print(f"    - {blocker}")
     if settings.firecrawl_available:
-        # The projection, so an operator sees the spend before it happens rather
-        # than after an HTTP 402.
         print(
-            f"    caps: {settings.firecrawl_max_searches_per_day} searches/day, "
-            f"{settings.firecrawl_max_scrapes_per_day} scrapes/day, "
+            f"    caps: {settings.firecrawl_max_scrapes_per_day} scrapes/day, "
             f"{settings.firecrawl_daily_credit_cap} credits/day, "
             f"{settings.firecrawl_monthly_credit_cap} credits/month"
-        )
-        print(
-            f"    cadence: no topic faster than "
-            f"{settings.firecrawl_min_topic_interval_minutes} minutes"
         )
 
     print(f"  fx provider:              {settings.fx_provider.value}")

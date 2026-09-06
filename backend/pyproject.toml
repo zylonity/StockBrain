@@ -26,6 +26,11 @@ dependencies = [
     # uvicorn[standard], but an explicit import deserves an explicit dependency.
     "websockets>=14.0,<18.0",
     "python-dateutil>=2.9,<3.0",
+    # Local article extraction. Only `bare_extraction` is called, on HTML this
+    # application fetched itself: trafilatura's own downloader knows nothing
+    # about SSRF and is never reached. lxml and charset-normalizer are already
+    # in the tree via yfinance.
+    "trafilatura>=2.2,<3",
     # Minimal runtime for the pinned upstream submodule; no upstream CLI/Redis.
     "langchain-openai>=1.1,<2",
     "langgraph>=1.0,<2",
@@ -95,6 +100,10 @@ ignore = [
 # would make the code harder to trace back to the spec than the convention is
 # worth.
 "stockbrain/errors.py" = ["N818"]
+# `SsrfRefused` is not an error in the provider sense -- nothing external
+# failed, StockBrain declined to make the request -- and `SsrfRefusedError`
+# would read as though the refusal itself had gone wrong.
+"stockbrain/extraction/ssrf.py" = ["N818"]
 # The module name is fixed by the specification's package layout. Absolute
 # imports mean it never shadows the stdlib `logging` for anything else.
 "stockbrain/logging.py" = ["A005"]
@@ -112,6 +121,7 @@ ignore = [
 "tests/integration/test_phase7_live.py" = ["T201"]
 "tests/integration/test_phase8_live.py" = ["T201"]
 "tests/integration/test_phase9_live.py" = ["T201"]
+"tests/integration/test_web_discovery_live.py" = ["T201"]
 "alembic/versions/*" = ["E501"]
 
 [tool.ruff.lint.isort]

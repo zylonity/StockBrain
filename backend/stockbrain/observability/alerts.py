@@ -48,7 +48,7 @@ from stockbrain.enums import (
     NotificationStatus,
     ProviderStatus,
 )
-from stockbrain.ingestion.firecrawl_budget import FirecrawlBudget
+from stockbrain.ingestion.provider_budget import ProviderCallBudget
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.llm.budget import BudgetGuard, BudgetStatus
 from stockbrain.logging import get_logger
@@ -82,7 +82,7 @@ class AlertCondition(StrEnum):
     BROKER_AUTH_FAILING = "BROKER_AUTH_FAILING"
     FX_UNAVAILABLE = "FX_UNAVAILABLE"
     LLM_BUDGET_EXHAUSTED = "LLM_BUDGET_EXHAUSTED"
-    FIRECRAWL_BUDGET_EXHAUSTED = "FIRECRAWL_BUDGET_EXHAUSTED"
+    DISCOVERY_BUDGET_EXHAUSTED = "DISCOVERY_BUDGET_EXHAUSTED"
 
 
 #: How long one firing of a condition suppresses the next.  Urgent conditions
@@ -100,7 +100,7 @@ _WINDOWS: dict[AlertCondition, dt.timedelta] = {
     AlertCondition.PROVIDER_DOWN: dt.timedelta(hours=6),
     AlertCondition.FX_UNAVAILABLE: dt.timedelta(hours=12),
     AlertCondition.LLM_BUDGET_EXHAUSTED: dt.timedelta(hours=12),
-    AlertCondition.FIRECRAWL_BUDGET_EXHAUSTED: dt.timedelta(hours=12),
+    AlertCondition.DISCOVERY_BUDGET_EXHAUSTED: dt.timedelta(hours=12),
 }
 
 #: Conditions that mean money may already have moved, or is about to.
@@ -114,8 +114,9 @@ _CRITICAL: frozenset[AlertCondition] = frozenset(
 )
 
 #: Providers whose absence is a genuine fault rather than a design choice.
-#: Firecrawl is absent from this set on purpose: it is *expected* to be off, and
-#: its budget has its own condition.
+#: Brave, Exa and Firecrawl are absent from this set on purpose: each is
+#: *expected* to be off in a deployment that has not configured it, and their
+#: budgets have their own condition.
 _ALERTABLE_PROVIDERS: tuple[ProviderName, ...] = (
     ProviderName.POSTGRES,
     ProviderName.TRADING212,
@@ -156,14 +157,14 @@ class OperationalAlerts:
         *,
         health: ProviderHealthRegistry,
         llm_budget: BudgetGuard | None = None,
-        firecrawl_budget: FirecrawlBudget | None = None,
+        budgets: dict[str, ProviderCallBudget] | None = None,
         queue: JobQueue | None = None,
     ) -> None:
         self._database = database
         self._settings = settings
         self._health = health
         self._llm_budget = llm_budget
-        self._firecrawl_budget = firecrawl_budget
+        self._budgets = dict(budgets or {})
         self._queue = queue or JobQueue()
 
     async def scan(self, *, now: dt.datetime | None = None) -> AlertScan:
@@ -361,16 +362,26 @@ class OperationalAlerts:
                     f"{state.reason}. Ingestion, deterministic processing and broker "
                     f"reconciliation continue; new model work does not."
                 )
-        if self._firecrawl_budget is not None and self._settings.firecrawl_available:
-            # Only when Firecrawl is actually switched on. A disabled provider
-            # reporting "budget exhausted" every twelve hours is exactly the
-            # noise that teaches an operator to stop reading the channel.
-            state_fc = await self._firecrawl_budget.state()
-            if state_fc.exhausted:
-                conditions[AlertCondition.FIRECRAWL_BUDGET_EXHAUSTED] = (
-                    "; ".join(state_fc.exhausted_reasons)
-                    + ". Alpaca news and SEC EDGAR are unaffected."
+        exhausted: list[str] = []
+        for budget in self._budgets.values():
+            # Only for providers that are actually switched on. A disabled
+            # provider reporting "budget exhausted" every twelve hours is
+            # exactly the noise that teaches an operator to stop reading the
+            # channel.
+            if not budget.enabled:
+                continue
+            state_provider = await budget.state()
+            if state_provider.exhausted:
+                exhausted.append(
+                    f"{budget.provider}: " + "; ".join(state_provider.exhausted_reasons)
                 )
+        if exhausted:
+            # One condition covering every metered discovery provider rather
+            # than one per provider: an operator whose Brave and Exa allowances
+            # both ran out has one thing to look at, not two messages.
+            conditions[AlertCondition.DISCOVERY_BUDGET_EXHAUSTED] = (
+                "; ".join(exhausted) + ". Alpaca news and SEC EDGAR are unaffected."
+            )
         return conditions
 
     async def _fx_conditions(self) -> dict[AlertCondition, str]:

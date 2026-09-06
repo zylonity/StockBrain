@@ -219,6 +219,9 @@ main {
 }
 
 .status-HEALTHY { color: var(--ok); }
+/* A spending limit doing its job, not a fault. Warn-coloured because it
+   does stop work, but named distinctly so it is never read as an outage. */
+.status-BUDGET_EXHAUSTED { color: var(--warn); }
 .status-DEGRADED { color: var(--warn); }
 .status-DOWN { color: var(--bad); }
 .status-DISABLED { color: var(--off); }

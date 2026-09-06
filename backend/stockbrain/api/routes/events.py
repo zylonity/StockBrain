@@ -157,6 +157,12 @@ def _to_source(source: Source, relationship: str | None) -> SourceResponse:
         relationship=relationship,
         excerpt=excerpt,
         symbols=symbols,
+        # Falls back to the row's own provider for anything ingested before the
+        # column existed, so the panel never shows a blank where a provider is
+        # perfectly well known.
+        discovered_by=list(source.discovered_by or [source.provider.value]),
+        extraction_method=source.extraction_method,
+        content_fetched_at=source.content_fetched_at,
     )
 
 

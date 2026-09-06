@@ -1,8 +1,8 @@
 """Raw source documents and the canonical events derived from them.
 
 A *source* is one retrieved artefact: an Alpaca news article, an SEC filing, a
-Firecrawl search result.  Sources are immutable evidence and are kept verbatim
-for audit.
+Brave or Exa search result.  Sources are immutable evidence and are kept
+verbatim for audit.
 
 An *event* is the deduplicated real-world occurrence that one or more sources
 describe.  Research runs are attached to events, not to articles, so a story
@@ -69,11 +69,34 @@ class Source(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """When full article content was fetched from the origin, if it ever was.
 
     ``NULL`` means the row holds only what the discovery provider handed over --
-    for a Firecrawl search that is a title, a URL, a snippet and a date, which
-    is enough for deduplication and for the cheap classifier to triage but not
-    the article. Fetching the body is a separate, separately budgeted act, so
-    "do we have the body" has to be a fact on the row rather than a guess from
-    the length of ``raw_content``."""
+    for a web search that is a title, a URL, a snippet and a date, which is
+    enough for deduplication and for the cheap classifier to triage but not the
+    article. Fetching the body is a separate act, so "do we have the body" has
+    to be a fact on the row rather than a guess from the length of
+    ``raw_content``.
+
+    Set even when the attempt produced nothing, because the point of the column
+    is to stop the attempt happening twice -- and the second attempt is the one
+    that might cost money."""
+
+    extraction_method: Mapped[str | None] = mapped_column(sa.Text)
+    """How the body was obtained: ``PROVIDER``, ``LOCAL``, ``FIRECRAWL`` or
+    ``NONE`` (see :class:`~stockbrain.enums.ExtractionMethod`).
+
+    Recorded because "did reading this page cost money" must be answerable after
+    the fact, and because a URL that local extraction already handled must never
+    be offered to the paid fallback."""
+
+    discovered_by: Mapped[list[str]] = mapped_column(
+        pg.JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    """Every provider that surfaced this exact artefact, in the order they did.
+
+    ``provider`` records who found it *first* and owns the row's identity;
+    this records that Exa independently surfaced a page Brave had already
+    ingested.  Two providers finding one page is corroboration and is worth
+    keeping -- but it is emphatically not two events, so the value is appended
+    here rather than expressed as a second source row."""
 
     provider_metadata: Mapped[JSONDict] = mapped_column(
         "metadata", nullable=False, server_default=sa.text("'{}'::jsonb")
@@ -101,7 +124,7 @@ class Source(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         sa.Index("ix_sources_content_hash", "content_hash"),
         sa.Index("ix_sources_received_at", "received_at"),
         sa.Index("ix_sources_published_at", "published_at"),
-        # The enrichment sweep asks one question -- "which Firecrawl rows still
+        # The extraction sweep asks one question -- "which discovered rows still
         # have no body?" -- and it asks it on a schedule, so the partial index
         # keeps that from becoming a scan of every source ever ingested.
         sa.Index(

@@ -10,10 +10,15 @@ A modular monolith and PostgreSQL. Two containers.
 
 ```
 Alpaca news WS ─┐
-SEC EDGAR ──────┼─→ ingestion ─→ dedupe ─→ canonical event
-Firecrawl ──────┘                              │
+SEC EDGAR ──────┤
+Brave (routine) ┼─→ ingestion ─→ dedupe ─→ canonical event
+Exa (semantic) ─┘                              │
                                                ▼
                                     DeepSeek V4 Flash classifier
+                                               │
+                                    shortlisted URLs only
+                                               │
+                              local extraction ─→ Firecrawl fallback
                                                │
                                      instrument resolution
                                                │
@@ -67,7 +72,14 @@ stockbrain/
   services.py        runtime container; owns workers, scheduler, news stream
 
   ingestion/         providers, normalisation, dedupe, the ingest entry point
-  ingestion/firecrawl_budget.py  durable Firecrawl call/credit ledger
+  ingestion/web_search.py        canonical search DTOs + the provider protocol
+  ingestion/brave.py             routine thematic web/news search
+  ingestion/exa.py               semantic second-order search
+  ingestion/provider_budget.py   durable per-provider call/spend ledger
+  extraction/        page fetching, kept separate from discovery
+  extraction/ssrf.py             the only outbound path to an address a stranger chose
+  extraction/local.py            free article extraction (trafilatura)
+  extraction/firecrawl.py        the paid fallback, and nothing else
   jobs/              PostgreSQL queue, worker pool, scheduler, handlers
 
   llm/               provider interface, DeepSeek client, pricing, budget, telemetry
@@ -223,8 +235,11 @@ race; a unique index is not. The same pattern protects job scheduling via
 ### Why retries are opt-in per request
 
 `ProviderHttpClient.request_json` defaults `retry_safe=False`. A GET opts in
-because it has no side effect; Firecrawl's search opts in explicitly because its
-only side effect is credit consumption. Nothing else does. There is deliberately
+because it has no side effect — and Brave's search is a GET that opts in
+*because Brave documents that only successful requests are billed*, which makes
+a bounded retry there genuinely free. Exa and Firecrawl publish no such
+guarantee, so neither retries: on those a retry is not a second chance, it is a
+second charge. Nothing else does. There is deliberately
 no middleware that could decide on its own to repeat a request — that is the
 mechanism which, applied to a Trading 212 order POST, creates a duplicate order.
 
@@ -1497,3 +1512,203 @@ looks like coverage.
 * **No live Firecrawl call during the investigation.** The reconstruction is
   from `firecrawl_activity_logs.csv`, the job history, the `sources` table and
   the committed Phase 2 code.
+
+## Multi-provider web discovery
+
+Firecrawl stops being the primary discovery provider. Brave answers routine
+thematic search, Exa answers semantic second-order search, and Firecrawl keeps
+one job: a paid page fetch when free local extraction cannot read a page.
+
+The verified provider facts, prices and the resulting cost model are in
+`docs/sources.md` → "Provider split". What follows is why the code is shaped the
+way it is.
+
+### The vendor's response shape had leaked
+
+Through Phase 9, `sources` was a Firecrawl concept, `tbs` was a Firecrawl token,
+`DiscoveryQuerySpec.scrape_content` was a Firecrawl feature and the job type was
+named after the company. Replacing the vendor therefore meant touching the
+scheduler, the registry, the handlers, the configuration and the GUI.
+
+`ingestion/web_search.py` is the fix. Everything downstream of a search —
+deduplication, the deterministic filters, the DeepSeek triage, the event flow —
+sees a `WebSearchResult` and nothing else. A provider adapter's only job is to
+turn its own JSON into those fields and keep the original payload alongside for
+audit. Adding a fourth backend needs an adapter and a config value; it needs no
+migration, no job type and no change to any consumer.
+
+`freshness_days` is the small example that makes the point. Firecrawl spells a
+recency window `qdr:d`, Brave spells it `pd`, Exa spells it an ISO instant.
+Storing one of the three in the database made the column unusable by the other
+two, so the column is now a number of days and each adapter translates.
+
+### Two kinds of query, because they are two different questions
+
+Brave answers "what was published about grid transformers this week". Exa
+answers "which public companies benefit from a transformer shortage caused by
+datacentre expansion". A keyword index answers the second badly; an embedding
+index answers it well, at 1.4× the price per call for an answer that moves over
+weeks rather than hours.
+
+`discovery_queries.search_kind` is `ROUTINE` or `SEMANTIC`, and the kind decides
+three things at once: which provider answers it, which sweep enqueues it, and
+which cadence floor applies (6 hours routine, 24 hours semantic). Running the
+expensive one on the cheap one's cadence is the single most expensive
+misconfiguration available here, and making the kind a property of the row is
+what stops it.
+
+Duplicating routine queries into the semantic provider would double the bill to
+rediscover the same articles, so they are separate lists on separate schedules
+rather than one list run through both backends.
+
+### There is no automatic fallback between paid providers
+
+This is the design's sharpest edge, and it is deliberate.
+
+If Brave is unconfigured, exhausted or down, routine queries **defer**. They are
+not re-run on Exa. A query pinned to a provider this deployment does not
+recognise resolves to `none` and does not run — it is not silently rehomed onto
+the configured default, because that would let a typo redirect a query onto a
+backend it was deliberately kept off.
+
+The pattern being refused is: *Brave fails → Exa is called → Firecrawl scrapes →
+retries*. Each link looks like resilience and the chain is a cost multiplier
+triggered by an outage — the moment a budget is least able to absorb it. Falling
+back across paid providers is a decision an operator makes by configuring a
+provider pin, never one the software makes at 3am.
+
+### The budget is one ledger with per-provider accounting
+
+`firecrawl_calls` became `provider_calls`: the same reserve-before-you-spend
+table, generalised. Phase 9's argument for it is unchanged and is above
+("The durable-ledger pattern, generalised"). What is new is that each provider
+gets its own caps, its own window sums and its own advisory-lock key — Brave
+hitting its ceiling must not serialise behind Firecrawl and must not stop Exa.
+
+The column is `units_charged`, not `credits_charged`, because a unit means
+something different per provider: a Firecrawl credit, a Brave request, an Exa
+request. They are never added together, and the label travels with the number so
+a panel cannot imply otherwise. `cost_usd_charged` exists alongside for the
+providers that publish a per-call price; it stays NULL for Firecrawl, which bills
+credits against a monthly allowance. Reporting an invented dollar figure there
+would put a number nobody can check in the one table that exists to be believed.
+
+A **monthly** cap matters more than it did. Brave's free credit is monthly, and
+12 searches a day for 31 days is 372 — past a 320 ceiling. A daily cap alone
+cannot protect a monthly allowance, which is why both exist and why the config
+validator refuses a monthly cap below the daily one.
+
+Two reconciliation rules are worth naming:
+
+* **The charge is the provider's own number where it gives one, floored at one
+  unit.** A search that returned three results where the limit allowed thirty
+  cost less, and honouring that keeps the ledger reconcilable against the
+  invoice. A provider that billed *more* than the model predicted is believed
+  outright: an estimate that is too low is the one failure a cost control cannot
+  tolerate.
+* **A failure is charged unless the provider says otherwise in writing.** Brave
+  documents that only successful requests are billed, so a classified Brave
+  provider error is refunded. A *transport* failure is not refunded even on
+  Brave, because a timeout is precisely the case where nobody knows whether the
+  far side served the request.
+
+### Search and extraction are two capabilities
+
+Firecrawl offered both behind one credential and one credit balance, and the
+consequence was that turning on discovery turned on page fetching — at one
+credit per result, for pages nothing had yet judged worth reading.
+
+`stockbrain/extraction/` is the split. An extractor is given a URL and returns
+text or an explained failure. It is never given a document, an event or a
+classification: what to read is the caller's decision and the caller's budget.
+
+The order is unchanged from Phase 9 and is the whole cheap-first pipeline:
+
+```
+search metadata → canonical URL → deterministic dedupe → DeepSeek triage
+                                                              │
+                                          only a promoted event's sources
+                                                              │
+                                      local extraction (free, trafilatura)
+                                                              │
+                                    Firecrawl fallback, if and only if:
+                                      · the local failure is one a different
+                                        fetcher could plausibly fix
+                                      · both switches are on
+                                      · the budget grants a reservation
+                                      · this URL has not been tried
+```
+
+`ExtractionFailure.fallback_eligible` is where the third of those lives, and it
+is deliberately restrictive. An HTTP error, a transport failure and a 200 with
+almost no text are eligible — a rendering scraper plausibly does better. A
+refused URL and an unsupported content type are **not**: a second fetcher gets
+the same answer, and spending on a failure the fallback will reproduce is how a
+fallback becomes a cost storm.
+
+"At most one paid attempt per URL" is made true rather than aspirational by
+writing `sources.content_fetched_at` **even when the attempt produced nothing**.
+A redelivered job, a duplicate enqueue or an operator re-running the sweep finds
+the marker and does not buy the page again.
+
+### The extractor is the one component a stranger can point at an address
+
+Every other outbound request in StockBrain goes to a hostname the operator
+configured. This one goes wherever a search result says. An attacker who can
+rank a page can choose an address this process will connect to — and inside this
+deployment's compose network, that address could be `postgres:5432`.
+
+`extraction/ssrf.py` allows exactly one thing: an `http`/`https` request to a
+publicly routable address. Three properties carry the weight:
+
+* **The check is on the resolved address, not the hostname.** Blocking the
+  string `localhost` blocks nothing, because an attacker controls their own DNS.
+  Every address a name resolves to must pass, not just the first — a name with
+  one public A record and one private one would otherwise connect to whichever
+  the socket layer preferred.
+* **Redirects are re-checked, one hop at a time.** A public URL that 302s to
+  `169.254.169.254` is the canonical bypass, so `follow_redirects` is off and
+  the full check runs on every hop.
+* **Refusals name the reason and never the credential.** A URL carrying userinfo
+  is refused outright, and every URL is redacted before it reaches a log line.
+
+There is no allowlist override and no "internal fetch" mode. A setting that
+turns this off is a setting that will eventually be on.
+
+The rest of the fetch is the same posture: no JavaScript, no browser, no
+subprocess; the body is read incrementally and abandoned the moment it passes
+the size limit; only HTML-ish content types are read; and `trafilatura`'s own
+urllib3 downloader — which knows nothing about any of this — is never called.
+Only `bare_extraction` is, on bytes this process fetched itself.
+
+### Provenance is preserved, not tidied
+
+Rows discovered by the old Firecrawl search are still in the table with
+`provider = 'FIRECRAWL'`. They are valid evidence and they are not rewritten:
+claiming Brave found them would falsify the record to make the new architecture
+look neater.
+
+Going forward, when Exa surfaces a page Brave already ingested, the dedupe layer
+catches it on the canonical URL and appends `EXA` to `sources.discovered_by`.
+One source, one event, one classification, one research run — and a record that
+two independent providers found it, which is corroboration worth having. The
+`provider` column still names who found it *first*, because that is what the
+uniqueness constraint is built on.
+
+### What this deliberately did not do
+
+* **No cross-provider fan-out on failure**, as above. The fallback that exists —
+  local extraction to Firecrawl — is bounded, one attempt, and gated by two
+  switches and a durable budget.
+* **No `contents` on a scheduled Exa search**, and no `scrapeOptions` anywhere.
+  Both are the same trap under two names, and the second one already cost this
+  system an allowance.
+* **No second classifier.** The DeepSeek triage reads search metadata from every
+  provider through the same canonical DTO; it was not taught which backend found
+  a result, because that is not information about the event.
+* **No live Firecrawl call**, at any point in this work. The fallback is verified
+  against mocks, and a test asserts that no live test calls it.
+* **No new provider status semantics beyond one.** `BUDGET_EXHAUSTED` was added
+  because "the provider is out of allowance" and "the provider is broken" need
+  different actions from an operator, and Phase 9 reported the first as the
+  second.

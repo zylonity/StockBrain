@@ -29,6 +29,7 @@ __all__ = [
     "ExecutionFailure",
     "ExecutionOutcome",
     "ExecutionPolicy",
+    "ExtractionMethod",
     "ImpactDirection",
     "InstrumentSupport",
     "JobStatus",
@@ -41,6 +42,8 @@ __all__ = [
     "OrderType",
     "PriceSource",
     "ProposalStatus",
+    "ProviderCallKind",
+    "ProviderCallOutcome",
     "ProviderStatus",
     "ReactionStatus",
     "ReconciliationResult",
@@ -54,11 +57,23 @@ __all__ = [
     "SpreadStatus",
     "ThesisAction",
     "TimeHorizon",
+    "WebDiscoveryKind",
+    "WebDiscoveryProviderName",
 ]
 
 
 class SourceProvider(StrEnum):
+    """Which discovery provider produced a source row.
+
+    ``FIRECRAWL`` is retained because rows discovered by the Phase 2-9 Firecrawl
+    search still exist and are still valid evidence.  Firecrawl is no longer a
+    discovery provider -- it is a fallback *extractor* -- but rewriting those
+    rows to claim Brave or Exa found them would be falsifying provenance.
+    """
+
     ALPACA = "ALPACA"
+    BRAVE = "BRAVE"
+    EXA = "EXA"
     FIRECRAWL = "FIRECRAWL"
     SEC = "SEC"
     MANUAL = "MANUAL"
@@ -418,7 +433,17 @@ class ActorType(StrEnum):
 
 
 class ProviderStatus(StrEnum):
+    """How a single external dependency is currently behaving.
+
+    ``BUDGET_EXHAUSTED`` is separate from ``DEGRADED`` on purpose.  Both mean
+    "this provider is not doing work right now", but the operator's next action
+    differs completely: a degraded provider is a fault to investigate, an
+    exhausted one is a spending limit doing exactly its job.  Phase 9 reported
+    the second as the first, and no panel could tell them apart.
+    """
+
     HEALTHY = "HEALTHY"
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     DEGRADED = "DEGRADED"
     DOWN = "DOWN"
     DISABLED = "DISABLED"
@@ -447,27 +472,44 @@ class JobType(StrEnum):
     REASSESS_POSITION = "REASSESS_POSITION"
     SEND_NOTIFICATION = "SEND_NOTIFICATION"
     BROKER_RECONCILE = "BROKER_RECONCILE"
-    FIRECRAWL_TOPIC_SEARCH = "FIRECRAWL_TOPIC_SEARCH"
-    FIRECRAWL_ENRICH = "FIRECRAWL_ENRICH"
+    WEB_DISCOVERY_SEARCH = "WEB_DISCOVERY_SEARCH"
+    """One stored discovery query, run against whichever provider it names.
+
+    Replaces ``FIRECRAWL_TOPIC_SEARCH``.  The provider is payload and
+    configuration, not job identity, so adding a fourth search backend never
+    needs a fourth job type -- and the scheduler protections that stop a paid
+    call being made twice are written once.
+    """
+
+    CONTENT_EXTRACT = "CONTENT_EXTRACT"
+    """Fetch and extract the body of one already-triaged source.
+
+    Replaces ``FIRECRAWL_ENRICH``.  Local extraction first; the paid Firecrawl
+    scrape is a fallback inside this handler, not a job type of its own, because
+    "which extractor ran" is an outcome rather than a plan.
+    """
+
     SEC_REFRESH = "SEC_REFRESH"
     INSTRUMENT_REFRESH = "INSTRUMENT_REFRESH"
     EXPIRE_PROPOSALS = "EXPIRE_PROPOSALS"
     PROVIDER_HEALTH_CHECK = "PROVIDER_HEALTH_CHECK"
 
 
-class FirecrawlCallKind(StrEnum):
-    """Which paid Firecrawl operation a ledger row accounts for.
+class ProviderCallKind(StrEnum):
+    """Which paid operation a ledger row accounts for.
 
-    Two kinds, because they bill differently: a search is 2 credits per 10
-    results and a scrape is 1 credit per page.
+    Two kinds, because they bill differently and are capped separately: a
+    *search* returns metadata for many results, a *scrape* fetches one page.
+    Every metered provider maps onto one of the two -- Brave and Exa only ever
+    SEARCH, Firecrawl now only ever SCRAPE.
     """
 
     SEARCH = "SEARCH"
     SCRAPE = "SCRAPE"
 
 
-class FirecrawlCallOutcome(StrEnum):
-    """How a Firecrawl ledger row ended.
+class ProviderCallOutcome(StrEnum):
+    """How a paid-call ledger row ended.
 
     ``RESERVED`` is written and committed *before* the HTTP request, exactly as
     ``execution_attempts.sent_to_broker`` is, so a process that dies mid-call
@@ -479,6 +521,58 @@ class FirecrawlCallOutcome(StrEnum):
     RESERVED = "RESERVED"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+
+
+class WebDiscoveryKind(StrEnum):
+    """What a stored discovery query is *for*, which decides who runs it.
+
+    ``ROUTINE`` is a conventional recent-news/thematic search: keyword-shaped,
+    frequent, cheap, and answered well by a classical index.  ``SEMANTIC`` is
+    second-order discovery -- "who benefits from a transformer shortage" -- which
+    a keyword index answers badly and an embedding index answers well, at
+    roughly ten times the price per call.
+
+    Keeping them as distinct kinds rather than one query list with a provider
+    column is what stops the expensive one being run on the cheap one's cadence.
+    """
+
+    ROUTINE = "ROUTINE"
+    SEMANTIC = "SEMANTIC"
+
+
+class WebDiscoveryProviderName(StrEnum):
+    """Search backends StockBrain knows how to talk to.
+
+    ``NONE`` is a real, safe setting: the kind it is configured for simply does
+    not run, and every other kind carries on.
+    """
+
+    NONE = "none"
+    BRAVE = "brave"
+    EXA = "exa"
+
+
+class ExtractionMethod(StrEnum):
+    """How a source's body was obtained.
+
+    Recorded on the row because "did this cost money" must be answerable after
+    the fact, and because a page that local extraction handled must never be
+    offered to a paid extractor a second time.
+    """
+
+    PROVIDER = "PROVIDER"
+    """The discovery provider delivered the body itself (Alpaca, SEC)."""
+
+    LOCAL = "LOCAL"
+    """Fetched over plain HTTP and extracted locally.  Free."""
+
+    FIRECRAWL = "FIRECRAWL"
+    """Paid fallback, used only after local extraction failed on a shortlisted
+    URL."""
+
+    NONE = "NONE"
+    """Extraction was attempted and produced nothing usable.  Recorded so the
+    attempt is not repeated."""
 
 
 class NotificationClass(StrEnum):

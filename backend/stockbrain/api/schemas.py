@@ -324,6 +324,15 @@ class SourceResponse(ApiModel):
     excerpt: str | None = None
     symbols: list[str] = Field(default_factory=list)
 
+    discovered_by: list[str] = Field(default_factory=list)
+    """Every provider that surfaced this artefact, first one first.  Two
+    providers finding one page is corroboration, and the panel shows it."""
+
+    extraction_method: str | None = None
+    """How the body was obtained, or ``None`` while only a snippet is held."""
+
+    content_fetched_at: dt.datetime | None = None
+
 
 class EventSummaryResponse(ApiModel):
     """Scores are ranking features used to prioritise analysis.
@@ -631,13 +640,15 @@ class LlmBudgetResponse(ApiModel):
 class DiscoveryQueryResponse(ApiModel):
     id: uuid.UUID
     query: str
+    kind: str
+    provider: str
     enabled: bool
     last_run_at: dt.datetime | None
     last_success_at: dt.datetime | None
     last_error: str | None
     consecutive_failures: int
     results_seen: int
-    credits_used: int
+    units_used: int
 
 
 class DiscoveryTopicResponse(ApiModel):
@@ -648,7 +659,7 @@ class DiscoveryTopicResponse(ApiModel):
     enabled: bool
     interval_minutes: int
     result_limit: int
-    freshness: str
+    freshness_days: int
     last_run_at: dt.datetime | None
     queries: list[DiscoveryQueryResponse]
 
@@ -663,16 +674,21 @@ class IngestionStatsResponse(ApiModel):
     latest_source_at: dt.datetime | None
 
 
-class FirecrawlUsageResponse(ApiModel):
+class ProviderUsageResponse(ApiModel):
+    """One provider's usage inside one window."""
+
     searches: int
     scrapes: int
-    estimated_credits: int
-    provider_reported_credits: int
+    estimated_units: int
+    provider_reported_units: int
+    results_returned: int
     pages_scraped: int
+    estimated_cost_usd: str
+    """A decimal string, not a float: a price is exact or it is not reported."""
 
 
-class FirecrawlBudgetResponse(ApiModel):
-    """Firecrawl's cadence and spend, with no key and no secret in it.
+class ProviderBudgetResponse(ApiModel):
+    """One metered provider's cadence and spend, with no key and no secret in it.
 
     Every field here exists because Phase 2 had none of them: the only visible
     signal that 21 searches an hour were emptying a credit allowance was a
@@ -680,49 +696,92 @@ class FirecrawlBudgetResponse(ApiModel):
     later.
     """
 
+    provider: str
+    unit_label: str
+    """What one unit is for this provider -- ``requests`` or ``credits``. Units
+    are never comparable across providers, so the label travels with them."""
+
     enabled: bool
+    status: str
     blockers: list[str]
     exhausted: bool
     exhausted_reasons: list[str]
     search_exhausted: bool
     scrape_exhausted: bool
-    today: FirecrawlUsageResponse
-    month: FirecrawlUsageResponse
+    today: ProviderUsageResponse
+    month: ProviderUsageResponse
     max_searches_per_day: int
     max_scrapes_per_day: int
-    daily_credit_cap: int
-    monthly_credit_cap: int
+    daily_unit_cap: int
+    monthly_unit_cap: int
     searches_remaining_today: int
     scrapes_remaining_today: int
-    daily_credits_remaining: int
-    monthly_credits_remaining: int
-    min_topic_interval_minutes: int
-    search_result_limit: int
-    search_sources: list[str]
-    scrape_enabled: bool
+    daily_units_remaining: int
+    monthly_units_remaining: int
     day_start: dt.datetime
     month_start: dt.datetime
-    last_successful_call_at: dt.datetime | None = None
     last_call_at: dt.datetime | None = None
+    last_successful_call_at: dt.datetime | None = None
+    last_error: str | None = None
     recent_results_returned: int | None = None
-    per_topic: list[FirecrawlTopicUsageResponse] = Field(default_factory=list)
 
 
-class FirecrawlTopicUsageResponse(ApiModel):
+class DiscoveryQueryUsageResponse(ApiModel):
     """One query's cadence, so "why has this not run" has an answer."""
 
     topic: str
     query: str
+    kind: str
+    provider: str
     enabled: bool
     last_run_at: dt.datetime | None
     last_success_at: dt.datetime | None
     next_eligible_at: dt.datetime | None
     effective_interval_minutes: int
+    result_limit: int
+    priority: int
     consecutive_failures: int
     searches_performed: int
     results_seen: int
-    credits_used: int
+    units_used: int
     last_error: str | None
+
+
+class ContentExtractionStatusResponse(ApiModel):
+    """How pages are being read, and how often that costs anything."""
+
+    enabled: bool
+    blockers: list[str]
+    extractor: str
+    """The library and strategy in use, named so the panel is not a black box."""
+
+    max_per_day: int
+    fetched_today: int
+    by_method_today: dict[str, int]
+    """``LOCAL`` / ``FIRECRAWL`` / ``NONE`` counts for the current UTC day. The
+    only one of these that costs money is ``FIRECRAWL``."""
+
+    local_failures_today: int
+    firecrawl_fallbacks_today: int
+    fallback_enabled: bool
+
+
+class WebDiscoveryStatusResponse(ApiModel):
+    """The provider split, made legible in one object.
+
+    Answers the four questions an operator actually has: who is doing routine
+    search, who is doing semantic search, how much of each allowance is left,
+    and why a given query has not run.
+    """
+
+    enabled: bool
+    routine_provider: str
+    semantic_provider: str
+    routine_min_interval_minutes: int
+    semantic_min_interval_minutes: int
+    providers: list[ProviderBudgetResponse] = Field(default_factory=list)
+    queries: list[DiscoveryQueryUsageResponse] = Field(default_factory=list)
+    extraction: ContentExtractionStatusResponse | None = None
 
 
 class FxStatusResponse(ApiModel):
@@ -806,5 +865,5 @@ class DiscoveryStatusResponse(ApiModel):
     scheduled_tasks: list[dict[str, object]]
     stats: IngestionStatsResponse
     budget: LlmBudgetResponse | None = None
-    firecrawl: FirecrawlBudgetResponse | None = None
+    web_discovery: WebDiscoveryStatusResponse | None = None
     queue: JobQueueHealthResponse | None = None

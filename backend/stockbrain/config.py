@@ -34,7 +34,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from stockbrain.enums import ExecutionPolicy
+from stockbrain.enums import ExecutionPolicy, WebDiscoveryKind, WebDiscoveryProviderName
 
 __all__ = [
     "AppEnv",
@@ -44,6 +44,7 @@ __all__ = [
     "FxProviderName",
     "LogFormat",
     "Settings",
+    "WebDiscoveryProviderName",
     "get_settings",
 ]
 
@@ -229,94 +230,227 @@ class Settings(BaseSettings):
     """Liquid US equity used for the one-request startup entitlement probe."""
 
     # ------------------------------------------------------------------
-    # Firecrawl
+    # Web discovery
     #
-    # Firecrawl is **broad thematic discovery**, not the fast-news path: Alpaca
-    # news and SEC EDGAR handle time-critical financial discovery, and both are
-    # unmetered by comparison. Every value below exists because Phase 2's
-    # cadence emptied a credit allowance in about an hour (see
-    # ``docs/sources.md`` and ``docs/operations.md``): 9 enabled queries on
-    # 20/30-minute intervals is 21 searches an hour, and each one scraped every
-    # result page at 1 credit apiece.
+    # Broad thematic and second-order discovery, **not** the fast-news path:
+    # Alpaca news and SEC EDGAR handle time-critical financial discovery and
+    # both are unmetered by comparison. Two providers, two purposes, two
+    # schedules:
+    #
+    #   ROUTINE  -> Brave    conventional recent-news/thematic search
+    #   SEMANTIC -> Exa      second-order and indirect-exposure search
+    #
+    # There is deliberately **no automatic fallback between them**. If Brave is
+    # unavailable, routine queries defer; they are not silently re-run on a
+    # provider that costs ten times as much. Cross-provider fan-out is how a
+    # cost control becomes a cost multiplier.
+    #
+    # Every value below exists because Phase 2's cadence emptied a credit
+    # allowance in about an hour (``docs/sources.md``, ``docs/operations.md``):
+    # 9 enabled queries on 20/30-minute intervals is 21 searches an hour, and
+    # each one scraped every result page.
+    # ------------------------------------------------------------------
+    web_discovery_enabled: bool = True
+    """Master switch for both search providers.
+
+    Off leaves discovery running on Alpaca news and SEC EDGAR alone, which is a
+    complete and unmetered pipeline."""
+
+    web_discovery_routine_provider: WebDiscoveryProviderName = WebDiscoveryProviderName.BRAVE
+    web_discovery_semantic_provider: WebDiscoveryProviderName = WebDiscoveryProviderName.EXA
+    """Which backend answers each query kind. ``none`` is a real setting: that
+    kind simply does not run and the other one is unaffected."""
+
+    web_discovery_min_query_interval_minutes: int = Field(default=360, ge=15, le=20160)
+    """Floor on any routine query's cadence, in minutes.
+
+    A topic row may ask for a *slower* cadence than this but never a faster one.
+    Six hours by default: thematic drift is measured in days, and anything
+    faster is work Alpaca news already does for free. Raising the floor is safe;
+    lowering it is what caused the incident."""
+
+    web_discovery_min_semantic_interval_minutes: int = Field(default=1440, ge=60, le=40320)
+    """The same floor for semantic queries, and deliberately much higher.
+
+    A semantic search costs roughly ten times a routine one and answers a
+    question -- "who benefits from this constraint" -- whose answer changes over
+    weeks, not hours."""
+
+    web_discovery_failure_cooldown_minutes: int = Field(default=120, ge=1, le=20160)
+    """How long a query waits after a *failure* before it is eligible again.
+
+    Separate from the success interval: a query that is failing must not be
+    retried on the ordinary cadence, because on a metered endpoint a retry is a
+    second charge rather than a second chance."""
+
+    web_discovery_freshness_days: int = Field(default=7, ge=1, le=3650)
+    """Default recency window for a seeded topic, in days. Provider-neutral;
+    each adapter translates it into its own vocabulary."""
+
+    # ------------------------------------------------------------------
+    # Brave Search  (routine web/news discovery)
+    #
+    # Verified 2026-09-05: $5 per 1,000 requests with $5 of monthly credit
+    # applied automatically -- roughly 1,000 requests a month at no cost. The
+    # caps below are an order of magnitude under that on purpose.
+    # ------------------------------------------------------------------
+    brave_api_key: SecretStr = SecretStr("")
+    brave_base_url: str = "https://api.search.brave.com"
+    brave_timeout_seconds: float = Field(default=20.0, ge=5.0, le=120.0)
+
+    brave_max_searches_per_day: int = Field(default=12, ge=0, le=10000)
+    """Hard ceiling on paid searches per UTC day, counted durably. Not a
+    target: the default schedule asks for about ten."""
+
+    brave_max_searches_per_month: int = Field(default=320, ge=0, le=1000000)
+    """Hard ceiling per UTC calendar month.
+
+    The binding constraint, because Brave's free credit is monthly: a daily cap
+    alone cannot protect it, since 12 a day for 31 days is 372. 320 keeps a
+    comfortable margin inside the ~1,000 requests $5 of credit buys, leaving
+    room for a manual search and for the estimate being wrong."""
+
+    brave_result_limit: int = Field(default=10, ge=1, le=20)
+    """``count`` sent to ``/res/v1/web/search``. Documented maximum 20, and it
+    applies to web results only -- the news cluster comes back alongside at no
+    extra charge. Unlike Firecrawl's ``limit`` this does **not** multiply the
+    price: one request is one billable request."""
+
+    brave_result_filter: CommaSeparatedStrs
+    """``result_filter`` values; defaults to ``web,news``. A relevance knob, not
+    a cost knob."""
+
+    brave_safesearch: Literal["off", "moderate", "strict"] = "off"
+    """Financial and industrial news is not what this filter is for, and
+    ``moderate`` (the API default) has been observed to drop legitimate results
+    about weapons procurement and pharmaceuticals."""
+
+    # ------------------------------------------------------------------
+    # Exa  (semantic second-order discovery)
+    #
+    # Verified 2026-09-05: $7 per 1,000 requests for up to 10 results, $1 per
+    # 1,000 results above 10, contents $1 per 1,000 pages per content type.
+    # New accounts get $20 of credit and the free tier adds $10 a month.
+    # ------------------------------------------------------------------
+    exa_api_key: SecretStr = SecretStr("")
+    exa_base_url: str = "https://api.exa.ai"
+    exa_timeout_seconds: float = Field(default=45.0, ge=5.0, le=180.0)
+
+    exa_max_searches_per_day: int = Field(default=3, ge=0, le=1000)
+    """Hard ceiling on paid semantic searches per UTC day.
+
+    Deliberately tiny. A semantic query asks a question whose answer moves over
+    weeks; running it hourly would spend ten times Brave's price to receive
+    yesterday's answer."""
+
+    exa_max_searches_per_month: int = Field(default=70, ge=0, le=100000)
+    """Hard ceiling per UTC calendar month: about $0.49 at the verified price,
+    well inside the $10 monthly free credit."""
+
+    exa_result_limit: int = Field(default=10, ge=1, le=100)
+    """``numResults``. Ten is the ceiling included in the base price; every
+    result above it is separately billed."""
+
+    exa_search_type: Literal["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"] = (
+        "auto"
+    )
+    """``auto`` lets Exa pick between neural and keyword retrieval at the base
+    price. The ``deep*`` modes are $12-15 per 1,000 and are a research tool, not
+    a discovery sweep."""
+
+    exa_fetch_contents: bool = False
+    """Whether a semantic search may also request page contents.
+
+    **Default off, and the scheduler never turns it on.** This is Exa's
+    equivalent of Firecrawl's ``scrapeOptions``: the field that quietly turns a
+    metadata call into a per-result page fetch. Extraction happens after triage,
+    locally, and is free."""
+
+    exa_snippet_max_chars: int = Field(default=1200, ge=200, le=20000)
+    """How much of a returned text body is kept as a triage snippet, on the
+    rare occasions contents are requested at all."""
+
+    # ------------------------------------------------------------------
+    # Local content extraction
+    #
+    # The default extractor and, in normal operation, the only one that runs.
+    # It costs nothing, which is what makes "search broadly, read selectively"
+    # stop being a budget question.
+    # ------------------------------------------------------------------
+    content_extraction_enabled: bool = True
+    content_extract_max_per_day: int = Field(default=60, ge=0, le=10000)
+    """How many shortlisted pages may be fetched per UTC day.
+
+    Free, but not unbounded: a runaway sweep is a runaway outbound request rate
+    against publishers who did not ask for it."""
+
+    content_extract_timeout_seconds: float = Field(default=20.0, ge=2.0, le=120.0)
+    content_extract_max_bytes: int = Field(default=5_000_000, ge=10_000, le=100_000_000)
+    """Response body ceiling. Enforced while streaming, so a response that
+    declares nothing and sends a gigabyte is abandoned rather than buffered."""
+
+    content_extract_min_chars: int = Field(default=400, ge=50, le=100_000)
+    """Below this an extraction counts as failed. A JavaScript shell, a consent
+    wall and a paywall stub all return a 200 with a few dozen words, and
+    treating that as an article would put nothing useful in front of the
+    classifier while marking the URL as read."""
+
+    content_extract_user_agent: str = (
+        "StockBrain/0.1 (self-hosted research agent; +https://github.com/)"
+    )
+    """An honest, contactable identity. Impersonating a browser to get past a
+    publisher's block is both dishonest and fragile."""
+
+    # ------------------------------------------------------------------
+    # Firecrawl  (fallback extractor only)
+    #
+    # Firecrawl was the primary discovery provider through Phase 9. It is not
+    # any more: the search path is removed, and what remains is one paid page
+    # fetch for the case local extraction cannot handle -- a publisher that
+    # answers 403 to a plain client, or serves a shell that needs rendering.
     #
     # Firecrawl bills (verified 2026-09-05 against
-    # <https://docs.firecrawl.dev/billing>): **search = 2 credits per 10
-    # results, rounded up per 10**, and **scrape = 1 credit per page**.
-    # ``limit`` is per *source*, so two sources at limit 10 is 20 billed
-    # results, and ``scrapeOptions`` adds one credit for every one of them.
+    # <https://docs.firecrawl.dev/billing>): **scrape = 1 credit per page**, and
+    # credits are charged whenever its infrastructure processed the request,
+    # even when the target site returned an error.
     # ------------------------------------------------------------------
     firecrawl_api_key: SecretStr = SecretStr("")
     firecrawl_base_url: str = "https://api.firecrawl.dev"
 
-    firecrawl_min_topic_interval_minutes: int = Field(default=720, ge=15, le=20160)
-    """Floor on a topic's own ``interval_minutes``, in minutes.
+    firecrawl_max_scrapes_per_day: int = Field(default=5, ge=0, le=10000)
+    """Hard ceiling on paid fallback fetches per UTC day.
 
-    A topic row may ask for a *slower* cadence than this but never a faster one.
-    Twelve hours by default: thematic drift is measured in days, and anything
-    faster is a job Alpaca news already does for free. Raising the floor is
-    safe; lowering it is what caused the incident."""
+    A fallback only happens for a URL that already survived deduplication, the
+    cheap classifier *and* a failed free attempt, so this is deliberately
+    small."""
 
-    firecrawl_max_searches_per_day: int = Field(default=12, ge=0, le=10000)
-    """Hard ceiling on paid search calls per UTC day, counted durably.
+    firecrawl_daily_credit_cap: int = Field(default=10, ge=0, le=1000000)
+    """Hard ceiling on estimated credits per UTC day."""
 
-    Not a target. With the default 5-per-source limit each search is 2 credits,
-    so twelve searches is 24 credits a day."""
-
-    firecrawl_max_scrapes_per_day: int = Field(default=6, ge=0, le=10000)
-    """Hard ceiling on paid full-content fetches per UTC day.
-
-    A scrape only happens for a result that already survived deduplication and
-    the cheap classifier, so this is deliberately small."""
-
-    firecrawl_daily_credit_cap: int = Field(default=30, ge=0, le=1000000)
-    """Hard ceiling on *estimated* credits per UTC day.
-
-    Estimated from the published billing model and then reconciled against the
-    ``creditsUsed`` the search response actually reports, so the number this cap
-    compares against is the provider's own accounting wherever the provider
-    supplies one."""
-
-    firecrawl_monthly_credit_cap: int = Field(default=900, ge=0, le=10000000)
+    firecrawl_monthly_credit_cap: int = Field(default=200, ge=0, le=10000000)
     """Hard ceiling on estimated credits per UTC calendar month.
 
-    Firecrawl's allowance is monthly, so a daily cap alone cannot protect it: 30
-    a day for 31 days is 930. 900 leaves headroom inside a 1,000-credit
-    allowance for a manual search and for the estimate being wrong."""
-
-    firecrawl_search_result_limit: int = Field(default=5, ge=1, le=100)
-    """``limit`` sent to ``/v2/search`` -- **per source**, not per request.
-
-    Five with the two default sources is ten billed results, which is exactly
-    one 2-credit billing block. Six would be twelve results and 4 credits."""
-
-    firecrawl_search_sources: CommaSeparatedStrs
-    """Which ``/v2/search`` sources to request; defaults to ``web,news``.
-
-    Each source multiplies the billed result count, so this is a cost knob as
-    much as a coverage one."""
-
-    firecrawl_scrape_enabled: bool = True
-    """Whether the second stage may fetch full article content at all.
-
-    False leaves discovery running on search metadata alone -- title, URL,
-    snippet and date -- which is enough for the classifier to triage."""
+    Firecrawl's allowance is monthly, so a daily cap alone cannot protect it: 10
+    a day for 31 days is 310. 200 leaves headroom inside a 1,000-credit
+    allowance."""
 
     firecrawl_scrape_timeout_seconds: float = Field(default=60.0, ge=5.0, le=300.0)
-
-    firecrawl_failure_cooldown_minutes: int = Field(default=60, ge=1, le=20160)
-    """How long a query waits after a *failure* before it is eligible again.
-
-    Separate from the success interval: a query that is failing must not be
-    retried on the ordinary cadence, because Firecrawl charges for a request its
-    infrastructure processed even when the answer was an error."""
 
     firecrawl_enabled: bool = False
     """Default **off**.
 
-    The one provider in this system that can spend real money on a schedule with
-    no human in the loop. A fresh deployment discovers through Alpaca news and
-    SEC EDGAR, and enabling Firecrawl is a deliberate act taken after reading
-    the budget above."""
+    The one provider in this system that can spend real money without a human in
+    the loop. A fresh deployment discovers through Brave, Exa, Alpaca news and
+    SEC EDGAR, and enabling this is a deliberate act taken after reading the
+    budget above."""
+
+    firecrawl_fallback_extraction_enabled: bool = False
+    """Whether a failed local extraction may escalate to a paid Firecrawl fetch.
+
+    Separate from ``FIRECRAWL_ENABLED`` so that "the credential exists" and "we
+    are willing to spend it on this page" stay two different decisions. Both
+    must be true, and even then the escalation happens only for a shortlisted
+    URL whose local attempt failed for a reason a different fetcher could fix."""
 
     # ------------------------------------------------------------------
     # SEC EDGAR (no API key; descriptive User-Agent is mandatory)
@@ -676,7 +810,7 @@ class Settings(BaseSettings):
         "cors_allow_origins",
         "risk_allowed_instrument_types",
         "risk_allowed_sessions",
-        "firecrawl_search_sources",
+        "brave_result_filter",
         mode="before",
     )
     @classmethod
@@ -835,17 +969,26 @@ class Settings(BaseSettings):
             raise ValueError("LLM_MONTHLY_HARD_USD must be >= LLM_MONTHLY_SOFT_USD")
         return self
 
-    @field_validator("firecrawl_search_sources", mode="after")
+    @field_validator("brave_result_filter", mode="after")
     @classmethod
-    def _normalise_firecrawl_sources(cls, value: list[str]) -> list[str]:
-        """Default to ``web,news`` and refuse a source ``/v2/search`` does not offer.
+    def _normalise_brave_result_filter(cls, value: list[str]) -> list[str]:
+        """Default to ``web,news`` and refuse a filter the API does not document.
 
-        An unknown source name would be rejected by the API *after* the request
-        was billed, so it is caught here instead. Order is preserved and
-        duplicates are dropped, because a repeated source would be requested --
-        and billed -- twice.
+        An unknown filter name would be rejected by the API *after* the request
+        was made, so it is caught here instead. Order is preserved and
+        duplicates are dropped.
         """
-        allowed = {"web", "news", "images"}
+        allowed = {
+            "discussions",
+            "faq",
+            "infobox",
+            "locations",
+            "news",
+            "query",
+            "summarizer",
+            "videos",
+            "web",
+        }
         if not value:
             return ["web", "news"]
         cleaned: list[str] = []
@@ -855,43 +998,64 @@ class Settings(BaseSettings):
                 continue
             if name not in allowed:
                 raise ValueError(
-                    f"FIRECRAWL_SEARCH_SOURCES contains {raw!r}; "
-                    f"/v2/search documents only {sorted(allowed)}"
+                    f"BRAVE_RESULT_FILTER contains {raw!r}; "
+                    f"the API documents only {sorted(allowed)}"
                 )
             if name not in cleaned:
                 cleaned.append(name)
-        if not cleaned:
-            return ["web", "news"]
-        return cleaned
+        return cleaned or ["web", "news"]
 
     @model_validator(mode="after")
-    def _validate_firecrawl_budget(self) -> Settings:
-        """Reject a Firecrawl budget that cannot hold.
+    def _validate_provider_budgets(self) -> Settings:
+        """Reject a provider budget that cannot hold.
 
         Each check is a combination that would look configured and then spend
-        more than the operator intended, which is exactly the class of mistake
-        this whole section exists to prevent.
+        more than the operator intended, or would look configured and be unable
+        to spend at all -- both are the class of mistake this whole section
+        exists to prevent.
         """
         problems: list[str] = []
+        if self.brave_max_searches_per_month < self.brave_max_searches_per_day:
+            problems.append(
+                "BRAVE_MAX_SEARCHES_PER_MONTH must be >= BRAVE_MAX_SEARCHES_PER_DAY, "
+                "otherwise the daily cap can never be reached"
+            )
+        if self.exa_max_searches_per_month < self.exa_max_searches_per_day:
+            problems.append(
+                "EXA_MAX_SEARCHES_PER_MONTH must be >= EXA_MAX_SEARCHES_PER_DAY, "
+                "otherwise the daily cap can never be reached"
+            )
         if self.firecrawl_monthly_credit_cap < self.firecrawl_daily_credit_cap:
             problems.append(
                 "FIRECRAWL_MONTHLY_CREDIT_CAP must be >= FIRECRAWL_DAILY_CREDIT_CAP, "
                 "otherwise the daily cap can never be reached"
             )
-        # The cheapest a single search can be is one 2-credit billing block. A
-        # daily credit cap below the cost of the searches the daily search cap
-        # permits is not a stricter limit, it is two limits that disagree.
-        cheapest_search_credits = 2
-        if (
-            self.firecrawl_max_searches_per_day
-            and self.firecrawl_daily_credit_cap < cheapest_search_credits
-        ):
+        # A markdown scrape is one credit. A daily credit cap below the cost of
+        # the scrapes the daily scrape cap permits is not a stricter limit, it
+        # is two limits that disagree.
+        if self.firecrawl_max_scrapes_per_day and self.firecrawl_daily_credit_cap < 1:
             problems.append(
-                "FIRECRAWL_DAILY_CREDIT_CAP is below the 2 credits a single /v2/search "
-                "costs, so FIRECRAWL_MAX_SEARCHES_PER_DAY can never be used"
+                "FIRECRAWL_DAILY_CREDIT_CAP is below the 1 credit a single /v2/scrape "
+                "costs, so FIRECRAWL_MAX_SCRAPES_PER_DAY can never be used"
+            )
+        if self.firecrawl_fallback_extraction_enabled and not self.content_extraction_enabled:
+            problems.append(
+                "FIRECRAWL_FALLBACK_EXTRACTION_ENABLED requires CONTENT_EXTRACTION_ENABLED: "
+                "the paid fallback only ever runs after a local attempt failed, so with "
+                "local extraction off it would become the primary extractor"
+            )
+        if self.web_discovery_routine_provider is WebDiscoveryProviderName.EXA:
+            problems.append(
+                "WEB_DISCOVERY_ROUTINE_PROVIDER=exa would run every routine keyword search "
+                "on the semantic provider's price; Exa answers SEMANTIC queries"
+            )
+        if self.web_discovery_semantic_provider is WebDiscoveryProviderName.BRAVE:
+            problems.append(
+                "WEB_DISCOVERY_SEMANTIC_PROVIDER=brave would answer second-order questions "
+                "with a keyword index; Brave answers ROUTINE queries"
             )
         if problems:
-            raise ValueError("Invalid Firecrawl budget: " + "; ".join(problems))
+            raise ValueError("Invalid web discovery budget: " + "; ".join(problems))
         return self
 
     @field_validator("fx_probe_base_currency", "fx_probe_quote_currency", mode="after")
@@ -1130,8 +1294,8 @@ class Settings(BaseSettings):
         return not self.fx_blockers
 
     @property
-    def firecrawl_blockers(self) -> list[str]:
-        """Every reason no paid Firecrawl call will be made, in GUI-ready wording.
+    def brave_blockers(self) -> list[str]:
+        """Every reason no paid Brave call will be made, in GUI-ready wording.
 
         Same shape as :attr:`execution_blockers`: "available" is defined as "no
         blockers remain", so a health panel can never show a blocker beside a
@@ -1141,12 +1305,69 @@ class Settings(BaseSettings):
         blockers: list[str] = []
         if not self.discovery_enabled:
             blockers.append("DISCOVERY_ENABLED is false")
+        if not self.web_discovery_enabled:
+            blockers.append("WEB_DISCOVERY_ENABLED is false")
+        if self.web_discovery_routine_provider is not WebDiscoveryProviderName.BRAVE:
+            blockers.append(
+                f"WEB_DISCOVERY_ROUTINE_PROVIDER is "
+                f"{self.web_discovery_routine_provider.value!r}, not 'brave'"
+            )
+        if not self.brave_api_key.get_secret_value():
+            blockers.append("BRAVE_API_KEY is not set")
+        if self.brave_max_searches_per_day <= 0:
+            blockers.append("BRAVE_MAX_SEARCHES_PER_DAY is 0")
+        if self.brave_max_searches_per_month <= 0:
+            blockers.append("BRAVE_MAX_SEARCHES_PER_MONTH is 0")
+        return blockers
+
+    @property
+    def brave_available(self) -> bool:
+        return not self.brave_blockers
+
+    @property
+    def exa_blockers(self) -> list[str]:
+        """Every reason no paid Exa call will be made, in GUI-ready wording."""
+        blockers: list[str] = []
+        if not self.discovery_enabled:
+            blockers.append("DISCOVERY_ENABLED is false")
+        if not self.web_discovery_enabled:
+            blockers.append("WEB_DISCOVERY_ENABLED is false")
+        if self.web_discovery_semantic_provider is not WebDiscoveryProviderName.EXA:
+            blockers.append(
+                f"WEB_DISCOVERY_SEMANTIC_PROVIDER is "
+                f"{self.web_discovery_semantic_provider.value!r}, not 'exa'"
+            )
+        if not self.exa_api_key.get_secret_value():
+            blockers.append("EXA_API_KEY is not set")
+        if self.exa_max_searches_per_day <= 0:
+            blockers.append("EXA_MAX_SEARCHES_PER_DAY is 0")
+        if self.exa_max_searches_per_month <= 0:
+            blockers.append("EXA_MAX_SEARCHES_PER_MONTH is 0")
+        return blockers
+
+    @property
+    def exa_available(self) -> bool:
+        return not self.exa_blockers
+
+    @property
+    def firecrawl_blockers(self) -> list[str]:
+        """Every reason no paid Firecrawl fetch will be made.
+
+        Firecrawl is now the fallback *extractor*, so ``DISCOVERY_ENABLED`` is
+        not among these: a page can be worth reading while the sweep that found
+        it is paused. What gates it is the extraction pipeline it sits behind.
+        """
+        blockers: list[str] = []
+        if not self.content_extraction_enabled:
+            blockers.append("CONTENT_EXTRACTION_ENABLED is false")
         if not self.firecrawl_enabled:
             blockers.append("FIRECRAWL_ENABLED is false")
+        if not self.firecrawl_fallback_extraction_enabled:
+            blockers.append("FIRECRAWL_FALLBACK_EXTRACTION_ENABLED is false")
         if not self.firecrawl_api_key.get_secret_value():
             blockers.append("FIRECRAWL_API_KEY is not set")
-        if self.firecrawl_max_searches_per_day <= 0:
-            blockers.append("FIRECRAWL_MAX_SEARCHES_PER_DAY is 0")
+        if self.firecrawl_max_scrapes_per_day <= 0:
+            blockers.append("FIRECRAWL_MAX_SCRAPES_PER_DAY is 0")
         if self.firecrawl_daily_credit_cap <= 0:
             blockers.append("FIRECRAWL_DAILY_CREDIT_CAP is 0")
         if self.firecrawl_monthly_credit_cap <= 0:
@@ -1156,6 +1377,37 @@ class Settings(BaseSettings):
     @property
     def firecrawl_available(self) -> bool:
         return not self.firecrawl_blockers
+
+    @property
+    def content_extraction_blockers(self) -> list[str]:
+        """Every reason no page body will be fetched at all."""
+        blockers: list[str] = []
+        if not self.content_extraction_enabled:
+            blockers.append("CONTENT_EXTRACTION_ENABLED is false")
+        if self.content_extract_max_per_day <= 0:
+            blockers.append("CONTENT_EXTRACT_MAX_PER_DAY is 0")
+        return blockers
+
+    @property
+    def content_extraction_available(self) -> bool:
+        return not self.content_extraction_blockers
+
+    def min_query_interval_minutes(self, kind: WebDiscoveryKind) -> int:
+        """The cadence floor for one query kind.
+
+        Read wherever an interval is *used* rather than where it is stored, so
+        an old topic row, a restored backup or a hand-written ``UPDATE`` cannot
+        go faster than the operator allowed.
+        """
+        if kind is WebDiscoveryKind.SEMANTIC:
+            return self.web_discovery_min_semantic_interval_minutes
+        return self.web_discovery_min_query_interval_minutes
+
+    def provider_for_kind(self, kind: WebDiscoveryKind) -> WebDiscoveryProviderName:
+        """Which backend answers this kind of query, by configuration."""
+        if kind is WebDiscoveryKind.SEMANTIC:
+            return self.web_discovery_semantic_provider
+        return self.web_discovery_routine_provider
 
     @property
     def telegram_configured(self) -> bool:

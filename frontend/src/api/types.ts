@@ -7,6 +7,12 @@
 
 export type ProviderStatus =
   | "HEALTHY"
+  /**
+   * Switched on, working, and out of allowance. Separate from DEGRADED because
+   * the operator's next action differs completely: a degraded provider is a
+   * fault to investigate, an exhausted one is a spending limit doing its job.
+   */
+  | "BUDGET_EXHAUSTED"
   | "DEGRADED"
   | "DOWN"
   | "DISABLED"
@@ -204,6 +210,14 @@ export interface SourceRecord {
   /** Plain text extracted server-side. Never raw provider HTML. */
   excerpt: string | null;
   symbols: string[];
+  /**
+   * Every provider that surfaced this artefact, first one first. Two providers
+   * finding one page is corroboration, and the panel shows it.
+   */
+  discovered_by: string[];
+  /** How the body was obtained, or null while only a snippet is held. */
+  extraction_method: string | null;
+  content_fetched_at: string | null;
 }
 
 export interface EventDetail {
@@ -245,69 +259,111 @@ export interface DiscoveryStatus {
   scheduled_tasks: ScheduledTask[];
   stats: IngestionStats;
   budget: LlmBudget | null;
-  firecrawl: FirecrawlBudget | null;
+  web_discovery: WebDiscoveryStatus | null;
   queue: JobQueueHealth | null;
 }
 
-export interface FirecrawlUsage {
+export interface ProviderUsage {
   searches: number;
   scrapes: number;
-  estimated_credits: number;
-  provider_reported_credits: number;
+  estimated_units: number;
+  provider_reported_units: number;
+  results_returned: number;
   pages_scraped: number;
+  /** A decimal string, not a number: a price is exact or it is not reported. */
+  estimated_cost_usd: string;
 }
 
 /**
- * Firecrawl's cadence and spend.
+ * One metered provider's cadence and spend.
  *
  * Every field here exists because Phase 2 had none of them: the only visible
- * signal that 21 searches an hour were emptying the credit allowance was a
+ * signal that 21 searches an hour were emptying a credit allowance was a
  * Prometheus counter nobody was scraping, and an HTTP 402 twenty-nine searches
  * later. There is deliberately no field for the API key.
  */
-export interface FirecrawlBudget {
+export interface ProviderBudget {
+  provider: string;
+  /**
+   * What one unit is for this provider - "requests" or "credits". Units are
+   * never comparable across providers, so the label travels with them.
+   */
+  unit_label: string;
   enabled: boolean;
+  status: ProviderStatus;
   blockers: string[];
   exhausted: boolean;
   exhausted_reasons: string[];
   search_exhausted: boolean;
   scrape_exhausted: boolean;
-  today: FirecrawlUsage;
-  month: FirecrawlUsage;
+  today: ProviderUsage;
+  month: ProviderUsage;
   max_searches_per_day: number;
   max_scrapes_per_day: number;
-  daily_credit_cap: number;
-  monthly_credit_cap: number;
+  daily_unit_cap: number;
+  monthly_unit_cap: number;
   searches_remaining_today: number;
   scrapes_remaining_today: number;
-  daily_credits_remaining: number;
-  monthly_credits_remaining: number;
-  min_topic_interval_minutes: number;
-  search_result_limit: number;
-  search_sources: string[];
-  scrape_enabled: boolean;
+  daily_units_remaining: number;
+  monthly_units_remaining: number;
   day_start: string;
   month_start: string;
-  last_successful_call_at: string | null;
   last_call_at: string | null;
+  last_successful_call_at: string | null;
+  last_error: string | null;
   recent_results_returned: number | null;
-  per_topic: FirecrawlTopicUsage[];
 }
 
 /** Per query, so "why has this topic not run" has an answer. */
-export interface FirecrawlTopicUsage {
+export interface DiscoveryQueryUsage {
   topic: string;
   query: string;
+  kind: string;
+  provider: string;
   enabled: boolean;
   last_run_at: string | null;
   last_success_at: string | null;
   next_eligible_at: string | null;
   effective_interval_minutes: number;
+  result_limit: number;
+  priority: number;
   consecutive_failures: number;
   searches_performed: number;
   results_seen: number;
-  credits_used: number;
+  units_used: number;
   last_error: string | null;
+}
+
+/** How pages are read, and how often that costs anything. */
+export interface ContentExtractionStatus {
+  enabled: boolean;
+  blockers: string[];
+  extractor: string;
+  max_per_day: number;
+  fetched_today: number;
+  /** LOCAL / FIRECRAWL / NONE counts for today. Only FIRECRAWL costs money. */
+  by_method_today: Record<string, number>;
+  local_failures_today: number;
+  firecrawl_fallbacks_today: number;
+  fallback_enabled: boolean;
+}
+
+/**
+ * The provider split, made legible in one object.
+ *
+ * Answers the four questions an operator actually has: who is doing routine
+ * search, who is doing semantic search, how much of each allowance is left, and
+ * why a given query has not run.
+ */
+export interface WebDiscoveryStatus {
+  enabled: boolean;
+  routine_provider: string;
+  semantic_provider: string;
+  routine_min_interval_minutes: number;
+  semantic_min_interval_minutes: number;
+  providers: ProviderBudget[];
+  queries: DiscoveryQueryUsage[];
+  extraction: ContentExtractionStatus | null;
 }
 
 /**
@@ -370,13 +426,15 @@ export interface WebSecurityStatus {
 export interface DiscoveryQueryRecord {
   id: string;
   query: string;
+  kind: string;
+  provider: string;
   enabled: boolean;
   last_run_at: string | null;
   last_success_at: string | null;
   last_error: string | null;
   consecutive_failures: number;
   results_seen: number;
-  credits_used: number;
+  units_used: number;
 }
 
 export interface DiscoveryTopic {
@@ -387,7 +445,7 @@ export interface DiscoveryTopic {
   enabled: boolean;
   interval_minutes: number;
   result_limit: number;
-  freshness: string;
+  freshness_days: number;
   last_run_at: string | null;
   queries: DiscoveryQueryRecord[];
 }

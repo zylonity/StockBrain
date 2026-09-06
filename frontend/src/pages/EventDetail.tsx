@@ -130,6 +130,16 @@ export function EventDetail() {
                   {source.headline ?? "(no headline)"}
                 </span>
                 <ProviderBadge provider={source.provider} />
+                {/* Every provider *after* the first that surfaced this exact
+                    page. Two providers finding one article is corroboration
+                    and is worth seeing; it is not two events. */}
+                {source.discovered_by
+                  .filter((name) => name !== source.provider)
+                  .map((name) => (
+                    <span className="badge" key={name} title="also found by">
+                      + {name}
+                    </span>
+                  ))}
                 <CategoryBadge category={source.source_category} />
                 {source.relationship && (
                   <span className="badge">{source.relationship}</span>
@@ -146,6 +156,14 @@ export function EventDetail() {
                 <dd>{formatTimestamp(source.published_at)}</dd>
                 <dt>Ingested</dt>
                 <dd>{formatTimestamp(source.received_at)}</dd>
+                <dt>Body</dt>
+                <dd>
+                  {source.content_fetched_at
+                    ? `${source.extraction_method ?? "unknown"} · ${formatTimestamp(
+                        source.content_fetched_at,
+                      )}`
+                    : "snippet only — not fetched"}
+                </dd>
                 {source.canonical_url && (
                   <>
                     <dt>Link</dt>

@@ -189,6 +189,15 @@ class ProviderHttpClient:
         if self._owns_client:
             await self._client.aclose()
 
+    @property
+    def headers(self) -> Mapping[str, str]:
+        """The default headers every request from this client carries.
+
+        Read-only, and never logged by this module: for most providers these
+        contain the credential.
+        """
+        return self._client.headers
+
     # ------------------------------------------------------------------
     # Request execution
     # ------------------------------------------------------------------

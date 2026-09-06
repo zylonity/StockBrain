@@ -292,41 +292,90 @@ def test_production_still_requires_a_signing_key() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Firecrawl
+# Web discovery providers
 # ---------------------------------------------------------------------------
-def test_firecrawl_needs_a_key_and_a_switch_and_a_budget() -> None:
-    """Three independent conditions, each reported by name.
+def test_brave_needs_a_key_and_a_budget() -> None:
+    """Each condition reported by name.
 
     "Available" is "no blockers remain", so the flag and the reason list can
     never disagree.
     """
+    assert _settings().brave_available is False
+    assert _settings(brave_api_key="brv-x").brave_available is True
+    # A zero cap is a deliberate off switch and is reported as a blocker rather
+    # than as a working provider that happens to refuse everything.
+    assert _settings(brave_api_key="brv-x", brave_max_searches_per_day=0).brave_available is False
+    # A zero monthly cap is the same off switch and is caught by the pair of
+    # limits having to agree: a monthly cap below the daily cap is rejected at
+    # startup rather than presenting as "discovery silently does nothing".
+    assert (
+        _settings(
+            brave_api_key="brv-x",
+            brave_max_searches_per_day=0,
+            brave_max_searches_per_month=0,
+        ).brave_available
+        is False
+    )
+
+
+def test_exa_needs_a_key_and_a_budget() -> None:
+    assert _settings().exa_available is False
+    assert _settings(exa_api_key="exa-x").exa_available is True
+    assert _settings(exa_api_key="exa-x", exa_max_searches_per_day=0).exa_available is False
+
+
+def test_firecrawl_needs_a_key_and_two_switches_and_a_budget() -> None:
+    """Four independent conditions.
+
+    Two switches rather than one, because "the credential exists" and "spend it
+    on this page" are different decisions: a key landing in ``.env`` must not by
+    itself enable paid fetching.
+    """
     assert _settings().firecrawl_available is False
     assert _settings(firecrawl_enabled=True).firecrawl_available is False
     assert _settings(firecrawl_api_key="fc-x").firecrawl_available is False
-    assert _settings(firecrawl_enabled=True, firecrawl_api_key="fc-x").firecrawl_available is True
-    # A zero cap is a deliberate off switch and is reported as a blocker rather
-    # than as a working provider that happens to refuse everything.
+    assert _settings(firecrawl_enabled=True, firecrawl_api_key="fc-x").firecrawl_available is False
     assert (
         _settings(
             firecrawl_enabled=True,
+            firecrawl_fallback_extraction_enabled=True,
             firecrawl_api_key="fc-x",
-            firecrawl_max_searches_per_day=0,
+        ).firecrawl_available
+        is True
+    )
+    assert (
+        _settings(
+            firecrawl_enabled=True,
+            firecrawl_fallback_extraction_enabled=True,
+            firecrawl_api_key="fc-x",
+            firecrawl_max_scrapes_per_day=0,
         ).firecrawl_available
         is False
     )
 
 
-def test_discovery_disabled_disables_firecrawl_too() -> None:
+def test_discovery_disabled_disables_the_search_providers() -> None:
     """The subsystem switch is above the provider switch."""
-    settings = _settings(discovery_enabled=False, firecrawl_enabled=True, firecrawl_api_key="fc-x")
-    assert settings.firecrawl_available is False
-    assert any("DISCOVERY_ENABLED" in blocker for blocker in settings.firecrawl_blockers)
+    settings = _settings(discovery_enabled=False, brave_api_key="brv-x", exa_api_key="exa-x")
+    assert settings.brave_available is False
+    assert settings.exa_available is False
+    assert any("DISCOVERY_ENABLED" in blocker for blocker in settings.brave_blockers)
+    assert any("DISCOVERY_ENABLED" in blocker for blocker in settings.exa_blockers)
 
 
-def test_an_unknown_search_source_is_refused_at_startup() -> None:
-    """The API would reject it after processing -- and billing -- the request."""
+def test_web_discovery_disabled_disables_the_search_providers() -> None:
+    """One switch turns off both metered search backends and leaves the free
+    ones -- Alpaca news and SEC EDGAR -- running."""
+    settings = _settings(web_discovery_enabled=False, brave_api_key="brv-x", exa_api_key="exa-x")
+    assert settings.brave_available is False
+    assert settings.exa_available is False
+    assert settings.discovery_enabled is True
+
+
+def test_an_unknown_result_filter_is_refused_at_startup() -> None:
+    """The API would reject it after processing the request."""
     with pytest.raises(ValidationError, match="documents only"):
-        _settings(firecrawl_search_sources="web,podcasts")
+        _settings(brave_result_filter="web,podcasts")
 
 
 # ---------------------------------------------------------------------------

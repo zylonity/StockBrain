@@ -21,7 +21,6 @@ from stockbrain.errors import (
 )
 from stockbrain.httpclient import RateLimitSnapshot, TokenBucket
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient, parse_news_item
-from stockbrain.ingestion.base import DiscoveryQuerySpec
 from stockbrain.ingestion.firecrawl import FirecrawlClient
 from stockbrain.ingestion.sec_edgar import SecEdgarClient, normalize_cik, parse_recent_filings
 
@@ -110,7 +109,9 @@ def test_alpaca_stream_errors_are_classified(code: int, expected: type[Exception
 
 
 # ---------------------------------------------------------------------------
-# Firecrawl
+# Firecrawl -- scrape only.  Its search path was removed with the provider
+# split; the parsing tests for it now live in ``test_brave.py`` / ``test_exa.py``
+# against the providers that replaced it.
 # ---------------------------------------------------------------------------
 
 
@@ -118,96 +119,64 @@ def _firecrawl() -> FirecrawlClient:
     return FirecrawlClient(Settings(app_env="test", firecrawl_api_key="fc-test"))
 
 
-def test_firecrawl_sources_are_objects_not_strings() -> None:
-    """Current docs specify ``[{"type": "web"}]``.
+def test_firecrawl_scrape_requests_markdown_only() -> None:
+    """Every other format is documented as an additional per-page charge.
 
-    StockBrain's spec showed ``["web", "news"]``, which the API does not accept.
+    ``json`` is +4 credits, a prompt-injection check is +4 and zero-data-
+    retention is +1, so the cheapest documented shape is the only one sent.
     """
-    body = _firecrawl().build_request(DiscoveryQuerySpec(query="q", limit=5))
-    assert body["sources"] == [{"type": "web"}, {"type": "news"}]
+    body = _firecrawl().build_scrape_request("https://example.com/a")
+    assert body["formats"] == [{"type": "markdown"}]
+    assert body["onlyMainContent"] is True
+    # Documented in milliseconds, 1000-300000.
+    assert body["timeout"] == 60000
 
 
-def test_firecrawl_query_is_truncated_to_the_documented_maximum() -> None:
-    body = _firecrawl().build_request(DiscoveryQuerySpec(query="x" * 900))
-    assert len(body["query"]) == 500
+def test_firecrawl_scrape_collapses_array_valued_metadata() -> None:
+    """``title`` and ``description`` are ``string | string[]`` on this endpoint.
 
-
-def test_firecrawl_limit_is_clamped_to_the_documented_range() -> None:
-    client = _firecrawl()
-    assert client.build_request(DiscoveryQuerySpec(query="q", limit=999))["limit"] == 100
-    assert client.build_request(DiscoveryQuerySpec(query="q", limit=0))["limit"] == 1
-
-
-def test_firecrawl_parses_web_and_news_result_shapes_separately() -> None:
-    """Web results carry ``description``; news results carry ``snippet``/``date``."""
-    client = _firecrawl()
-    spec = DiscoveryQuerySpec(query="datacentre power")
-    outcome = client.parse_response(
+    Stringifying a two-element array would put ``"['a', 'b']"`` in a headline.
+    """
+    result = _firecrawl().parse_scrape_response(
         {
             "success": True,
-            "creditsUsed": 3,
             "data": {
-                "web": [
-                    {
-                        "url": "https://reuters.com/a",
-                        "title": "Web title",
-                        "description": "Web description",
-                        "markdown": "# Scraped body",
-                    }
-                ],
-                "news": [
-                    {
-                        "url": "https://cnbc.com/b",
-                        "title": "News title",
-                        "snippet": "News snippet",
-                        "date": "2026-09-01T00:00:00Z",
-                    }
-                ],
+                "markdown": "# Body",
+                "metadata": {
+                    "title": ["First", "Second"],
+                    "description": ["D"],
+                    "sourceURL": "https://example.com/a",
+                    "statusCode": 200,
+                },
             },
         },
-        spec,
+        "https://example.com/requested",
     )
-
-    assert len(outcome.documents) == 2
-    web, news = outcome.documents
-    assert web.body == "# Scraped body"
-    assert web.metadata["firecrawl_source_type"] == "web"
-    assert news.body == "News snippet"
-    assert news.published_at == dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
-    assert client.last_credits_used == 3
-    # The provider's own accounting is returned rather than left on the client,
-    # because the durable budget has to record what the call cost in the same
-    # place it recorded that the call happened.
-    assert outcome.credits_reported == 3
-    assert outcome.results_returned == 2
-    assert outcome.scraped_pages == 1
+    assert result.title == "First"
+    assert result.description == "D"
+    # The URL the provider actually read, not the one asked for.
+    assert result.url == "https://example.com/a"
+    assert result.has_content
 
 
-def test_firecrawl_drops_results_without_a_url() -> None:
-    """No URL means no provenance and no dedupe identity.
+def test_firecrawl_scrape_reports_an_explicit_failure() -> None:
+    with pytest.raises(ProviderResponseError):
+        _firecrawl().parse_scrape_response({"success": False, "error": "x"}, "https://a.example")
 
-    The result is still *counted*: Firecrawl billed for returning it, and a
-    budget that only counted the results StockBrain could use would under-state
-    the spend.
+
+def test_firecrawl_scrape_rejects_a_response_without_data() -> None:
+    with pytest.raises(ProviderResponseError):
+        _firecrawl().parse_scrape_response({"success": True}, "https://a.example")
+
+
+def test_firecrawl_no_longer_exposes_a_search_method() -> None:
+    """The paid primary-discovery path is removed, not merely unscheduled.
+
+    Leaving a search method in the tree that nothing calls is how it gets
+    called again.
     """
-    outcome = _firecrawl().parse_response(
-        {"success": True, "data": {"web": [{"title": "no url"}]}},
-        DiscoveryQuerySpec(query="q"),
-    )
-    assert outcome.documents == ()
-    assert outcome.results_returned == 1
-
-
-def test_firecrawl_reports_an_explicit_failure() -> None:
-    with pytest.raises(ProviderResponseError):
-        _firecrawl().parse_response(
-            {"success": False, "warning": "quota"}, DiscoveryQuerySpec(query="q")
-        )
-
-
-def test_firecrawl_rejects_a_response_without_data() -> None:
-    with pytest.raises(ProviderResponseError):
-        _firecrawl().parse_response({"success": True}, DiscoveryQuerySpec(query="q"))
+    assert not hasattr(FirecrawlClient, "search")
+    assert not hasattr(FirecrawlClient, "build_request")
 
 
 # ---------------------------------------------------------------------------

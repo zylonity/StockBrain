@@ -1,4 +1,4 @@
-"""Firecrawl scheduling correctness: cadence, restart, dedupe, no retry storms.
+"""Web discovery scheduling: cadence, restart, dedupe, and no retry storms.
 
 Reconstructed directly from ``firecrawl_activity_logs.csv``.  What the log shows
 is four independent per-topic timers running at 20 and 30 minutes, nine enabled
@@ -15,7 +15,9 @@ Twenty-nine searches in 62 minutes.  In steady state that is 21 an hour: 3
 queries every 20 minutes plus 6 every 30, which is 504 a day.
 
 Each of these tests names the specific property of that behaviour it prevents
-from coming back.
+from coming back.  The provider underneath has changed -- Brave for routine
+searches, Exa for semantic ones -- but every failure mode the log records is a
+scheduling failure mode, and none of them was fixed by changing vendor.
 """
 
 from __future__ import annotations
@@ -28,9 +30,9 @@ import sqlalchemy as sa
 from stockbrain.config import Settings
 from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic, Job
 from stockbrain.db.session import Database
-from stockbrain.enums import JobStatus, JobType
+from stockbrain.enums import JobStatus, JobType, WebDiscoveryKind
 from stockbrain.ingestion.topics import DEFAULT_TOPICS, seed_default_topics
-from stockbrain.jobs.handlers import effective_topic_interval_minutes
+from stockbrain.jobs.handlers import effective_query_interval_minutes
 from stockbrain.observability.health import ProviderHealthRegistry
 from stockbrain.services import ServiceContainer
 
@@ -43,8 +45,8 @@ def _settings(database: Database, **overrides: object) -> Settings:
         "log_level": "CRITICAL",
         "web_auth_enabled": False,
         "database_url": database.engine.url.render_as_string(hide_password=False),
-        "firecrawl_api_key": "fc-test",
-        "firecrawl_enabled": True,
+        "brave_api_key": "brv-test",
+        "exa_api_key": "exa-test",
         "discovery_enabled": True,
         # Nothing else should start; these tests are about the sweep.
         "alpaca_news_enabled": False,
@@ -75,14 +77,46 @@ async def _seed_two_queries(database: Database, *, interval_minutes: int = 20) -
             enabled=True,
             interval_minutes=interval_minutes,
             result_limit=10,
-            freshness="qdr:h",
+            freshness_days=1,
             include_domains=[],
             exclude_domains=[],
         )
         session.add(topic)
         await session.flush()
-        session.add(DiscoveryQuery(topic_id=topic.id, query='"AI data center"', enabled=True))
-        session.add(DiscoveryQuery(topic_id=topic.id, query='"data centre" power', enabled=True))
+        for text in ('"AI data center"', '"data centre" power'):
+            session.add(
+                DiscoveryQuery(
+                    topic_id=topic.id,
+                    query=text,
+                    enabled=True,
+                    search_kind=WebDiscoveryKind.ROUTINE,
+                )
+            )
+
+
+async def _seed_semantic_query(database: Database) -> None:
+    """One semantic query, on its own topic, so the two kinds can be told apart."""
+    async with database.transaction() as session:
+        topic = DiscoveryTopic(
+            slug="second_order_exposure",
+            name="Second-order exposure",
+            enabled=True,
+            interval_minutes=1440,
+            result_limit=10,
+            freshness_days=30,
+            include_domains=[],
+            exclude_domains=[],
+        )
+        session.add(topic)
+        await session.flush()
+        session.add(
+            DiscoveryQuery(
+                topic_id=topic.id,
+                query="who benefits from a transformer shortage",
+                enabled=True,
+                search_kind=WebDiscoveryKind.SEMANTIC,
+            )
+        )
 
 
 async def _jobs(database: Database) -> list[Job]:
@@ -91,7 +125,7 @@ async def _jobs(database: Database) -> list[Job]:
             (
                 await session.execute(
                     sa.select(Job)
-                    .where(Job.job_type == JobType.FIRECRAWL_TOPIC_SEARCH.value)
+                    .where(Job.job_type == JobType.WEB_DISCOVERY_SEARCH.value)
                     .order_by(Job.created_at)
                 )
             ).scalars()
@@ -119,7 +153,7 @@ async def test_the_sweep_enqueues_and_makes_no_paid_call(clean_tables: Database)
     """
     await _seed_two_queries(clean_tables)
     services = _container(clean_tables)
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
 
     jobs = await _jobs(clean_tables)
     assert len(jobs) == 2
@@ -135,7 +169,7 @@ async def test_a_paid_search_job_gets_exactly_one_attempt(clean_tables: Database
     """
     await _seed_two_queries(clean_tables)
     services = _container(clean_tables)
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
     assert all(job.max_attempts == 1 for job in await _jobs(clean_tables))
 
 
@@ -153,13 +187,14 @@ async def test_the_interval_floor_overrides_a_twenty_minute_topic_row(
     """
     await _seed_two_queries(clean_tables, interval_minutes=20)
     services = _container(clean_tables)
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
 
     for query in await _queries(clean_tables):
         assert query.next_eligible_at is not None
-        # Claimed at enqueue time, one full floor interval out.
+        # Claimed at enqueue time, one full floor interval out: the configured
+        # routine floor of six hours, not the twenty minutes the row asked for.
         gap = query.next_eligible_at - dt.datetime.now(dt.UTC)
-        assert gap > dt.timedelta(minutes=700), gap
+        assert gap > dt.timedelta(minutes=355), gap
 
 
 async def test_a_query_inside_its_cooldown_is_not_enqueued_again(
@@ -168,14 +203,14 @@ async def test_a_query_inside_its_cooldown_is_not_enqueued_again(
     """The second sweep tick must not re-enqueue what the first just claimed."""
     await _seed_two_queries(clean_tables)
     services = _container(clean_tables)
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
     first = len(await _jobs(clean_tables))
 
     # Clear the queue so dedupe is not what stops the second sweep -- the
     # cooldown has to be sufficient on its own.
     async with clean_tables.transaction() as session:
         await session.execute(sa.delete(Job))
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
 
     assert first == 2
     assert await _jobs(clean_tables) == []
@@ -191,13 +226,13 @@ async def test_a_process_restart_does_not_reset_the_cooldown(
     brand-new container reads the same one.
     """
     await _seed_two_queries(clean_tables)
-    await _container(clean_tables)._enqueue_due_topic_searches()
+    await _container(clean_tables)._enqueue_due_routine_searches()
     async with clean_tables.transaction() as session:
         await session.execute(sa.delete(Job))
 
     # A different ServiceContainer with different objects: a restart.
     restarted = _container(clean_tables)
-    await restarted._enqueue_due_topic_searches()
+    await restarted._enqueue_due_routine_searches()
     assert await _jobs(clean_tables) == []
 
 
@@ -210,12 +245,12 @@ async def test_ten_restarts_in_a_row_still_spend_nothing(
     topic set.
     """
     await _seed_two_queries(clean_tables)
-    await _container(clean_tables)._enqueue_due_topic_searches()
+    await _container(clean_tables)._enqueue_due_routine_searches()
     async with clean_tables.transaction() as session:
         await session.execute(sa.delete(Job))
 
     for _ in range(10):
-        await _container(clean_tables)._enqueue_due_topic_searches()
+        await _container(clean_tables)._enqueue_due_routine_searches()
     assert await _jobs(clean_tables) == []
 
 
@@ -225,7 +260,7 @@ async def test_a_query_becomes_eligible_again_once_the_cooldown_elapses(
     """The cooldown is a delay, not a permanent stop."""
     await _seed_two_queries(clean_tables)
     services = _container(clean_tables)
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
     async with clean_tables.transaction() as session:
         await session.execute(sa.delete(Job))
         await session.execute(
@@ -233,7 +268,7 @@ async def test_a_query_becomes_eligible_again_once_the_cooldown_elapses(
                 next_eligible_at=sa.func.now() - dt.timedelta(minutes=1)
             )
         )
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
     assert len(await _jobs(clean_tables)) == 2
 
 
@@ -253,7 +288,7 @@ async def test_a_row_written_before_the_column_existed_is_not_treated_as_due(
                 next_eligible_at=None, last_run_at=sa.func.now() - dt.timedelta(minutes=30)
             )
         )
-    await _container(clean_tables)._enqueue_due_topic_searches()
+    await _container(clean_tables)._enqueue_due_routine_searches()
     assert await _jobs(clean_tables) == []
 
     queries = await _queries(clean_tables)
@@ -266,7 +301,7 @@ async def test_a_query_that_has_never_run_is_due_immediately(
 ) -> None:
     """A genuinely new query should not wait twelve hours for its first search."""
     await _seed_two_queries(clean_tables)
-    await _container(clean_tables)._enqueue_due_topic_searches()
+    await _container(clean_tables)._enqueue_due_routine_searches()
     assert len(await _jobs(clean_tables)) == 2
 
 
@@ -288,8 +323,8 @@ async def test_two_sweeps_running_at_once_cannot_queue_the_same_query_twice(
     # Sequential rather than gathered: the two sweeps hold row locks on the same
     # table and gathering them on one asyncio loop with one pool can deadlock in
     # the test, which would prove nothing about production.
-    await first._enqueue_due_topic_searches()
-    await second._enqueue_due_topic_searches()
+    await first._enqueue_due_routine_searches()
+    await second._enqueue_due_routine_searches()
 
     jobs = await _jobs(clean_tables)
     assert len(jobs) == 2
@@ -306,13 +341,13 @@ async def test_an_outstanding_job_suppresses_a_second_enqueue(
     """
     await _seed_two_queries(clean_tables)
     services = _container(clean_tables)
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
     async with clean_tables.transaction() as session:
         # Make them eligible again but leave the jobs in place.
         await session.execute(
             sa.update(DiscoveryQuery).values(next_eligible_at=sa.func.now() - dt.timedelta(hours=1))
         )
-    await services._enqueue_due_topic_searches()
+    await services._enqueue_due_routine_searches()
     assert len(await _jobs(clean_tables)) == 2
 
 
@@ -329,8 +364,10 @@ async def test_the_sweep_stops_when_the_daily_search_cap_is_reached(
     keys for nothing.
     """
     await _seed_two_queries(clean_tables)
-    services = _container(clean_tables, firecrawl_max_searches_per_day=0)
-    await services._enqueue_due_topic_searches()
+    services = _container(
+        clean_tables, brave_max_searches_per_day=0, brave_max_searches_per_month=0
+    )
+    await services._enqueue_due_routine_searches()
     assert await _jobs(clean_tables) == []
 
 
@@ -343,8 +380,8 @@ async def test_the_sweep_enqueues_only_as_many_as_the_budget_allows(
     rather than on whichever row PostgreSQL happened to return.
     """
     await _seed_two_queries(clean_tables)
-    services = _container(clean_tables, firecrawl_max_searches_per_day=1)
-    await services._enqueue_due_topic_searches()
+    services = _container(clean_tables, brave_max_searches_per_day=1)
+    await services._enqueue_due_routine_searches()
     assert len(await _jobs(clean_tables)) == 1
 
 
@@ -356,7 +393,7 @@ async def test_discovery_paused_stops_the_sweep(clean_tables: Database) -> None:
     await _seed_two_queries(clean_tables)
     async with clean_tables.transaction() as session:
         session.add(AppSetting(key=DISCOVERY_PAUSED_KEY, value={"paused": True}))
-    await _container(clean_tables)._enqueue_due_topic_searches()
+    await _container(clean_tables)._enqueue_due_routine_searches()
     assert await _jobs(clean_tables) == []
 
 
@@ -364,8 +401,132 @@ async def test_a_disabled_topic_is_never_swept(clean_tables: Database) -> None:
     await _seed_two_queries(clean_tables)
     async with clean_tables.transaction() as session:
         await session.execute(sa.update(DiscoveryTopic).values(enabled=False))
-    await _container(clean_tables)._enqueue_due_topic_searches()
+    await _container(clean_tables)._enqueue_due_routine_searches()
     assert await _jobs(clean_tables) == []
+
+
+# ---------------------------------------------------------------------------
+# Routine and semantic are separate schedules on separate budgets
+# ---------------------------------------------------------------------------
+async def test_the_routine_sweep_never_enqueues_a_semantic_query(
+    clean_tables: Database,
+) -> None:
+    """The single most expensive misconfiguration available here.
+
+    A semantic query on the routine cadence is a ten-times-the-price search run
+    ten times as often, and the answer it returns moves over weeks. The sweeps
+    filter on ``search_kind`` rather than sharing one list.
+    """
+    await _seed_two_queries(clean_tables)
+    await _seed_semantic_query(clean_tables)
+    services = _container(clean_tables)
+    await services._enqueue_due_routine_searches()
+
+    jobs = await _jobs(clean_tables)
+    assert len(jobs) == 2
+    assert all(job.payload["kind"] == "ROUTINE" for job in jobs)
+    assert all(job.payload["provider"] == "brave" for job in jobs)
+
+
+async def test_the_semantic_sweep_never_enqueues_a_routine_query(
+    clean_tables: Database,
+) -> None:
+    await _seed_two_queries(clean_tables)
+    await _seed_semantic_query(clean_tables)
+    services = _container(clean_tables)
+    await services._enqueue_due_semantic_searches()
+
+    jobs = await _jobs(clean_tables)
+    assert len(jobs) == 1
+    assert jobs[0].payload["kind"] == "SEMANTIC"
+    assert jobs[0].payload["provider"] == "exa"
+
+
+async def test_an_exhausted_routine_budget_does_not_stop_semantic_discovery(
+    clean_tables: Database,
+) -> None:
+    """Each provider has its own caps, its own ledger sums and its own lock.
+
+    Brave running out is not a reason to stop asking second-order questions,
+    and -- crucially in the other direction -- it is *not* a reason to start
+    asking them on Brave's behalf.
+    """
+    await _seed_two_queries(clean_tables)
+    await _seed_semantic_query(clean_tables)
+    services = _container(
+        clean_tables, brave_max_searches_per_day=0, brave_max_searches_per_month=0
+    )
+    await services._enqueue_due_routine_searches()
+    await services._enqueue_due_semantic_searches()
+
+    jobs = await _jobs(clean_tables)
+    assert len(jobs) == 1
+    assert jobs[0].payload["kind"] == "SEMANTIC"
+
+
+async def test_an_unavailable_routine_provider_does_not_fan_out_to_the_other(
+    clean_tables: Database,
+) -> None:
+    """**No automatic fallback between paid providers.**
+
+    Brave unconfigured means routine queries defer. It does not mean they get
+    answered by the provider that costs ten times as much -- that pattern is
+    how an outage becomes an invoice.
+    """
+    await _seed_two_queries(clean_tables)
+    await _seed_semantic_query(clean_tables)
+    services = _container(clean_tables, brave_api_key="")
+    assert services.brave is None
+
+    await services._enqueue_due_routine_searches()
+    await services._enqueue_due_semantic_searches()
+
+    jobs = await _jobs(clean_tables)
+    assert [job.payload["kind"] for job in jobs] == ["SEMANTIC"]
+
+
+async def test_the_semantic_floor_is_a_day_even_for_an_hourly_topic_row(
+    clean_tables: Database,
+) -> None:
+    """A restored backup asking for hourly semantic search gets a day."""
+    await _seed_semantic_query(clean_tables)
+    async with clean_tables.transaction() as session:
+        await session.execute(sa.update(DiscoveryTopic).values(interval_minutes=60))
+
+    services = _container(clean_tables)
+    await services._enqueue_due_semantic_searches()
+
+    queries = await _queries(clean_tables)
+    assert queries[0].next_eligible_at is not None
+    gap = queries[0].next_eligible_at - dt.datetime.now(dt.UTC)
+    assert gap > dt.timedelta(hours=23), gap
+
+
+async def test_a_query_pinned_to_an_unknown_provider_is_not_silently_rehomed(
+    clean_tables: Database,
+) -> None:
+    """A typo in a provider pin must not redirect a query onto a backend it was
+    deliberately kept off.  It resolves to ``none`` and the query does not run.
+    """
+    from stockbrain.jobs.handlers import build_query_plan
+
+    await _seed_two_queries(clean_tables)
+    async with clean_tables.transaction() as session:
+        await session.execute(sa.update(DiscoveryQuery).values(provider="bravo"))
+
+    settings = _settings(clean_tables)
+    async with clean_tables.session() as session:
+        row = (
+            await session.execute(
+                sa.select(DiscoveryQuery, DiscoveryTopic).join(
+                    DiscoveryTopic, DiscoveryTopic.id == DiscoveryQuery.topic_id
+                )
+            )
+        ).first()
+    assert row is not None
+    query, topic = row
+    plan = build_query_plan(query, topic, settings)
+    assert plan.provider_name.value == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -394,31 +555,96 @@ async def test_the_seeded_default_topics_cost_less_than_the_daily_cap(
             )
         ).all()
 
+    routine = [r for r in rows if r[0].search_kind is WebDiscoveryKind.ROUTINE]
+    semantic = [r for r in rows if r[0].search_kind is WebDiscoveryKind.SEMANTIC]
+
     searches_per_day = sum(
-        1440 / effective_topic_interval_minutes(topic.interval_minutes, settings)
-        for _, topic in rows
+        1440
+        / effective_query_interval_minutes(
+            topic.interval_minutes, WebDiscoveryKind.ROUTINE, settings
+        )
+        for _, topic in routine
     )
-    # Five enabled queries at twelve hours apiece: ten searches a day.
-    assert len(rows) == 5
+    # Five enabled routine queries at twelve hours apiece: ten searches a day.
+    assert len(routine) == 5
     assert searches_per_day == 10
-    assert searches_per_day <= settings.firecrawl_max_searches_per_day
+    assert searches_per_day <= settings.brave_max_searches_per_day
+    # And a long month of that stays inside the monthly cap, which is the
+    # constraint a daily cap alone cannot hold.
+    assert searches_per_day * 31 <= settings.brave_max_searches_per_month
 
-    # Two credits each with the default 5-per-source limit and two sources.
-    projected_credits = int(searches_per_day) * 2
-    projected_credits += settings.firecrawl_max_scrapes_per_day
-    assert projected_credits <= settings.firecrawl_daily_credit_cap
-    assert projected_credits * 31 <= settings.firecrawl_monthly_credit_cap
+    # The semantic topic ships disabled: it is the one that costs 1.4x a Brave
+    # search, and it should be switched on deliberately.
+    assert semantic == []
 
 
-async def test_the_seeded_result_limit_is_one_billing_block(
+async def test_the_seeded_semantic_topic_is_present_but_disabled(
     clean_tables: Database,
 ) -> None:
-    """Six results per source would be twelve billed results and 4 credits."""
+    """Present so an operator can see what it would ask; disabled so nobody
+    pays for it by installing the software."""
     async with clean_tables.transaction() as session:
         await seed_default_topics(session)
     async with clean_tables.session() as session:
-        limits = set((await session.execute(sa.select(DiscoveryTopic.result_limit))).scalars())
-    assert limits == {5}
+        rows = (
+            await session.execute(
+                sa.select(DiscoveryTopic, DiscoveryQuery)
+                .join(DiscoveryQuery, DiscoveryQuery.topic_id == DiscoveryTopic.id)
+                .where(DiscoveryTopic.slug == "second_order_exposure")
+            )
+        ).all()
+    assert rows
+    topic = rows[0][0]
+    assert topic.enabled is False
+    assert all(query.search_kind is WebDiscoveryKind.SEMANTIC for _, query in rows)
+    # They are questions, not keyword lists -- which is what an embedding index
+    # is for and what a keyword index handles worst.
+    assert any("benefit" in query.query for _, query in rows)
+
+
+async def test_the_seeded_semantic_topic_is_added_to_an_upgraded_database(
+    clean_tables: Database,
+) -> None:
+    """A deployment upgraded from Phase 9 already has the routine topics and
+    would never reach the seeder again, so the one genuinely new thing the
+    provider split introduces would otherwise never appear."""
+    from stockbrain.ingestion.topics import seed_semantic_topic
+
+    await _seed_two_queries(clean_tables)
+    async with clean_tables.transaction() as session:
+        assert await seed_default_topics(session) == 0
+        assert await seed_semantic_topic(session) is True
+        # Idempotent: a second run adds nothing.
+        assert await seed_semantic_topic(session) is False
+
+    async with clean_tables.session() as session:
+        slugs = set((await session.execute(sa.select(DiscoveryTopic.slug))).scalars())
+    assert slugs == {"ai_infrastructure", "second_order_exposure"}
+
+
+async def test_the_seeded_result_limit_is_within_the_configured_ceiling(
+    clean_tables: Database,
+) -> None:
+    """A topic row asking for a hundred results is a topic row asking for an
+    overage line on every search; the ceiling is applied as a reduction."""
+    from stockbrain.jobs.handlers import build_query_plan
+
+    async with clean_tables.transaction() as session:
+        await seed_default_topics(session)
+        await session.execute(sa.update(DiscoveryTopic).values(result_limit=100))
+
+    settings = _settings(clean_tables)
+    async with clean_tables.session() as session:
+        rows = (
+            await session.execute(
+                sa.select(DiscoveryQuery, DiscoveryTopic).join(
+                    DiscoveryTopic, DiscoveryTopic.id == DiscoveryQuery.topic_id
+                )
+            )
+        ).all()
+    for query, topic in rows:
+        plan = build_query_plan(query, topic, settings)
+        assert plan.query.limit <= 20
 
 
 def test_no_seeded_topic_asks_for_a_sub_hour_cadence() -> None:
@@ -428,4 +654,11 @@ def test_no_seeded_topic_asks_for_a_sub_hour_cadence() -> None:
     still be a seed that told the next reader 20 minutes was reasonable.
     """
     assert all(seed.interval_minutes >= 720 for seed in DEFAULT_TOPICS)
-    assert sum(1 for seed in DEFAULT_TOPICS if seed.enabled) == 2
+
+
+def test_no_seeded_semantic_topic_asks_for_a_sub_day_cadence() -> None:
+    assert all(
+        seed.interval_minutes >= 1440
+        for seed in DEFAULT_TOPICS
+        if seed.kind is WebDiscoveryKind.SEMANTIC
+    )

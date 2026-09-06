@@ -66,7 +66,7 @@ async def test_providers_endpoint_reports_every_provider(
     providers = {entry["provider"] for entry in body["providers"]}
     assert "postgres" in providers
     assert "trading212" in providers
-    assert len(providers) == 10
+    assert len(providers) == len(ProviderName)
 
 
 async def test_provider_health_is_persisted_at_startup(

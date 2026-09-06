@@ -157,10 +157,19 @@ def register_static_provider_states(settings: Settings, registry: ProviderHealth
     elif not alpaca_configured:
         registry.set_disabled(ProviderName.ALPACA_MARKET_DATA, "Alpaca credentials are not set")
 
-    if not settings.firecrawl_enabled:
-        registry.set_disabled(ProviderName.FIRECRAWL, "FIRECRAWL_ENABLED is false")
-    elif not settings.firecrawl_api_key.get_secret_value():
-        registry.set_disabled(ProviderName.FIRECRAWL, "FIRECRAWL_API_KEY is not set")
+    # Each provider reports the *first* reason it will not run, so the panel
+    # names one thing to fix rather than a list. The full list is available on
+    # the discovery endpoint.
+    if settings.brave_blockers:
+        registry.set_disabled(ProviderName.BRAVE, settings.brave_blockers[0])
+    if settings.exa_blockers:
+        registry.set_disabled(ProviderName.EXA, settings.exa_blockers[0])
+    if settings.firecrawl_blockers:
+        registry.set_disabled(ProviderName.FIRECRAWL, settings.firecrawl_blockers[0])
+    if settings.content_extraction_blockers:
+        registry.set_disabled(
+            ProviderName.CONTENT_EXTRACTION, settings.content_extraction_blockers[0]
+        )
 
     if not settings.sec_enabled:
         registry.set_disabled(ProviderName.SEC, "SEC_ENABLED is false")

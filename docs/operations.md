@@ -93,7 +93,7 @@ fault), `UNKNOWN` (configured, not yet checked).
 Expected combinations:
 
 ```
-Alpaca news DOWN + Firecrawl HEALTHY   → discovery DEGRADED, application DEGRADED
+Alpaca news DOWN + Brave HEALTHY       → discovery DEGRADED, application DEGRADED
 Trading 212 DOWN                       → execution unavailable, research healthy
 PostgreSQL DOWN                        → application DOWN / not ready
 ```
@@ -142,11 +142,11 @@ because "we have an authenticating reverse proxy" and "nobody ever set a
 password" look identical from the code's side. Every start logs
 `web_authentication_not_protecting` with the reason.
 
-## Firecrawl cost control
+## Web discovery cost control
 
-Firecrawl is the only provider that can spend real money on a schedule with
-nobody watching, and in Phase 2 it did. See `docs/sources.md` for the full
-incident reconstruction; the operational summary:
+Three providers can spend real money here, and in Phase 2 one of them did with
+nobody watching. See `docs/sources.md` for the full incident reconstruction and
+for every price quoted below; the operational summary:
 
 * **29 searches in 62 minutes** on 2026-09-05 (`firecrawl_activity_logs.csv`),
   then HTTP 402 for 127 consecutive jobs.
@@ -156,41 +156,116 @@ incident reconstruction; the operational summary:
 * Nothing in the system could have stopped it: the only accounting was an
   integer on a client object and a Prometheus counter.
 
-What protects it now:
+### Who does what
+
+| Role | Provider | Setting | Price (verified 2026-09-05) |
+|---|---|---|---|
+| Routine thematic web/news search | **Brave** | `WEB_DISCOVERY_ROUTINE_PROVIDER=brave` | $5 / 1,000 requests; $5/month free credit |
+| Semantic second-order search | **Exa** | `WEB_DISCOVERY_SEMANTIC_PROVIDER=exa` | $7 / 1,000 requests; $10/month free credit |
+| Page extraction | **local** (trafilatura) | `CONTENT_EXTRACTION_ENABLED=true` | free |
+| Difficult-page fallback | **Firecrawl** | `FIRECRAWL_FALLBACK_EXTRACTION_ENABLED` | 1 credit / page |
+
+Fast financial news is **not** on this list: Alpaca news and SEC EDGAR handle
+time-critical discovery and both are unmetered by comparison. Web discovery is
+for thematic and second-order developments a finance-only feed never carries.
+
+**There is no automatic fallback between the paid providers.** If Brave is
+unavailable, routine queries defer — they are not re-run on Exa. That is
+deliberate: `Brave fails → Exa called → Firecrawl scrapes → retries` is a cost
+multiplier triggered by an outage, at the moment a budget is least able to
+absorb it.
+
+### Getting the keys
+
+* **Brave** — <https://api-dashboard.search.brave.com/>. The "Search" plan. A
+  card is required for identity verification even on the credit-funded tier;
+  Brave states it will not be charged. Check the current terms for whether the
+  $5 monthly credit carries an attribution requirement (see the discrepancy
+  recorded in `docs/sources.md`). Set `BRAVE_API_KEY`.
+* **Exa** — <https://exa.ai/>. New accounts get $20 of credit and the free tier
+  adds $10/month. Set `EXA_API_KEY`.
+* **Firecrawl** — only if you want the paid fallback. Optional, and off.
+
+A provider with no key is simply DISABLED and says so; the rest of the
+application is unaffected.
+
+### What protects the budget
 
 | Control | Default | Where it lives |
 |---|---|---|
-| `FIRECRAWL_ENABLED` | **false** | a fresh deployment discovers via Alpaca + SEC |
-| Per-topic interval floor | 720 min | applied where the interval is *used*, so a topic row cannot go faster |
-| Searches/day | 12 | durable ledger, not a process counter |
-| Scrapes/day | 6 | second stage only, for results that survived triage |
-| Credits/day | 30 | estimated, then reconciled against the provider's `creditsUsed` |
-| Credits/month | 900 | the allowance is monthly; a daily cap alone cannot hold it |
-| Search `limit` | 5 **per source** | 5 × 2 sources = 10 results = exactly one 2-credit block |
-| Retries | none | a retry is a second *paid* call; the durable cooldown is the retry |
+| `WEB_DISCOVERY_ENABLED` | true | one switch turns off both search backends |
+| Routine cadence floor | 360 min | applied where the interval is *used*, so a topic row cannot go faster |
+| Semantic cadence floor | 1440 min | ten times the price for an answer that moves over weeks |
+| `BRAVE_MAX_SEARCHES_PER_DAY` | 12 | durable ledger, not a process counter |
+| `BRAVE_MAX_SEARCHES_PER_MONTH` | **320** | the binding one: the free credit is monthly |
+| `EXA_MAX_SEARCHES_PER_DAY` | 3 | a semantic answer moves over weeks |
+| `EXA_MAX_SEARCHES_PER_MONTH` | **70** | ≈$0.49 at the published price |
+| `CONTENT_EXTRACT_MAX_PER_DAY` | 60 | free, but a runaway sweep is still a runaway request rate |
+| `FIRECRAWL_ENABLED` | **false** | and `FIRECRAWL_FALLBACK_EXTRACTION_ENABLED` must *also* be true |
+| `FIRECRAWL_MAX_SCRAPES_PER_DAY` | 5 | only after a free attempt failed on a shortlisted URL |
+| `FIRECRAWL_MONTHLY_CREDIT_CAP` | 200 | inside a 1,000-credit allowance |
+| Retries | none, except Brave | Brave documents that failed requests are not billed; nothing else does |
 
-**The two-stage model.** A search asks for metadata only — title, URL, snippet,
-date. That is enough for URL deduplication, the deterministic source-category
-rules and the cheap DeepSeek classifier. Full article content is fetched
-separately, one page at a time, and only for a source whose event the classifier
-promoted to `CANDIDATE`. Passing `scrapeOptions` to a broad search was the single
-largest contributor to the incident: it turned a 4-credit search into a
-24-credit one.
+**Ceiling if every cap were reached every single day: $2.09/month**, against
+$15/month of free allowance. Expected steady-state spend at the shipped
+defaults — five routine queries at 12-hour intervals, the semantic topic
+disabled, Firecrawl off — is **$0.00**.
 
-**Budget exhaustion is not a failure.** Firecrawl reports degraded, Alpaca news
-continues, SEC EDGAR continues, already-ingested events keep being classified,
-research and broker reconciliation keep running. The daily window resets at UTC
-midnight on the **database** clock.
+### The cheap-first pipeline
 
-Read the state:
+A search asks for **metadata only** — title, URL, snippet, date. That is enough
+for URL deduplication, the deterministic source-category rules and the cheap
+DeepSeek classifier. A page body is fetched separately, one page at a time, and
+only for a source whose event the classifier promoted to `CANDIDATE`.
 
-```bash
-curl -s localhost:8080/api/v1/discovery/status | python3 -m json.tool | sed -n '/firecrawl/,/^  }/p'
+Passing `scrapeOptions` to a broad search was the single largest contributor to
+the incident — it turned a 4-credit search into a 24-credit one. Exa's
+`contents` is the same trap under another name, and `EXA_FETCH_CONTENTS` exists
+so that switching it on is visible. Both are off, and no scheduler sets either.
+
+Extraction runs **locally and free** for essentially every page. The paid
+Firecrawl fallback runs only when all of the following hold: the local attempt
+failed for a reason a different fetcher could plausibly fix (an HTTP error, a
+transport failure, or a 200 with almost no text — *not* a refusal or a PDF);
+both Firecrawl switches are on; the durable budget grants a reservation; and the
+URL has not been attempted before. One attempt per URL, ever, and no retry.
+
+### Enabling semantic discovery
+
+The `second_order_exposure` topic ships **disabled** — it is the one that costs
+1.4× a Brave search. To turn it on:
+
+```sql
+UPDATE discovery_topics SET enabled = true WHERE slug = 'second_order_exposure';
 ```
 
-It reports searches and credits used today and this month, the caps, remaining
-headroom, the last successful call, and per query: last run, last success,
-`next_eligible_at`, consecutive failures and lifetime credits. No API key.
+Four queries at a 24-hour cadence is 4 searches/day ≈ $0.028/day ≈ $0.87/month,
+which is inside the daily cap of 3 only if you also raise `EXA_MAX_SEARCHES_PER_DAY`
+or disable some of the queries. Decide which; the sweep will otherwise spend the
+day's allowance on the highest-priority queries and defer the rest, which is a
+safe outcome but probably not the intended one.
+
+### Reading the state
+
+**Budget exhaustion is not a failure.** The provider reports
+`BUDGET_EXHAUSTED` — a distinct status from `DEGRADED`, because a spending limit
+doing its job and a broken provider need different actions — and Alpaca news,
+SEC EDGAR, classification, research and broker reconciliation all keep running.
+The daily and monthly windows reset on the **database** clock.
+
+```bash
+curl -s localhost:8080/api/v1/discovery/status \
+  | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["web_discovery"], indent=2))'
+```
+
+It reports, per provider: status, blockers, searches and units used today and
+this month, the caps, remaining headroom, estimated cost, last call, last
+success and last error. Per query: kind, resolved provider, last run, last
+success, `next_eligible_at`, effective interval, consecutive failures and
+lifetime units. And for extraction: how many pages were read today, how many
+locally, how many through the paid fallback, and how many produced nothing.
+
+No API key appears in any of it.
 
 ## Foreign exchange
 
@@ -299,9 +374,9 @@ so at WARNING), and sweeps execution attempts stranded mid-flight: an attempt
 recorded as sent with no result becomes `EXECUTION_AMBIGUOUS` and is queued for
 reconciliation. **It is never resent.**
 
-Nothing in a restart re-runs a paid provider call. Firecrawl eligibility is a
+Nothing in a restart re-runs a paid provider call. Query eligibility is a
 committed `discovery_queries.next_eligible_at` column, so ten restarts in a row
-spend nothing; the Firecrawl budget is a table, so a restart does not forget
+spend nothing; every provider budget is a table, so a restart does not forget
 what today already cost.
 
 ### Host restart
@@ -552,7 +627,7 @@ curl -s localhost:8080/api/v1/discovery/status | python3 -m json.tool | sed -n '
 A stale claim is reclaimed automatically, subject to the same `max_attempts`
 budget so a job that reliably kills its worker cannot loop for ever. A job with
 no attempts left is marked `FAILED` rather than retried — which is why a
-Firecrawl search job carries `max_attempts=1`: reclaiming it would be a second
+web-discovery search job carries `max_attempts=1`: reclaiming it would be a second
 billable request.
 
 ## Operational alerts
@@ -569,7 +644,7 @@ unreachable — and a failed send is recorded and **never** auto-resent.
 | `RECONCILIATION_UNRESOLVED` | critical | 6h |
 | `QUEUE_STUCK` | warning | 2h |
 | `QUEUE_BACKLOG`, `PROVIDER_DOWN` | warning | 6h |
-| `DEAD_JOBS`, `TRADING_HALTED`, `FX_UNAVAILABLE`, `LLM_BUDGET_EXHAUSTED`, `FIRECRAWL_BUDGET_EXHAUSTED` | warning | 12h |
+| `DEAD_JOBS`, `TRADING_HALTED`, `FX_UNAVAILABLE`, `LLM_BUDGET_EXHAUSTED`, `DISCOVERY_BUDGET_EXHAUSTED` | warning | 12h |
 
 Suppression is the `notifications.dedupe_key` unique index carrying a window
 stamp — not a timestamp comparison in Python — so two workers cannot both
@@ -632,7 +707,7 @@ the order is roughly the order in which failing one is cheapest to discover.
 
 **Cost**
 
-- [ ] Firecrawl: enabled or not — decide deliberately. If enabled, the caps and
+- [ ] Web discovery: Brave and Exa keys set or not — decide deliberately. If set, the caps and
       the cadence in `/api/v1/discovery/status` are numbers you are willing to
       pay every day for a month.
 - [ ] LLM budgets reflect what you will actually accept

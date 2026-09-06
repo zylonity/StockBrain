@@ -1,9 +1,13 @@
-"""The durable Firecrawl budget, against a real PostgreSQL.
+"""The durable per-provider budget, against a real PostgreSQL.
 
 Phase 2's credit accounting was an integer on a client object and a Prometheus
 counter.  Neither survives a restart and neither can refuse a call, which is why
 twenty-nine searches emptied an allowance with nothing in the system able to
 stop them.  Every test here asserts a property that only a *table* can have.
+
+The ledger is now shared by every metered provider, so two properties are added
+to the Phase 9 set: a provider's caps are its own, and one provider's exhausted
+allowance neither blocks nor is blocked by another's.
 """
 
 from __future__ import annotations
@@ -17,10 +21,10 @@ import pytest
 import sqlalchemy as sa
 
 from stockbrain.db.models.sources import Source
-from stockbrain.db.models.system import FirecrawlCall
+from stockbrain.db.models.system import ProviderCall
 from stockbrain.db.session import Database
-from stockbrain.enums import FirecrawlCallKind, FirecrawlCallOutcome, SourceProvider
-from stockbrain.ingestion.firecrawl_budget import FirecrawlBudget
+from stockbrain.enums import ProviderCallKind, ProviderCallOutcome, SourceProvider
+from stockbrain.ingestion.provider_budget import ProviderCallBudget
 
 pytestmark = pytest.mark.integration
 
@@ -28,30 +32,35 @@ pytestmark = pytest.mark.integration
 def budget(
     database: Database,
     *,
+    provider: str = "firecrawl",
+    unit_label: str = "credits",
+    unit_cost_usd: Decimal | None = None,
     enabled: bool = True,
     searches: int = 3,
     scrapes: int = 2,
     daily: int = 100,
     monthly: int = 1000,
-) -> FirecrawlBudget:
-    return FirecrawlBudget(
+) -> ProviderCallBudget:
+    return ProviderCallBudget(
         database,
+        provider=provider,
+        unit_label=unit_label,
+        unit_cost_usd=unit_cost_usd,
         enabled=enabled,
         blockers=() if enabled else ("FIRECRAWL_ENABLED is false",),
         max_searches_per_day=searches,
         max_scrapes_per_day=scrapes,
-        daily_credit_cap=daily,
-        monthly_credit_cap=monthly,
+        daily_unit_cap=daily,
+        monthly_unit_cap=monthly,
     )
 
 
-async def _rows(database: Database) -> list[FirecrawlCall]:
+async def _rows(database: Database, provider: str | None = None) -> list[ProviderCall]:
     async with database.session() as session:
-        return list(
-            (
-                await session.execute(sa.select(FirecrawlCall).order_by(FirecrawlCall.reserved_at))
-            ).scalars()
-        )
+        stmt = sa.select(ProviderCall).order_by(ProviderCall.reserved_at)
+        if provider is not None:
+            stmt = stmt.where(ProviderCall.provider == provider)
+        return list((await session.execute(stmt)).scalars())
 
 
 # ---------------------------------------------------------------------------
@@ -67,19 +76,19 @@ async def test_a_reservation_is_committed_before_the_call(clean_tables: Database
     already have spent".
     """
     guard = budget(clean_tables)
-    reservation = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2)
+    reservation = await guard.reserve(ProviderCallKind.SEARCH, units_needed=2)
     assert reservation is not None
 
     rows = await _rows(clean_tables)
     assert len(rows) == 1
-    assert rows[0].outcome is FirecrawlCallOutcome.RESERVED
-    assert rows[0].credits_reserved == 2
+    assert rows[0].outcome is ProviderCallOutcome.RESERVED
+    assert rows[0].units_reserved == 2
     # Charged at the reservation before any answer arrives.
-    assert rows[0].credits_charged == 2
+    assert rows[0].units_charged == 2
     # And the budget already counts it, so a second caller cannot spend it too.
     state = await guard.state()
     assert state.today.searches == 1
-    assert state.today.credits == 2
+    assert state.today.units == 2
 
 
 async def test_an_unreconciled_reservation_is_charged_not_forgiven(
@@ -91,10 +100,10 @@ async def test_an_unreconciled_reservation_is_charged_not_forgiven(
     a killed worker leaves behind.
     """
     guard = budget(clean_tables)
-    await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4)
+    await guard.reserve(ProviderCallKind.SEARCH, units_needed=4)
     state = await guard.state()
-    assert state.today.credits == 4
-    assert state.today.reported_credits == 0
+    assert state.today.units == 4
+    assert state.today.reported_units == 0
 
 
 async def test_the_providers_own_number_wins_when_it_is_higher(
@@ -103,31 +112,38 @@ async def test_the_providers_own_number_wins_when_it_is_higher(
     """An estimate that is too low is the one failure a cost control cannot
     tolerate, so a larger ``creditsUsed`` is believed outright."""
     guard = budget(clean_tables)
-    reservation = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2)
+    reservation = await guard.reserve(ProviderCallKind.SEARCH, units_needed=2)
     assert reservation is not None
-    await guard.record_success(reservation, credits_reported=6, results_returned=30)
+    await guard.record_success(reservation, units_reported=6, results_returned=30)
     rows = await _rows(clean_tables)
-    assert rows[0].credits_charged == 6
-    assert rows[0].credits_reported == 6
+    assert rows[0].units_charged == 6
+    assert rows[0].units_reported == 6
 
 
 async def test_a_cheaper_call_is_honoured_down_to_the_floor(
     clean_tables: Database,
 ) -> None:
-    """A search returning three results costs one block, not four.
+    """A search returning three results costs what it cost, not what was
+    reserved.
 
-    But never zero: the request was processed, and processing is what is billed.
+    A ledger that systematically over-counts is a ledger an operator stops
+    reconciling against the invoice. But never zero: the request was processed,
+    and processing is what is billed.
     """
     guard = budget(clean_tables)
-    reservation = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4)
+    reservation = await guard.reserve(ProviderCallKind.SEARCH, units_needed=4)
     assert reservation is not None
-    await guard.record_success(reservation, credits_reported=2, results_returned=3)
-    assert (await _rows(clean_tables))[0].credits_charged == 2
+    await guard.record_success(reservation, units_reported=2, results_returned=3)
+    assert (await _rows(clean_tables))[0].units_charged == 2
 
-    second = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4)
+    second = await guard.reserve(ProviderCallKind.SEARCH, units_needed=4)
     assert second is not None
-    await guard.record_success(second, credits_reported=0, results_returned=0)
-    assert (await _rows(clean_tables))[1].credits_charged == 2
+    await guard.record_success(second, units_reported=0, results_returned=0)
+    # One unit, not zero. The floor is a flat unit now rather than Phase 9's
+    # two-credit Firecrawl search block: every call this system still makes --
+    # a Brave request, an Exa request, a Firecrawl scrape -- has a minimum
+    # billable size of one.
+    assert (await _rows(clean_tables))[1].units_charged == 1
 
 
 async def test_a_failed_call_still_costs_what_it_claimed(clean_tables: Database) -> None:
@@ -137,16 +153,16 @@ async def test_a_failed_call_still_costs_what_it_claimed(clean_tables: Database)
     failure costs what it reserved -- and that is also what stops a failing
     query from being retried into a second incident."""
     guard = budget(clean_tables)
-    reservation = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2)
+    reservation = await guard.reserve(ProviderCallKind.SEARCH, units_needed=2)
     assert reservation is not None
     await guard.record_failure(reservation, error_category="ProviderRateLimited", http_status=429)
 
     rows = await _rows(clean_tables)
-    assert rows[0].outcome is FirecrawlCallOutcome.FAILED
-    assert rows[0].credits_charged == 2
+    assert rows[0].outcome is ProviderCallOutcome.FAILED
+    assert rows[0].units_charged == 2
     assert rows[0].error_category == "ProviderRateLimited"
     assert rows[0].http_status == 429
-    assert (await guard.state()).today.credits == 2
+    assert (await guard.state()).today.units == 2
 
 
 async def test_only_a_class_name_is_stored_never_a_provider_body(
@@ -155,7 +171,7 @@ async def test_only_a_class_name_is_stored_never_a_provider_body(
     """A Firecrawl error body can echo the request, and the request carries an
     ``Authorization`` header. The category is what an operator triages on."""
     guard = budget(clean_tables)
-    reservation = await guard.reserve(FirecrawlCallKind.SCRAPE, credits_needed=1)
+    reservation = await guard.reserve(ProviderCallKind.SCRAPE, units_needed=1)
     assert reservation is not None
     await guard.record_failure(reservation, error_category="ProviderAuthError")
     row = (await _rows(clean_tables))[0]
@@ -169,9 +185,9 @@ async def test_only_a_class_name_is_stored_never_a_provider_body(
 # ---------------------------------------------------------------------------
 async def test_the_search_cap_refuses_the_next_search(clean_tables: Database) -> None:
     guard = budget(clean_tables, searches=2, daily=1000)
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is None
     assert len(await _rows(clean_tables)) == 2
 
 
@@ -183,9 +199,9 @@ async def test_a_full_scrape_cap_does_not_stop_a_search(clean_tables: Database) 
     metadata search may run.
     """
     guard = budget(clean_tables, searches=5, scrapes=1, daily=1000)
-    assert await guard.reserve(FirecrawlCallKind.SCRAPE, credits_needed=1) is not None
-    assert await guard.reserve(FirecrawlCallKind.SCRAPE, credits_needed=1) is None
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
+    assert await guard.reserve(ProviderCallKind.SCRAPE, units_needed=1) is not None
+    assert await guard.reserve(ProviderCallKind.SCRAPE, units_needed=1) is None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
 
 
 async def test_the_cost_of_this_call_is_checked_not_the_current_total(
@@ -193,10 +209,10 @@ async def test_the_cost_of_this_call_is_checked_not_the_current_total(
 ) -> None:
     """A five-credit call cannot slip through two credits of headroom."""
     guard = budget(clean_tables, searches=99, daily=6)
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4) is not None
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4) is None
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
-    assert (await guard.state()).today.credits == 6
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=4) is not None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=4) is None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
+    assert (await guard.state()).today.units == 6
 
 
 async def test_the_monthly_cap_refuses_even_with_daily_headroom(
@@ -204,8 +220,8 @@ async def test_the_monthly_cap_refuses_even_with_daily_headroom(
 ) -> None:
     """Firecrawl's allowance is monthly, so a daily cap alone cannot protect it."""
     guard = budget(clean_tables, searches=99, daily=1000, monthly=4)
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4) is not None
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=4) is not None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is None
     state = await guard.state()
     assert state.exhausted
     assert any("monthly cap" in reason for reason in state.exhausted_reasons)
@@ -217,7 +233,7 @@ async def test_a_disabled_budget_refuses_everything_and_writes_nothing(
     """Constructing the budget for a disabled provider is deliberate -- the GUI
     still shows yesterday's usage -- but it grants nothing."""
     guard = budget(clean_tables, enabled=False)
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is None
     assert len(await _rows(clean_tables)) == 0
 
 
@@ -236,7 +252,7 @@ async def test_two_workers_cannot_spend_the_last_credit_twice(
     """
     guard = budget(clean_tables, searches=3, daily=1000)
     results = await asyncio.gather(
-        *(guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) for _ in range(8))
+        *(guard.reserve(ProviderCallKind.SEARCH, units_needed=2) for _ in range(8))
     )
     granted = [item for item in results if item is not None]
     assert len(granted) == 3
@@ -251,11 +267,11 @@ async def test_concurrent_reservations_respect_a_credit_cap_too(
     calls are not all the same size."""
     guard = budget(clean_tables, searches=99, daily=10)
     results = await asyncio.gather(
-        *(guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4) for _ in range(6))
+        *(guard.reserve(ProviderCallKind.SEARCH, units_needed=4) for _ in range(6))
     )
     granted = [item for item in results if item is not None]
     assert len(granted) == 2
-    assert (await guard.state()).today.credits == 8
+    assert (await guard.state()).today.units == 8
 
 
 # ---------------------------------------------------------------------------
@@ -272,23 +288,23 @@ async def test_the_window_resets_on_the_utc_day_from_the_database_clock(
     hand itself a fresh day.
     """
     guard = budget(clean_tables, searches=2, daily=4)
-    reservation = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4)
+    reservation = await guard.reserve(ProviderCallKind.SEARCH, units_needed=4)
     assert reservation is not None
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is None
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is None
 
     async with clean_tables.transaction() as session:
         await session.execute(
-            sa.update(FirecrawlCall).values(
+            sa.update(ProviderCall).values(
                 reserved_at=sa.func.now() - dt.timedelta(days=1, hours=1)
             )
         )
 
     state = await guard.state()
     assert state.today.searches == 0
-    assert state.today.credits == 0
+    assert state.today.units == 0
     # Still inside the month, so the monthly total remembers it.
-    assert state.month.credits == 4
-    assert await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
+    assert state.month.units == 4
+    assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
 
 
 async def test_the_reported_window_boundaries_are_utc_midnight(
@@ -324,14 +340,14 @@ async def test_remaining_headroom_is_reported_and_never_negative(
     """A negative "remaining" would render as a nonsense number in the GUI and
     would invert the ``< limit`` comparisons a caller might build on it."""
     guard = budget(clean_tables, searches=1, scrapes=1, daily=2, monthly=2)
-    reservation = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=2)
+    reservation = await guard.reserve(ProviderCallKind.SEARCH, units_needed=2)
     assert reservation is not None
-    await guard.record_success(reservation, credits_reported=4)
+    await guard.record_success(reservation, units_reported=4)
 
     state = await guard.state()
     assert state.searches_remaining == 0
-    assert state.daily_credits_remaining == 0
-    assert state.monthly_credits_remaining == 0
+    assert state.daily_units_remaining == 0
+    assert state.monthly_units_remaining == 0
     assert state.search_exhausted
     assert state.scrape_exhausted
 
@@ -342,8 +358,8 @@ async def test_a_row_can_be_attributed_to_its_query_and_topic(
     """ "Which topic spent the allowance" has to be answerable afterwards."""
     guard = budget(clean_tables)
     reservation = await guard.reserve(
-        FirecrawlCallKind.SEARCH,
-        credits_needed=2,
+        ProviderCallKind.SEARCH,
+        units_needed=2,
         topic_slug="ai_infrastructure",
         requested_limit=5,
         requested_sources=["web", "news"],
@@ -361,21 +377,21 @@ async def test_a_scrape_row_records_its_target_and_page_count(
 ) -> None:
     guard = budget(clean_tables)
     reservation = await guard.reserve(
-        FirecrawlCallKind.SCRAPE,
-        credits_needed=1,
+        ProviderCallKind.SCRAPE,
+        units_needed=1,
         target_url="https://example.com/article",
         scrape_requested=True,
         source_id=None,
     )
     assert reservation is not None
-    await guard.record_success(reservation, credits_reported=None, pages_scraped=1)
+    await guard.record_success(reservation, units_reported=None, pages_scraped=1)
     row = (await _rows(clean_tables))[0]
-    assert row.kind is FirecrawlCallKind.SCRAPE
+    assert row.kind is ProviderCallKind.SCRAPE
     assert row.target_url == "https://example.com/article"
     assert row.pages_scraped == 1
     # /v2/scrape reports no creditsUsed, so the reservation stands.
-    assert row.credits_reported is None
-    assert row.credits_charged == 1
+    assert row.units_reported is None
+    assert row.units_charged == 1
 
 
 async def test_a_zero_credit_reservation_is_a_programming_error(
@@ -386,8 +402,8 @@ async def test_a_zero_credit_reservation_is_a_programming_error(
     Raised rather than tolerated: a caller that computed zero has a broken
     estimator, and silently letting it through would uncap that path.
     """
-    with pytest.raises(ValueError, match="at least one credit"):
-        await budget(clean_tables).reserve(FirecrawlCallKind.SEARCH, credits_needed=0)
+    with pytest.raises(ValueError, match="at least one unit"):
+        await budget(clean_tables).reserve(ProviderCallKind.SEARCH, units_needed=0)
 
 
 async def test_the_ledger_survives_a_new_budget_object(clean_tables: Database) -> None:
@@ -397,11 +413,11 @@ async def test_the_ledger_survives_a_new_budget_object(clean_tables: Database) -
     to live on the client.
     """
     first = budget(clean_tables, searches=2, daily=1000)
-    assert await first.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
-    assert await first.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is not None
+    assert await first.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
+    assert await first.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
 
     restarted = budget(clean_tables, searches=2, daily=1000)
-    assert await restarted.reserve(FirecrawlCallKind.SEARCH, credits_needed=2) is None
+    assert await restarted.reserve(ProviderCallKind.SEARCH, units_needed=2) is None
     assert (await restarted.state()).today.searches == 2
 
 
@@ -429,14 +445,14 @@ async def test_a_source_reference_survives_the_source_being_deleted(
 
     guard = budget(clean_tables)
     reservation = await guard.reserve(
-        FirecrawlCallKind.SCRAPE,
-        credits_needed=1,
+        ProviderCallKind.SCRAPE,
+        units_needed=1,
         source_id=source_id,
         target_url="https://example.com/article",
         scrape_requested=True,
     )
     assert reservation is not None
-    await guard.record_success(reservation, credits_reported=None, pages_scraped=1)
+    await guard.record_success(reservation, units_reported=None, pages_scraped=1)
 
     async with clean_tables.transaction() as session:
         await session.execute(sa.delete(Source).where(Source.id == source_id))
@@ -444,9 +460,9 @@ async def test_a_source_reference_survives_the_source_being_deleted(
     rows = await _rows(clean_tables)
     assert len(rows) == 1
     assert rows[0].source_id is None
-    assert rows[0].credits_charged == 1
+    assert rows[0].units_charged == 1
     assert rows[0].target_url == "https://example.com/article"
-    assert (await guard.state()).month.credits == 1
+    assert (await guard.state()).month.units == 1
 
 
 async def test_estimated_and_reported_credits_are_reported_separately(
@@ -458,14 +474,179 @@ async def test_estimated_and_reported_credits_are_reported_separately(
     estimator needs revisiting -- which is invisible if only one number is kept.
     """
     guard = budget(clean_tables)
-    first = await guard.reserve(FirecrawlCallKind.SEARCH, credits_needed=4)
-    second = await guard.reserve(FirecrawlCallKind.SCRAPE, credits_needed=1)
+    first = await guard.reserve(ProviderCallKind.SEARCH, units_needed=4)
+    second = await guard.reserve(ProviderCallKind.SCRAPE, units_needed=1)
     assert first is not None and second is not None
-    await guard.record_success(first, credits_reported=4, results_returned=20)
-    await guard.record_success(second, credits_reported=None, pages_scraped=1)
+    await guard.record_success(first, units_reported=4, results_returned=20)
+    await guard.record_success(second, units_reported=None, pages_scraped=1)
 
     state = await guard.state()
-    assert state.today.credits == 5
-    assert state.today.reported_credits == 4
+    assert state.today.units == 5
+    assert state.today.reported_units == 4
     assert state.today.pages_scraped == 1
-    assert Decimal(state.today.credits) >= Decimal(state.today.reported_credits)
+    assert Decimal(state.today.units) >= Decimal(state.today.reported_units)
+
+
+# ---------------------------------------------------------------------------
+# One ledger, several providers, no shared fate
+# ---------------------------------------------------------------------------
+async def test_each_provider_sums_only_its_own_rows(clean_tables: Database) -> None:
+    """The ledger is shared; the accounting is not.
+
+    A Brave request and a Firecrawl credit are different things and are never
+    added together -- which is why the column is ``units`` with a per-provider
+    label rather than ``credits``.
+    """
+    brave = budget(clean_tables, provider="brave", unit_label="requests", searches=5)
+    firecrawl = budget(clean_tables, provider="firecrawl", searches=5)
+
+    await brave.reserve(ProviderCallKind.SEARCH, units_needed=1)
+    await firecrawl.reserve(ProviderCallKind.SCRAPE, units_needed=4)
+
+    brave_state = await brave.state()
+    firecrawl_state = await firecrawl.state()
+    assert brave_state.today.searches == 1
+    assert brave_state.today.units == 1
+    assert brave_state.today.scrapes == 0
+    assert firecrawl_state.today.scrapes == 1
+    assert firecrawl_state.today.units == 4
+    assert firecrawl_state.today.searches == 0
+
+
+async def test_one_provider_exhausting_its_cap_does_not_refuse_another(
+    clean_tables: Database,
+) -> None:
+    """Budget exhaustion degrades one provider.
+
+    Alpaca news, SEC EDGAR and every other discovery path keep running, and so
+    does the other search backend -- which is the structural version of "a cost
+    control must not become an outage".
+    """
+    brave = budget(clean_tables, provider="brave", unit_label="requests", searches=1)
+    exa = budget(clean_tables, provider="exa", unit_label="requests", searches=1)
+
+    assert await brave.reserve(ProviderCallKind.SEARCH, units_needed=1) is not None
+    assert await brave.reserve(ProviderCallKind.SEARCH, units_needed=1) is None
+    # Exa is untouched by Brave's ceiling.
+    assert await exa.reserve(ProviderCallKind.SEARCH, units_needed=1) is not None
+
+
+async def test_a_dollar_price_is_recorded_where_the_provider_publishes_one(
+    clean_tables: Database,
+) -> None:
+    """Exa returns ``costDollars``; Brave and Firecrawl report nothing per call.
+
+    The charged figure is the larger of StockBrain's estimate and the
+    provider's own number, because an estimate that is too low is the one
+    failure mode a cost control cannot tolerate.
+    """
+    exa = budget(
+        clean_tables,
+        provider="exa",
+        unit_label="requests",
+        unit_cost_usd=Decimal("0.007"),
+    )
+    reservation = await exa.reserve(ProviderCallKind.SEARCH, units_needed=1)
+    assert reservation is not None
+    assert reservation.cost_usd_reserved == Decimal("0.007")
+
+    await exa.record_success(
+        reservation, units_reported=1, cost_usd_reported=Decimal("0.012"), results_returned=10
+    )
+    state = await exa.state()
+    assert state.today.cost_usd == Decimal("0.012000")
+
+
+async def test_a_provider_that_publishes_no_price_reports_none(
+    clean_tables: Database,
+) -> None:
+    """Firecrawl bills credits against a monthly allowance rather than dollars
+    per call.  Reporting an invented dollar figure would be worse than
+    reporting none, because the one table that exists to be believed would
+    contain a number nobody can check."""
+    firecrawl = budget(clean_tables, provider="firecrawl")
+    reservation = await firecrawl.reserve(ProviderCallKind.SCRAPE, units_needed=1)
+    assert reservation is not None
+    await firecrawl.record_success(reservation, pages_scraped=1)
+
+    rows = await _rows(clean_tables, "firecrawl")
+    assert rows[0].cost_usd_charged is None
+    assert (await firecrawl.state()).today.cost_usd == Decimal("0")
+
+
+async def test_a_refundable_failure_costs_nothing(clean_tables: Database) -> None:
+    """Brave documents that "only successful requests (non-error responses) are
+    counted against your quota and billed".
+
+    Charging for a call the provider says it did not bill would silently shrink
+    the allowance an operator actually has -- so the refund is honoured, but
+    only for the one provider that publishes the guarantee.
+    """
+    brave = budget(clean_tables, provider="brave", unit_label="requests", searches=5)
+    reservation = await brave.reserve(ProviderCallKind.SEARCH, units_needed=1)
+    assert reservation is not None
+    await brave.record_failure(reservation, error_category="ProviderRateLimited", refund=True)
+
+    state = await brave.state()
+    assert state.today.units == 0
+    # The row survives: what happened is still auditable, it simply cost nothing.
+    assert state.today.searches == 1
+    rows = await _rows(clean_tables, "brave")
+    assert rows[0].outcome is ProviderCallOutcome.FAILED
+    assert rows[0].units_charged == 0
+
+
+async def test_a_failure_is_charged_by_default(clean_tables: Database) -> None:
+    """Firecrawl charges for a request its infrastructure processed even when
+    the target answered an error, and no provider is assumed generous without
+    saying so in writing."""
+    firecrawl = budget(clean_tables, provider="firecrawl")
+    reservation = await firecrawl.reserve(ProviderCallKind.SCRAPE, units_needed=1)
+    assert reservation is not None
+    await firecrawl.record_failure(reservation, error_category="ProviderUnavailable")
+    assert (await firecrawl.state()).today.units == 1
+
+
+async def test_two_providers_do_not_serialise_behind_one_lock(
+    clean_tables: Database,
+) -> None:
+    """The advisory lock is keyed per provider.
+
+    Sharing one lock would make Brave's reservations queue behind Firecrawl's,
+    which is not a correctness bug but is a latency one -- and it would couple
+    two subsystems that must be able to fail independently.
+    """
+    brave = budget(clean_tables, provider="brave", unit_label="requests", searches=5)
+    exa = budget(clean_tables, provider="exa", unit_label="requests", searches=5)
+
+    granted = await asyncio.gather(
+        brave.reserve(ProviderCallKind.SEARCH, units_needed=1),
+        exa.reserve(ProviderCallKind.SEARCH, units_needed=1),
+    )
+    assert all(reservation is not None for reservation in granted)
+    assert {row.provider for row in await _rows(clean_tables)} == {"brave", "exa"}
+
+
+async def test_the_historical_firecrawl_rows_keep_their_provenance(
+    clean_tables: Database,
+) -> None:
+    """The Phase 2 incident's rows are the only record of what it cost.
+
+    They stay attributed to Firecrawl, and a Brave budget cannot see them --
+    which is also what stops the incident's spend being counted against a
+    provider that had nothing to do with it.
+    """
+    async with clean_tables.transaction() as session:
+        session.add(
+            ProviderCall(
+                provider="firecrawl",
+                kind=ProviderCallKind.SEARCH,
+                outcome=ProviderCallOutcome.FAILED,
+                units_reserved=24,
+                units_charged=24,
+                topic_slug="ai_infrastructure",
+            )
+        )
+
+    assert (await budget(clean_tables, provider="brave").state()).today.units == 0
+    assert (await budget(clean_tables, provider="firecrawl").state()).today.units == 24
