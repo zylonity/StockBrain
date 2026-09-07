@@ -196,8 +196,11 @@ def build_probe_plan(services: ServiceContainer) -> dict[ProviderName, Probe]:
             # request already in the codebase that asks it. Ingestion fetches
             # the same file on its own schedule, so once more per restart is
             # noise against that rather than new load.
-            tickers = await sec.company_tickers()
-            return f"{len(tickers)} company tickers"
+            companies = await sec.company_tickers()
+            # Both numbers, because they differ by more than two thousand and
+            # reporting only the first read as "SEC lost a quarter of the market".
+            symbols = sum(len(entry["tickers"]) for entry in companies.values())
+            return f"{len(companies)} companies, {symbols} tickers"
 
         plan[ProviderName.SEC] = probe_sec
 

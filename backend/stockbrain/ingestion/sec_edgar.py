@@ -27,7 +27,7 @@ from typing import Any
 
 from stockbrain.config import Settings
 from stockbrain.enums import SourceCategory, SourceProvider
-from stockbrain.errors import ProviderResponseError
+from stockbrain.errors import ProviderError, ProviderResponseError
 from stockbrain.httpclient import ProviderHttpClient, TokenBucket
 from stockbrain.ingestion.base import RawSourceDocument
 from stockbrain.logging import get_logger
@@ -160,6 +160,16 @@ class SecEdgarClient:
 
         This is the authoritative link between a filing and a market symbol; it
         is not a substitute for broker instrument resolution.
+
+        One CIK routinely owns several symbols -- share classes and the
+        ordinary/ADR pairs of foreign issuers -- so every one of them is kept in
+        ``tickers``.  Collapsing them cost 2,407 of EDGAR's 10,412 symbols and
+        left whichever sibling appeared last in the file as the company's only
+        name.  ``ticker`` remains the *first* symbol listed for the CIK, which is
+        stable across fetches in a way that "last one to overwrite" was not.
+
+        Callers going the other way want :meth:`ticker_to_cik`; a symbol lookup
+        must not be built by inverting this map.
         """
         payload = await self._www.get_json("/files/company_tickers.json")
         if not isinstance(payload, dict):
@@ -178,8 +188,69 @@ class SecEdgarClient:
                 cik = normalize_cik(raw_cik)
             except ValueError:
                 continue
-            mapping[cik] = {"cik": cik, "ticker": str(ticker).upper(), "title": title}
+            symbol = str(ticker).upper()
+            existing = mapping.get(cik)
+            if existing is None:
+                mapping[cik] = {
+                    "cik": cik,
+                    "ticker": symbol,
+                    "tickers": [symbol],
+                    "title": title,
+                }
+            elif symbol not in existing["tickers"]:
+                existing["tickers"].append(symbol)
         return mapping
+
+    async def ticker_to_cik(self) -> dict[str, str]:
+        """The same file as :meth:`company_tickers`, keyed the other way.
+
+        Not derivable from that method's result.  ``company_tickers.json`` has
+        one row per *ticker* and several tickers routinely share a CIK -- share
+        classes (GOOGL/GOOG/GOOGN) and the ordinary/ADR pairs of foreign issuers
+        (TSM/TSMWF, ASML/ASMLF).  Keying by CIK keeps one ticker per company and
+        silently drops the rest: 10,412 rows collapse to 8,005, and which of the
+        siblings survives is decided by file order.  A caller that starts from a
+        symbol needs every row, so this builds the reverse index from the payload
+        instead of inverting a lossy one.
+        """
+        payload = await self._www.get_json("/files/company_tickers.json")
+        if not isinstance(payload, dict):
+            raise ProviderResponseError("sec: company_tickers.json was not a JSON object")
+
+        mapping: dict[str, str] = {}
+        for entry in payload.values():
+            if not isinstance(entry, dict):
+                continue
+            ticker, raw_cik = entry.get("ticker"), entry.get("cik_str")
+            if not ticker or raw_cik is None:
+                continue
+            try:
+                mapping[str(ticker).upper()] = normalize_cik(raw_cik)
+            except ValueError:
+                continue
+        return mapping
+
+    async def company_concept(
+        self, cik: str | int, tag: str, *, taxonomy: str = "us-gaap"
+    ) -> dict[str, Any] | None:
+        """One XBRL concept's full reported history for one filer.
+
+        ``None`` rather than an exception when the filer has never reported the
+        tag: EDGAR answers 404 for that, it is the ordinary case across a list of
+        candidate tags, and it must not fail the concepts that did return.
+
+        Deliberately the per-concept endpoint and not ``companyfacts``: the
+        latter is one request but ships every tag the filer has ever used, which
+        for a large issuer is tens of megabytes to parse and discard.
+        """
+        padded = normalize_cik(cik)
+        try:
+            payload = await self._http.get_json(
+                f"/api/xbrl/companyconcept/CIK{padded}/{taxonomy}/{tag}.json"
+            )
+        except ProviderError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     async def submissions(self, cik: str | int) -> dict[str, Any]:
         padded = normalize_cik(cik)
