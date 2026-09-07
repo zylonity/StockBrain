@@ -31,6 +31,7 @@ from stockbrain.intelligence.tradingagents_adapter import (
     CONTEXT_TOOL,
     SYSTEM_POLICY,
     TradingAgentsResearchEngine,
+    debate_sequence,
 )
 from stockbrain.llm.openai_compat import parse_usage
 from stockbrain.llm.profiles import DEEPSEEK
@@ -249,10 +250,14 @@ async def test_actual_upstream_graph_role_routing_and_no_rediscovery(
         )
         engine = TradingAgentsResearchEngine(client)
         result = await engine.analyze(value, record_call=record, check_budget=allowed)
-    assert len(requests) == 7
+    # Derived from the engine's own debate length rather than pinned to a
+    # literal, so adding a rebuttal round does not silently stop checking the
+    # routing of every node that actually runs.
+    expected_roles = [role for _, role in debate_sequence(engine.debate_rounds)]
+    assert len(requests) == len(expected_roles)
     assert result.decision.action == "HOLD"
     assert {role for role, _ in result.reports} == set(ROLES) - {"trader"}
-    for role, body in zip(ROLES, requests, strict=True):
+    for role, body in zip(expected_roles, requests, strict=True):
         assert body["model"] == ("deepseek-v4-pro" if role in DEEP_ROLES else "deepseek-v4-flash")
         assert body["thinking"]["type"] == ("enabled" if role in DEEP_ROLES else "disabled")
         assert body["messages"][0]["content"].startswith(SYSTEM_POLICY)

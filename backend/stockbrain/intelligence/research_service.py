@@ -92,7 +92,7 @@ class ResearchService:
                 "sec" if fundamentals else "no_fundamentals_provider",
             ],
             "tools": ["read_research_context"],
-            "debate_rounds": 1,
+            "debate_rounds": getattr(engine, "debate_rounds", 1),
         }
         self.config_version = hashlib.sha256(
             json.dumps(self.config, sort_keys=True).encode()

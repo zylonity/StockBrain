@@ -141,6 +141,14 @@ exclude = ["^alembic/versions/"]
 module = ["tests.*"]
 disallow_untyped_defs = true
 
+# pandas and stockstats ship no type information. They are used in exactly one
+# place -- deriving technical indicators from bars already fetched -- and the
+# boundary is narrow: `compute_indicators` takes plain dicts and returns plain
+# floats, so nothing untyped escapes into the rest of the package.
+[[tool.mypy.overrides]]
+module = ["pandas", "pandas.*", "stockstats", "stockstats.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------

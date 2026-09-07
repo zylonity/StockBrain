@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import math
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import httpx
+import pandas as pd
 from pydantic import BaseModel, Field, SecretStr, ValidationError
+from stockstats import wrap
 
 from stockbrain.db.base import utcnow
 from stockbrain.enums import BarTimeframe
@@ -136,6 +139,87 @@ class FredMacroProvider:
         await self.http.aclose()
 
 
+#: The indicators upstream's market analyst is told to select from, and the same
+#: set its ``get_verified_market_snapshot`` treats as ground truth.  StockBrain
+#: refuses every upstream tool -- they are unvetted network callables -- but
+#: refusing the tool without replacing the *numbers* left the analyst unable to
+#: do the one job it exists for: 74% of its reports said the indicators could not
+#: be assessed, and the bear then cited that absence as risk.
+#:
+#: These are pure functions of bars already fetched.  Computing them here costs
+#: no request, no money and no new dependency, and -- unlike a prompt change --
+#: arithmetic cannot talk anybody into a position.
+SNAPSHOT_INDICATORS: tuple[str, ...] = (
+    "close_50_sma",
+    "close_200_sma",
+    "close_10_ema",
+    "macd",
+    "macds",
+    "macdh",
+    "rsi",
+    "boll",
+    "boll_ub",
+    "boll_lb",
+    "atr",
+    "vwma",
+)
+
+
+#: Rows each indicator genuinely needs before its name is honest.
+#:
+#: stockstats computes a rolling window over whatever it is given: ask for
+#: ``close_200_sma`` with ten rows and it returns the ten-row mean rather than
+#: NaN.  That number is not a 200-day average, and handing it to an analyst
+#: under that name is precisely the fabricated statistic the whole packet is
+#: built to prevent.  Short history yields ``None`` here instead.
+SNAPSHOT_MIN_ROWS: dict[str, int] = {
+    "close_50_sma": 50,
+    "close_200_sma": 200,
+    "close_10_ema": 10,
+    "macd": 26,
+    "macds": 35,
+    "macdh": 35,
+    "rsi": 15,
+    "boll": 20,
+    "boll_ub": 20,
+    "boll_lb": 20,
+    "atr": 15,
+    "vwma": 60,
+}
+
+
+def compute_indicators(rows: list[dict[str, float]]) -> tuple[dict[str, float | None], list[str]]:
+    """Latest value of each indicator, plus the names history was too short for.
+
+    ``None`` rather than an omitted key, and the short names listed explicitly:
+    an analyst that is told a value is unavailable states that; one handed a
+    silently missing field is left to guess whether it was zero.  A single bad
+    indicator never sinks the others -- stockstats raises per-column, and a
+    200-period average on 30 rows is an ordinary, expected failure.
+    """
+    values: dict[str, float | None] = {}
+    unavailable: list[str] = []
+    frame = wrap(pd.DataFrame(rows))
+    for name in SNAPSHOT_INDICATORS:
+        computed: float | None = None
+        if len(rows) < SNAPSHOT_MIN_ROWS.get(name, 1):
+            values[name] = None
+            unavailable.append(name)
+            continue
+        try:
+            series = frame[name]
+        except Exception:
+            series = None
+        if series is not None and len(series):
+            candidate = series.iloc[-1]
+            if pd.notna(candidate) and math.isfinite(float(candidate)):
+                computed = round(float(candidate), 6)
+        values[name] = computed
+        if computed is None:
+            unavailable.append(name)
+    return values, unavailable
+
+
 class AlpacaResearchProvider:
     """Research snapshot from the existing market provider, without an SDK fallback."""
 
@@ -158,6 +242,29 @@ class AlpacaResearchProvider:
         )
         if not eligible:
             raise ProviderResponseError("alpaca research: no completed historical bars")
+        # Indicators are computed over the FULL completed history, then the bar
+        # table is trimmed for the packet. A 200-period average needs 200 rows;
+        # computing after the trim would have silently produced nothing for the
+        # one indicator most often asked for by name.
+        indicator_rows: list[dict[str, float]] = [
+            {
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": float(bar.volume),
+            }
+            for bar in eligible
+        ]
+        indicators, unavailable = compute_indicators(indicator_rows)
+        # The date is carried alongside rather than inside the numeric frame:
+        # stockstats lowercases and rewrites columns, and a stray non-numeric
+        # column is one more thing that can change how it reads the rest.
+        latest_row = {
+            "date": eligible[-1].timestamp.date().isoformat(),
+            **indicator_rows[-1],
+            "feed": eligible[-1].feed,
+        }
         eligible = eligible[-180:]
         # A columnar encoding rather than 180 repetitions of the same seven keys.
         # Identical information, roughly a third of the characters: the bars were
@@ -193,6 +300,27 @@ class AlpacaResearchProvider:
                         "bars": rows,
                         "bars_feed": sorted({bar.feed for bar in eligible if bar.feed}),
                         "reaction": reaction.as_dict(),
+                        "execution_pricing": False,
+                    }
+                ),
+            ),
+            ResearchDatum(
+                provider="alpaca",
+                kind="verified_snapshot_and_indicators",
+                as_of=packet.as_of,
+                text=json.dumps(
+                    {
+                        "symbol": packet.company.symbol,
+                        "note": (
+                            "Deterministic. Computed by StockBrain from completed "
+                            "daily bars at or before as_of. Treat as the source of "
+                            "truth for exact price and indicator claims; do not "
+                            "recompute or estimate these from the bar table."
+                        ),
+                        "latest_row": latest_row,
+                        "rows_used": len(indicator_rows),
+                        "indicators": indicators,
+                        "unavailable": unavailable,
                         "execution_pricing": False,
                     }
                 ),

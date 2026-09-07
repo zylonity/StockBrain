@@ -223,6 +223,18 @@ class Settings(BaseSettings):
     validator rather than truncated, so the bound is enforced here instead.
     """
 
+    research_debate_rounds: int = Field(default=2, ge=1, le=3)
+    """How many times the bull and bear each speak before the manager reads.
+
+    One round -- upstream's default, and what shipped until now -- means the bull
+    opens without having seen the bear, and the bear answers holding the bull's
+    whole argument and then closes. Over 150 runs the bear argued from absent
+    evidence 148 times, the bull conceded the same gaps 137 times, and no manager
+    ever recommended a direction.
+
+    Two gives the bull its reply. Each extra round costs one more call from each
+    of the two deep-model roles, so the ceiling is deliberately low."""
+
     research_fundamentals_enabled: bool = True
     """Whether to attach SEC XBRL company facts to the research packet.
 

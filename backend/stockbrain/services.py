@@ -509,6 +509,7 @@ class ServiceContainer:
                     self.research_transport,
                     quick_model=settings.active_llm_quick_model,
                     deep_model=settings.active_llm_deep_model,
+                    debate_rounds=settings.research_debate_rounds,
                 )
                 if settings.fred_api_key.get_secret_value():
                     self.fred = FredMacroProvider(settings.fred_api_key)
