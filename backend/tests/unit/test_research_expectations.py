@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from collections.abc import Callable
 
 import httpx
 import pytest
 
 from stockbrain.errors import ProviderResponseError
 from stockbrain.httpclient import ProviderHttpClient
+from stockbrain.intelligence.research import ResearchPacket
 from stockbrain.intelligence.research_expectations import (
     POLYMARKET_TOPICS,
     FinnhubExpectationsProvider,
@@ -20,8 +22,11 @@ from tests.research_helpers import packet
 
 NOW = dt.datetime(2026, 9, 4, 12, tzinfo=dt.UTC)
 
+#: A MockTransport handler: httpx types these as plain callables.
+Handler = Callable[[httpx.Request], httpx.Response]
 
-def _packet(as_of: dt.datetime = NOW):
+
+def _packet(as_of: dt.datetime = NOW) -> ResearchPacket:
     return packet().model_copy(update={"as_of": as_of, "event_time": as_of - dt.timedelta(hours=1)})
 
 
@@ -105,7 +110,7 @@ def _finnhub_payloads() -> dict[str, object]:
     }
 
 
-def _finnhub(handler) -> FinnhubExpectationsProvider:
+def _finnhub(handler: Handler) -> FinnhubExpectationsProvider:
     return FinnhubExpectationsProvider(
         ProviderHttpClient(
             provider="finnhub",

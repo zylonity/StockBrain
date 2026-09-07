@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 import httpx
 import pytest
@@ -94,11 +95,14 @@ def _facts(unit: str = "USD") -> dict[str, object]:
     }
 
 
+#: A MockTransport handler: httpx types these as plain callables.
+Handler = Callable[[httpx.Request], httpx.Response]
+
 _DEFAULT_MAP = {"AAPL": "0000320193"}
 
 
 def _provider(
-    handler: object, symbol_map: dict[str, str] | None = None
+    handler: Handler, symbol_map: dict[str, str] | None = None
 ) -> tuple[SecXbrlFundamentalsProvider, SecEdgarClient]:
     """A real EDGAR client over a mock transport, so URL shape and CIK padding
     are exercised rather than stubbed."""

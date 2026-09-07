@@ -5,16 +5,18 @@ from __future__ import annotations
 import datetime as dt
 import json
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
 from stockbrain.enums import BarTimeframe
 from stockbrain.errors import ProviderResponseError
+from stockbrain.intelligence.research import ResearchDatum
 from stockbrain.intelligence.research_data import (
     SNAPSHOT_INDICATORS,
     AlpacaResearchProvider,
 )
-from stockbrain.market_data.base import Bar
+from stockbrain.market_data.base import Bar, ProviderCapability, Quote, Trade
 from tests.research_helpers import packet
 
 
@@ -27,7 +29,13 @@ class _Bars:
         self.count = count
 
     async def bars(
-        self, symbol: str, timeframe: BarTimeframe, start, end, *, limit=None
+        self,
+        symbol: str,
+        timeframe: BarTimeframe,
+        start: dt.datetime,
+        end: dt.datetime,
+        *,
+        limit: int | None = None,
     ) -> list[Bar]:
         if timeframe is BarTimeframe.MIN_1:
             return []
@@ -49,23 +57,24 @@ class _Bars:
             )
         return out
 
-    async def latest_quote(self, symbol: str):
+    async def latest_quote(self, symbol: str) -> Quote:
         raise ProviderResponseError("no quote")
 
-    async def latest_trade(self, symbol: str):
+    async def latest_trade(self, symbol: str) -> Trade:
         raise ProviderResponseError("no trade")
 
-    async def capability(self, *, refresh: bool = False):
+    async def capability(self, *, refresh: bool = False) -> ProviderCapability:
         raise ProviderResponseError("n/a")
 
     async def aclose(self) -> None:
         pass
 
 
-def _snapshot(data) -> dict:
+def _snapshot(data: tuple[ResearchDatum, ...]) -> dict[str, Any]:
     for datum in data:
         if datum.kind == "verified_snapshot_and_indicators":
-            return json.loads(datum.text)
+            body: dict[str, Any] = json.loads(datum.text)
+            return body
     raise AssertionError("no snapshot datum produced")
 
 
