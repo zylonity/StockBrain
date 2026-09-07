@@ -223,6 +223,30 @@ class Settings(BaseSettings):
     validator rather than truncated, so the bound is enforced here instead.
     """
 
+    finnhub_api_key: SecretStr = SecretStr("")
+    finnhub_base_url: str = "https://finnhub.io/api/v1"
+    finnhub_enabled: bool = True
+    """Analyst ratings and their direction of travel, insider Form 4 activity, and
+    the estimate-vs-actual record. Free tier, and the only free source measured
+    with complete coverage of foreign listings. Without a key it is simply not
+    constructed and research degrades that provider alone."""
+
+    polymarket_enabled: bool = True
+    polymarket_base_url: str = "https://gamma-api.polymarket.com"
+    """Crowd-implied probabilities for the rate path, inflation and recession.
+
+    Keyless, and macro *only*: single-stock prediction markets are excluded on
+    purpose, because a market on where a security closes is the crowd forecasting
+    the very thing the research run exists to forecast."""
+
+    yfinance_targets_enabled: bool = True
+    """Consensus price targets and forward EPS via yfinance.
+
+    Unofficial: it rides Yahoo's undocumented endpoints with no key, no SLA and no
+    stability promise. It is here because it is the only free source of price
+    targets that covers ASML and VWAGY, and it is built to be the provider that
+    fails -- every call is wrapped and a failure degrades this datum alone."""
+
     research_debate_rounds: int = Field(default=2, ge=1, le=3)
     """How many times the bull and bear each speak before the manager reads.
 

@@ -64,6 +64,9 @@ class ResearchService:
         macro: MacroDataProvider | None = None,
         supplemental: SupplementalResearchProvider | None = None,
         fundamentals: SupplementalResearchProvider | None = None,
+        expectations: SupplementalResearchProvider | None = None,
+        targets: SupplementalResearchProvider | None = None,
+        macro_markets: MacroDataProvider | None = None,
     ) -> None:
         self.database = database
         self.engine = engine
@@ -75,6 +78,9 @@ class ResearchService:
         self.macro = macro
         self.supplemental = supplemental
         self.fundamentals = fundamentals
+        self.expectations = expectations
+        self.targets = targets
+        self.macro_markets = macro_markets
         self.queue = JobQueue()
         self.telemetry = LlmTelemetry()
         self.config = {
@@ -90,6 +96,9 @@ class ResearchService:
                 "alpaca" if supplemental else "no_market_provider",
                 "fred" if macro else "no_macro_provider",
                 "sec" if fundamentals else "no_fundamentals_provider",
+                "finnhub" if expectations else "no_expectations_provider",
+                "yfinance" if targets else "no_targets_provider",
+                "polymarket" if macro_markets else "no_macro_markets_provider",
             ],
             "tools": ["read_research_context"],
             "debate_rounds": getattr(engine, "debate_rounds", 1),
@@ -480,6 +489,9 @@ class ResearchService:
             ("fred", self.macro, lambda: self.macro.context(packet.as_of)),  # type: ignore[union-attr]
             ("alpaca", self.supplemental, lambda: self.supplemental.context(packet)),  # type: ignore[union-attr]
             ("sec", self.fundamentals, lambda: self.fundamentals.context(packet)),  # type: ignore[union-attr]
+            ("finnhub", self.expectations, lambda: self.expectations.context(packet)),  # type: ignore[union-attr]
+            ("yfinance", self.targets, lambda: self.targets.context(packet)),  # type: ignore[union-attr]
+            ("polymarket", self.macro_markets, lambda: self.macro_markets.context(packet.as_of)),  # type: ignore[union-attr]
         )
         for name, provider, fetch in sources:
             if provider is None:

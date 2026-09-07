@@ -146,7 +146,7 @@ disallow_untyped_defs = true
 # boundary is narrow: `compute_indicators` takes plain dicts and returns plain
 # floats, so nothing untyped escapes into the rest of the package.
 [[tool.mypy.overrides]]
-module = ["pandas", "pandas.*", "stockstats", "stockstats.*"]
+module = ["pandas", "pandas.*", "stockstats", "stockstats.*", "yfinance", "yfinance.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,7 @@ from stockbrain.extraction.firecrawl import FirecrawlContentExtractor
 from stockbrain.extraction.local import LocalContentExtractor
 from stockbrain.fx.base import FxRateProvider
 from stockbrain.fx.service import FxService, build_fx_provider
+from stockbrain.httpclient import ProviderHttpClient, TokenBucket
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
 from stockbrain.ingestion.brave import BraveSearchClient
 from stockbrain.ingestion.exa import ExaSearchClient
@@ -73,6 +74,11 @@ from stockbrain.intelligence.research_data import (
     AlpacaResearchProvider,
     FredMacroProvider,
     SecXbrlFundamentalsProvider,
+)
+from stockbrain.intelligence.research_expectations import (
+    FinnhubExpectationsProvider,
+    PolymarketMacroProvider,
+    YFinanceTargetsProvider,
 )
 from stockbrain.intelligence.research_service import ResearchService
 from stockbrain.intelligence.research_transport import ResearchTransport
@@ -527,6 +533,28 @@ class ServiceContainer:
                     # that keeps this process under SEC's per-IP ceiling.
                     fundamentals=SecXbrlFundamentalsProvider(self.sec)
                     if self.sec and settings.research_fundamentals_enabled
+                    else None,
+                    expectations=FinnhubExpectationsProvider(
+                        ProviderHttpClient(
+                            provider="finnhub",
+                            base_url=settings.finnhub_base_url,
+                            rate_limiter=TokenBucket(1.0, burst=5),
+                        ),
+                        api_key=settings.finnhub_api_key.get_secret_value(),
+                    )
+                    if settings.finnhub_enabled and settings.finnhub_api_key.get_secret_value()
+                    else None,
+                    targets=YFinanceTargetsProvider()
+                    if settings.yfinance_targets_enabled
+                    else None,
+                    macro_markets=PolymarketMacroProvider(
+                        ProviderHttpClient(
+                            provider="polymarket",
+                            base_url=settings.polymarket_base_url,
+                            rate_limiter=TokenBucket(1.0, burst=3),
+                        )
+                    )
+                    if settings.polymarket_enabled
                     else None,
                     timeout_seconds=settings.research_timeout_seconds,
                     max_tokens=settings.research_max_output_tokens,
