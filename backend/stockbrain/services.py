@@ -69,7 +69,11 @@ from stockbrain.ingestion.topics import seed_default_topics, seed_semantic_topic
 from stockbrain.ingestion.web_search import WebDiscoveryProvider
 from stockbrain.instruments.service import ResolutionService
 from stockbrain.intelligence.classifier import EventClassifier
-from stockbrain.intelligence.research_data import AlpacaResearchProvider, FredMacroProvider
+from stockbrain.intelligence.research_data import (
+    AlpacaResearchProvider,
+    FredMacroProvider,
+    SecXbrlFundamentalsProvider,
+)
 from stockbrain.intelligence.research_service import ResearchService
 from stockbrain.intelligence.research_transport import ResearchTransport
 from stockbrain.intelligence.semantic_dedupe import SemanticDeduplicator
@@ -518,8 +522,14 @@ class ServiceContainer:
                     supplemental=AlpacaResearchProvider(self.market_data)
                     if self.market_data
                     else None,
+                    # Shares the EDGAR client, and therefore the one token bucket
+                    # that keeps this process under SEC's per-IP ceiling.
+                    fundamentals=SecXbrlFundamentalsProvider(self.sec)
+                    if self.sec and settings.research_fundamentals_enabled
+                    else None,
                     timeout_seconds=settings.research_timeout_seconds,
                     max_tokens=settings.research_max_output_tokens,
+                    evidence_chars=settings.research_evidence_chars,
                 )
                 self.health.record(
                     ProviderName.TRADINGAGENTS,

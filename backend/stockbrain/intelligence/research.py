@@ -159,7 +159,13 @@ class ResearchPacket(FrozenModel):
 
 def fence(value: str) -> str:
     # Escaping prevents a source from closing the fence or introducing prompt tags.
-    return "<untrusted_document>\n" + html.escape(value, quote=True) + "\n</untrusted_document>"
+    #
+    # ``quote=False`` on purpose. Only ``&``, ``<`` and ``>`` can form a tag or a
+    # closing fence, and those stay escaped; ``"`` and ``'`` are dangerous only
+    # inside an HTML *attribute*, which no fenced payload is ever interpolated
+    # into. Escaping them cost 6 characters per quote in a JSON dump -- roughly a
+    # 1.9x inflation of the whole packet -- which was spent on every role call.
+    return "<untrusted_document>\n" + html.escape(value, quote=False) + "\n</untrusted_document>"
 
 
 def public_text(value: object) -> str:

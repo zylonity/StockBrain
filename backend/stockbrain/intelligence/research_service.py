@@ -13,7 +13,9 @@ import datetime as dt
 import hashlib
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
@@ -58,8 +60,10 @@ class ResearchService:
         models: dict[str, str],
         timeout_seconds: float = 600,
         max_tokens: int = 3000,
+        evidence_chars: int = 12000,
         macro: MacroDataProvider | None = None,
         supplemental: SupplementalResearchProvider | None = None,
+        fundamentals: SupplementalResearchProvider | None = None,
     ) -> None:
         self.database = database
         self.engine = engine
@@ -67,8 +71,10 @@ class ResearchService:
         self.health = health
         self.models = models
         self.timeout = timeout_seconds
+        self.evidence_chars = evidence_chars
         self.macro = macro
         self.supplemental = supplemental
+        self.fundamentals = fundamentals
         self.queue = JobQueue()
         self.telemetry = LlmTelemetry()
         self.config = {
@@ -76,9 +82,14 @@ class ResearchService:
             "prompt_version": PROMPT_VERSION,
             "upstream": UPSTREAM_COMMIT,
             "max_tokens": max_tokens,
+            # Part of the config version on purpose: a run that saw 1600
+            # characters of an article and one that saw 12000 are not the same
+            # analysis, and the second must not dedupe against the first.
+            "evidence_chars": evidence_chars,
             "providers": [
                 "alpaca" if supplemental else "no_market_provider",
                 "fred" if macro else "no_macro_provider",
+                "sec" if fundamentals else "no_fundamentals_provider",
             ],
             "tools": ["read_research_context"],
             "debate_rounds": 1,
@@ -171,8 +182,11 @@ class ResearchService:
                         url=source.canonical_url,
                         published_at=source.published_at,
                         received_at=source.received_at,
-                        text=(source.normalized_text or source.headline or "")[:1600],
-                        text_truncated=len(source.normalized_text or source.headline or "") > 1600,
+                        text=(source.normalized_text or source.headline or "")[
+                            : self.evidence_chars
+                        ],
+                        text_truncated=len(source.normalized_text or source.headline or "")
+                        > self.evidence_chars,
                         relationship=relationship.value,
                     )
                     for source, relationship in sources
@@ -458,7 +472,16 @@ class ResearchService:
     async def _enrich(self, packet: ResearchPacket) -> ResearchPacket:
         data = list(packet.market_context)
         degraded = list(packet.degradation)
-        for name, provider in (("fred", self.macro), ("alpaca", self.supplemental)):
+        # Each entry is (name, configured provider, how to ask it for context).
+        # Keeping the call as a thunk is what lets the macro provider take an
+        # instant and the packet-scoped ones take a packet without the loop body
+        # having to know which is which.
+        sources: tuple[tuple[str, object | None, Callable[[], Awaitable[Any]]], ...] = (
+            ("fred", self.macro, lambda: self.macro.context(packet.as_of)),  # type: ignore[union-attr]
+            ("alpaca", self.supplemental, lambda: self.supplemental.context(packet)),  # type: ignore[union-attr]
+            ("sec", self.fundamentals, lambda: self.fundamentals.context(packet)),  # type: ignore[union-attr]
+        )
+        for name, provider, fetch in sources:
             if provider is None:
                 degraded.append(
                     ProviderDegradation(
@@ -469,13 +492,7 @@ class ResearchService:
                 )
                 continue
             try:
-                context = (
-                    await self.macro.context(packet.as_of)
-                    if name == "fred" and self.macro
-                    else await self.supplemental.context(packet)
-                    if self.supplemental
-                    else ()
-                )
+                context = await fetch()
                 # Validate a replacement provider's output before adding it, so a
                 # malformed/future-dated optional result degrades only that provider.
                 ResearchPacket.model_validate(
@@ -484,6 +501,11 @@ class ResearchService:
                 data.extend(context)
                 if name == "fred":
                     self.health.record(ProviderName.FRED, ProviderStatus.HEALTHY)
+                # SEC health is deliberately not recorded from here. The common
+                # failure is "this listing does not file with the SEC", which is
+                # a property of the company, not an outage; reporting it as
+                # DEGRADED would make the health panel blame a provider that is
+                # answering correctly. Ingestion still probes SEC for real.
             except (ProviderError, ValueError) as exc:
                 degraded.append(
                     ProviderDegradation(

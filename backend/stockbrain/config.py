@@ -210,6 +210,26 @@ class Settings(BaseSettings):
     research_timeout_seconds: float = Field(default=600, ge=30, le=3600)
     research_max_output_tokens: int = Field(default=3000, ge=256, le=16000)
 
+    research_evidence_chars: int = Field(default=12000, ge=500, le=20000)
+    """How much of each evidence document reaches the researcher.
+
+    This was hard-coded at 1600, which is a headline and a lead paragraph.  The
+    analysts were told not to invent figures and then handed a document with the
+    figures cut off, so "insufficient evidence" was the only honest verdict
+    available to them and every thesis came back HOLD or NO_ACTION.
+
+    The ceiling is :class:`~stockbrain.intelligence.research.EvidenceDocument`'s
+    own ``max_length``; a larger value would be silently refused by the packet
+    validator rather than truncated, so the bound is enforced here instead.
+    """
+
+    research_fundamentals_enabled: bool = True
+    """Whether to attach SEC XBRL company facts to the research packet.
+
+    Free, keyless and rate-limited alongside the existing EDGAR client.  Only US
+    filers and foreign private issuers that file XBRL are covered; everything
+    else degrades explicitly, exactly as a missing price history does."""
+
     # ------------------------------------------------------------------
     # LLM backend selection
     #
