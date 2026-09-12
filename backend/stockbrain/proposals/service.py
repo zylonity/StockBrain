@@ -617,6 +617,14 @@ class ProposalService:
                 fx=fx,
                 now=moment,
             )
+            # An exit reuses the origin thesis, so ``_build_proposal`` derives
+            # the same ``dedupe_key`` the opening BUY already holds -- a plain
+            # UNIQUE column -- and the insert would be swallowed as a duplicate.
+            # The key guards a *redelivered generation job*, and an exit is not
+            # one; the active-proposal partial index is what keeps a live exit
+            # from being proposed twice, and a lapsed exit must be
+            # re-proposable.
+            proposal.dedupe_key = None
             # Why this proposal exists, in the fields the GUI and Telegram
             # already render.
             proposal.sizing_reasons = [
@@ -1023,6 +1031,7 @@ class ProposalService:
                     TradeProposal.side == OrderSide.BUY,
                     TradeProposal.status == ProposalStatus.EXECUTED,
                     TradeProposal.thesis_id.is_not(None),
+                    TradeProposal.executed_at.is_not(None),
                 )
                 .order_by(TradeProposal.executed_at.desc())
                 .limit(1)

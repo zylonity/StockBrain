@@ -163,13 +163,14 @@ async def _seed_executed_buy(
     *,
     broker_ticker: str = "AAPL_US_EQ",
     quantity: Decimal = Decimal("9"),
+    dedupe_key: str | None = None,
 ) -> _ExecutedBuy:
     """Seed a funded, held position and the executed BUY proposal that opened it.
 
-    The research chain is ``proposal_helpers``' healthy world; only the final
-    proposal is written directly, because an exit reuses the opening thesis and
-    the ordinary generation path would give that row the same dedupe key an
-    exit proposes under.
+    The research chain is ``proposal_helpers``' healthy world; the final
+    proposal is written directly.  ``dedupe_key`` defaults to ``None`` so the
+    inherited-thesis test starts from a clean slate; the coexistence regression
+    passes the key the ordinary generation path would have stored.
     """
     await ph.seed(database)
     await ph.fund(database, positions={broker_ticker: (quantity, quantity)})
@@ -194,6 +195,7 @@ async def _seed_executed_buy(
         status=ProposalStatus.EXECUTED,
         executed_at=moment,
         expires_at=moment + dt.timedelta(days=1),
+        dedupe_key=dedupe_key,
     )
     async with database.transaction() as session:
         session.add(proposal)
@@ -228,6 +230,43 @@ async def test_an_exit_proposal_inherits_the_origin_thesis(clean_tables: Databas
     assert proposal.side is OrderSide.SELL
     assert {item["reason"] for item in proposal.sizing_reasons} >= {signal.reason}
     assert any(rule["rule_id"] == "hard_stop" for rule in proposal.risk_rules)
+
+
+async def test_an_exit_proposal_coexists_with_its_origin_buy(clean_tables: Database) -> None:
+    """A real executed buy keeps its dedupe key, and its exit is still created.
+
+    The ordinary generation path stamps the opening BUY with the key
+    ``_dedupe_key`` derives, and ``dedupe_key`` is a plain UNIQUE column.  An
+    exit that reused the origin thesis would compute the identical key and be
+    swallowed as a duplicate -- created=False against a position that plainly
+    needs exiting.  This seeds the buy the way production leaves it and asserts
+    the exit proposal is still written.
+    """
+    database = clean_tables
+    service = await _proposal_service(database)
+    fixture = await _seed_executed_buy(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        dedupe_key=service._dedupe_key(ph.THESIS_ID, "AAPL_US_EQ"),
+    )
+
+    async with database.session() as session:
+        origin = await session.get(TradeProposal, fixture.proposal_id)
+    assert origin is not None
+    assert origin.dedupe_key == service._dedupe_key(ph.THESIS_ID, "AAPL_US_EQ")
+
+    result = await service.generate_exit(
+        "AAPL_US_EQ",
+        ExitSignal(
+            rule_id="hard_stop",
+            action=ThesisAction.SELL,
+            reason="the position is -9.00% against average cost",
+            rule=_rule("hard_stop"),
+        ),
+    )
+
+    assert result.created, result.reason
+    assert result.proposal_id != fixture.proposal_id
 
 
 async def test_a_position_with_no_origin_proposal_is_not_exited(clean_tables: Database) -> None:
