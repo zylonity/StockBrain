@@ -430,6 +430,7 @@ def test_the_migration_round_trips_twice(migrated_database: str) -> None:
         for _ in range(2):
             command.downgrade(config, FX_PROVENANCE)
             command.upgrade(config, WEB_DISCOVERY)
+        command.upgrade(config, "head")
         command.check(config)
     finally:
         command.upgrade(config, "head")
