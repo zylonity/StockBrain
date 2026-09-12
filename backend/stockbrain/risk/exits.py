@@ -328,14 +328,21 @@ def _horizon_ends_at(observation: ExitObservation, config: RiskConfig) -> dt.dat
 
 def exit_floors(
     observation: ExitObservation, config: RiskConfig, *, now: dt.datetime
-) -> ExitFloors:
+) -> ExitFloors | None:
     """Every floor an exit rule would act on, computed from the same predicates.
 
     Read-only and deterministic: no broker, no database, no clock of its own.
     ``nearest_floor`` is the highest of the price floors -- the one the position
     would meet first -- and ``nearest_rule`` names the rule that owns it.  The
     horizon is a time, so it is reported but never competes for nearest.
+
+    ``None`` when the observation is unusable in the same way ``evaluate_exit``
+    refuses it: a non-positive cost basis or current price has no meaningful
+    floors, and dividing by one would raise instead of answering.
     """
+    if observation.average_price <= ZERO or observation.current_price <= ZERO:
+        return None
+
     target = roi_target_for(observation.horizon, observation.minutes_held(now), config)
     hard_stop = observation.average_price * (Decimal(1) - config.exit_hard_stop_pct)
     volatility_floor = _volatility_armed(observation, config, now)
