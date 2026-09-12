@@ -29,9 +29,11 @@ from stockbrain.risk.models import RuleResult
 
 __all__ = [
     "EXIT_PRECEDENCE",
+    "ExitFloors",
     "ExitObservation",
     "ExitSignal",
     "evaluate_exit",
+    "exit_floors",
     "roi_target_for",
 ]
 
@@ -85,6 +87,25 @@ class ExitSignal:
     rule: RuleResult
 
 
+@dataclass(frozen=True, slots=True)
+class ExitFloors:
+    """Where each exit rule would act for one open position.
+
+    ``nearest_floor`` and ``nearest_rule`` answer "which price matters first?":
+    the highest of the non-``None`` floors, so the operator sees the barrier the
+    position would meet soonest.  A time -- the horizon -- is not a price and
+    never competes here.
+    """
+
+    hard_stop: Decimal
+    volatility_floor: Decimal | None
+    trailing_floor: Decimal | None
+    roi_target_price: Decimal | None
+    horizon_ends_at: dt.datetime
+    nearest_floor: Decimal
+    nearest_rule: str
+
+
 def roi_target_for(horizon: TimeHorizon, minutes_held: int, config: RiskConfig) -> Decimal:
     """The profit required to bank a reduction at this age.
 
@@ -110,6 +131,50 @@ def _fired(rule_id: str, reason: str, observed: str, threshold: str) -> RuleResu
         observed=observed,
         threshold=threshold,
     )
+
+
+def _volatility_armed(
+    observation: ExitObservation, config: RiskConfig, now: dt.datetime
+) -> Decimal | None:
+    """The Chandelier floor, or ``None`` when the volatility rule would skip.
+
+    ``None`` when there is no peak, no usable ATR, a stale ATR, or a peak built
+    from too few observations.  Shared with ``exit_floors`` so the floor shown
+    to an operator is exactly the one the rule would act on.
+    """
+    peak = observation.peak_price
+    atr = observation.atr
+    atr_fresh = (
+        observation.atr_as_of is not None
+        and (now.date() - observation.atr_as_of).days <= config.exit_atr_max_age_days
+    )
+    if (
+        peak is not None
+        and atr is not None
+        and atr > ZERO
+        and atr_fresh
+        and observation.peak_observations >= config.exit_min_peak_observations
+    ):
+        return peak - config.exit_atr_multiplier * atr
+    return None
+
+
+def _trailing_armed(observation: ExitObservation, config: RiskConfig) -> Decimal | None:
+    """The trailing floor, or ``None`` until the position has genuinely run.
+
+    ``None`` when there is no peak, the peak is built from too few observations,
+    or the gain never reached the arm level.  Shared with ``exit_floors`` for
+    the same reason ``_volatility_armed`` is.
+    """
+    peak = observation.peak_price
+    if (
+        peak is not None
+        and observation.peak_observations >= config.exit_min_peak_observations
+        and (peak - observation.average_price) / observation.average_price
+        >= config.exit_trailing_arm_pct
+    ):
+        return peak * (Decimal(1) - config.exit_trailing_pct)
+    return None
 
 
 def evaluate_exit(
@@ -151,61 +216,43 @@ def evaluate_exit(
     #    stopped tight, a wild one is given room.  ATR is research-grade data
     #    and may be missing or stale; then this rule skips and the flat stops
     #    stand.  Needs the same trustworthy peak the trailing rule needs.
-    peak = observation.peak_price
-    atr = observation.atr
-    atr_fresh = (
-        observation.atr_as_of is not None
-        and (now.date() - observation.atr_as_of).days <= config.exit_atr_max_age_days
-    )
-    if (
-        peak is not None
-        and atr is not None
-        and atr > ZERO
-        and atr_fresh
-        and observation.peak_observations >= config.exit_min_peak_observations
-    ):
-        floor = peak - config.exit_atr_multiplier * atr
-        if observation.current_price < floor:
-            return ExitSignal(
-                rule_id="volatility_stop",
-                action=ThesisAction.SELL,
-                reason=(
-                    f"the price fell to {observation.current_price}, through the volatility "
-                    f"floor at {floor} ({config.exit_atr_multiplier} x ATR {atr} below the "
-                    f"peak of {peak})"
-                ),
-                rule=_fired(
-                    "volatility_stop",
-                    "the volatility floor was breached",
-                    str(observation.current_price),
-                    str(floor),
-                ),
-            )
+    floor = _volatility_armed(observation, config, now)
+    if floor is not None and observation.current_price < floor:
+        return ExitSignal(
+            rule_id="volatility_stop",
+            action=ThesisAction.SELL,
+            reason=(
+                f"the price fell to {observation.current_price}, through the volatility "
+                f"floor at {floor} ({config.exit_atr_multiplier} x ATR {observation.atr} "
+                f"below the peak of {observation.peak_price})"
+            ),
+            rule=_fired(
+                "volatility_stop",
+                "the volatility floor was breached",
+                str(observation.current_price),
+                str(floor),
+            ),
+        )
 
     # 3. trailing_stop -- armed only once the position has genuinely run, and
     #    only against a peak built from enough observations to mean something.
-    if (
-        peak is not None
-        and observation.peak_observations >= config.exit_min_peak_observations
-        and (peak - observation.average_price) / observation.average_price
-        >= config.exit_trailing_arm_pct
-    ):
-        floor = peak * (Decimal(1) - config.exit_trailing_pct)
-        if observation.current_price < floor:
-            return ExitSignal(
-                rule_id="trailing_stop",
-                action=ThesisAction.SELL,
-                reason=(
-                    f"the price fell to {observation.current_price} from a peak of {peak}, "
-                    f"through the {_pct(config.exit_trailing_pct)} trailing floor at {floor}"
-                ),
-                rule=_fired(
-                    "trailing_stop",
-                    "the trailing floor was breached",
-                    str(observation.current_price),
-                    str(floor),
-                ),
-            )
+    floor = _trailing_armed(observation, config)
+    if floor is not None and observation.current_price < floor:
+        return ExitSignal(
+            rule_id="trailing_stop",
+            action=ThesisAction.SELL,
+            reason=(
+                f"the price fell to {observation.current_price} from a peak of "
+                f"{observation.peak_price}, through the {_pct(config.exit_trailing_pct)} "
+                f"trailing floor at {floor}"
+            ),
+            rule=_fired(
+                "trailing_stop",
+                "the trailing floor was breached",
+                str(observation.current_price),
+                str(floor),
+            ),
+        )
 
     # 4. thesis_superseded -- research has published a newer conclusion about
     #    this company, so the reason recorded for holding is out of date.
@@ -260,6 +307,60 @@ def evaluate_exit(
         )
 
     return None
+
+
+def _horizon_ends_at(observation: ExitObservation, config: RiskConfig) -> dt.datetime:
+    """The instant the thesis runs out of time.
+
+    The horizon's terminal ROI row (``target == 0``) is the boundary the
+    ``horizon_elapsed`` rule fires past; the smallest such ``minutes`` is used so
+    a table with more than one terminal row still names one instant.
+    """
+    terminal_minutes = [
+        row_minutes
+        for row_horizon, row_minutes, row_target in config.exit_roi_decay
+        if row_horizon is observation.horizon and row_target == ZERO
+    ]
+    if not terminal_minutes:
+        raise ValueError(f"no terminal (target == 0) ROI row for {observation.horizon.value}")
+    return observation.opened_at + dt.timedelta(minutes=min(terminal_minutes))
+
+
+def exit_floors(
+    observation: ExitObservation, config: RiskConfig, *, now: dt.datetime
+) -> ExitFloors:
+    """Every floor an exit rule would act on, computed from the same predicates.
+
+    Read-only and deterministic: no broker, no database, no clock of its own.
+    ``nearest_floor`` is the highest of the price floors -- the one the position
+    would meet first -- and ``nearest_rule`` names the rule that owns it.  The
+    horizon is a time, so it is reported but never competes for nearest.
+    """
+    target = roi_target_for(observation.horizon, observation.minutes_held(now), config)
+    hard_stop = observation.average_price * (Decimal(1) - config.exit_hard_stop_pct)
+    volatility_floor = _volatility_armed(observation, config, now)
+    trailing_floor = _trailing_armed(observation, config)
+    roi_target_price = observation.average_price * (Decimal(1) + target) if target > ZERO else None
+
+    nearest_rule = "hard_stop"
+    nearest_floor = hard_stop
+    for rule_id, floor in (
+        ("volatility_stop", volatility_floor),
+        ("trailing_stop", trailing_floor),
+        ("roi_target", roi_target_price),
+    ):
+        if floor is not None and floor > nearest_floor:
+            nearest_rule, nearest_floor = rule_id, floor
+
+    return ExitFloors(
+        hard_stop=hard_stop,
+        volatility_floor=volatility_floor,
+        trailing_floor=trailing_floor,
+        roi_target_price=roi_target_price,
+        horizon_ends_at=_horizon_ends_at(observation, config),
+        nearest_floor=nearest_floor,
+        nearest_rule=nearest_rule,
+    )
 
 
 def _pct(value: Decimal) -> str:
