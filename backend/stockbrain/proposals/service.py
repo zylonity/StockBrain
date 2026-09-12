@@ -40,7 +40,7 @@ import datetime as dt
 import hashlib
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, Decimal
 
 import sqlalchemy as sa
@@ -63,6 +63,7 @@ from stockbrain.enums import (
     Broker,
     ExecutionPolicy,
     NotificationEvent,
+    OrderSide,
     OrderType,
     ProposalStatus,
     ResolutionStatus,
@@ -91,6 +92,7 @@ from stockbrain.proposals.state_machine import (
 )
 from stockbrain.risk.config import RiskConfig
 from stockbrain.risk.engine import RiskEngine
+from stockbrain.risk.exits import ExitSignal
 from stockbrain.risk.models import (
     AccountState,
     FxSnapshot,
@@ -126,7 +128,7 @@ _SWEEPABLE_STATUSES: tuple[ProposalStatus, ...] = (
 
 @dataclass(slots=True)
 class GenerationResult:
-    thesis_id: uuid.UUID
+    thesis_id: uuid.UUID | None
     created: bool
     proposal_id: uuid.UUID | None = None
     evaluation_id: uuid.UUID | None = None
@@ -492,6 +494,200 @@ class ProposalService:
                     )
         return result
 
+    async def generate_exit(
+        self,
+        broker_ticker: str,
+        signal: ExitSignal,
+        *,
+        now: dt.datetime | None = None,
+    ) -> GenerationResult:
+        """Turn one exit signal into a proposal, on the ordinary risk path.
+
+        The signal decides *that* the position should be reduced and *why*.
+        Everything else -- the quantity, the reference price, the spread, the
+        session, the FX -- is the existing evaluator's answer, unchanged.  An
+        exit is not a privileged order; it is an ordinary proposal whose action
+        came from a rule instead of from research.
+        """
+        moment = now or utcnow()
+
+        if blockers := await self.control_blockers():
+            return GenerationResult(
+                thesis_id=None,
+                created=False,
+                reason="proposal generation is halted: " + "; ".join(blockers),
+            )
+
+        async with self.database.session() as session:
+            origin = await self.origin_proposal(session, broker_ticker)
+            if origin is None or origin.thesis_id is None:
+                return GenerationResult(
+                    thesis_id=None,
+                    created=False,
+                    reason=(
+                        f"{broker_ticker} has no executed StockBrain buy to exit against, "
+                        "so there is no thesis this exit could supersede"
+                    ),
+                )
+            thesis_id = origin.thesis_id
+            candidate = await self._load_candidate(session, thesis_id)
+
+        if candidate is None:
+            return GenerationResult(
+                thesis_id=thesis_id,
+                created=False,
+                reason="the opening thesis or its research run is no longer present",
+            )
+
+        # The action is the rule's, not the thesis's.  Confidence is carried over
+        # from the opening thesis for the audit trail only: task 4 made the
+        # confidence floor skip risk-reducing actions, so it gates nothing here.
+        candidate = replace(candidate, action=signal.action)
+
+        evaluator = self._evaluator()
+        facts = await evaluator.load(
+            candidate.instrument, instrument_currency=candidate.identity.currency, now=moment
+        )
+        account, quote, fx = facts.account, facts.quote, facts.fx
+        account_id = account.account_id if account else DEFAULT_ACCOUNT_ID
+
+        async with self.database.transaction() as session:
+            await self._lock_account(session, account_id)
+            fresh_identity = await self._reload_identity(session, candidate)
+            verdict = await evaluator.evaluate(
+                session,
+                EvaluationContext(
+                    candidate.action, candidate.confidence, fresh_identity, account_id
+                ),
+                facts,
+                now=moment,
+            )
+            decision = verdict.decision
+
+            evaluation = RiskEvaluation(
+                stage=STAGE_GENERATION,
+                thesis_id=thesis_id,
+                broker=self.broker,
+                broker_ticker=fresh_identity.broker_ticker,
+                broker_instrument_id=fresh_identity.broker_instrument_id,
+                outcome=decision.outcome,
+                policy_version=decision.policy_version,
+                rules=[rule.as_dict() for rule in (*decision.rules, signal.rule)],
+                snapshot=decision.as_dict(),
+                snapshot_hash=decision.snapshot_hash(),
+                actor=f"system:exit:{signal.rule_id}",
+                detail="; ".join(decision.blocks) or signal.reason,
+            )
+            session.add(evaluation)
+            await session.flush()
+
+            METRICS.inc(
+                "stockbrain_risk_evaluations_total",
+                labels={"stage": STAGE_GENERATION, "outcome": decision.outcome.value},
+            )
+
+            if not decision.allowed:
+                # A blocked exit is recorded, not dropped: "we wanted out and
+                # the envelope refused" is the single most important thing an
+                # operator can be told about a holding.
+                reason = "; ".join(decision.blocks) or "; ".join(decision.sizing.reasons)
+                log.warning(
+                    "exit_proposal_blocked",
+                    broker_ticker=broker_ticker,
+                    exit_rule=signal.rule_id,
+                    outcome=decision.outcome.value,
+                    blocks=list(decision.block_rule_ids),
+                )
+                return GenerationResult(
+                    thesis_id=thesis_id,
+                    created=False,
+                    evaluation_id=evaluation.id,
+                    outcome=decision.outcome,
+                    reason=reason,
+                    blocks=decision.blocks,
+                )
+
+            assert quote is not None and account is not None
+            proposal = self._build_proposal(
+                candidate=candidate,
+                identity=fresh_identity,
+                decision=decision,
+                quote=quote,
+                account=account,
+                fx=fx,
+                now=moment,
+            )
+            # Why this proposal exists, in the fields the GUI and Telegram
+            # already render.
+            proposal.sizing_reasons = [
+                {"reason": signal.reason},
+                *proposal.sizing_reasons,
+            ]
+            proposal.risk_rules = [*proposal.risk_rules, signal.rule.as_dict()]
+            proposal.research_action = signal.action.value
+            session.add(proposal)
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                log.info(
+                    "exit_proposal_deduped",
+                    broker_ticker=broker_ticker,
+                    exit_rule=signal.rule_id,
+                    constraint=_constraint_name(exc),
+                )
+                return GenerationResult(
+                    thesis_id=thesis_id,
+                    created=False,
+                    outcome=decision.outcome,
+                    reason="a live proposal already exists for this listing",
+                )
+
+            evaluation.proposal_id = proposal.id
+            session.add(
+                AuditLog(
+                    actor_type=ActorType.SYSTEM,
+                    actor_id=f"system:exit:{signal.rule_id}",
+                    action="proposal.exit_generated",
+                    entity_type="trade_proposal",
+                    entity_id=proposal.id,
+                    details={
+                        "thesis_id": str(thesis_id),
+                        "broker_ticker": proposal.broker_ticker,
+                        "exit_rule": signal.rule_id,
+                        "exit_reason": signal.reason,
+                        "side": proposal.side.value,
+                        "quantity": str(proposal.proposed_quantity),
+                        "risk_outcome": decision.outcome.value,
+                        "risk_policy_version": decision.policy_version,
+                        "execution_policy": proposal.execution_policy.value,
+                    },
+                )
+            )
+            if proposal.execution_policy is ExecutionPolicy.MANUAL:
+                await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_MANUAL)
+            proposal_id = proposal.id
+            evaluation_id = evaluation.id
+
+        METRICS.inc("stockbrain_trade_proposals_total", labels={"outcome": decision.outcome.value})
+        METRICS.inc("stockbrain_position_exits_total", labels={"rule": signal.rule_id})
+        log.info(
+            "exit_proposal_generated",
+            proposal_id=str(proposal_id),
+            broker_ticker=broker_ticker,
+            exit_rule=signal.rule_id,
+            side=proposal.side.value,
+            quantity=str(proposal.proposed_quantity),
+        )
+        return GenerationResult(
+            thesis_id=thesis_id,
+            created=True,
+            proposal_id=proposal_id,
+            evaluation_id=evaluation_id,
+            outcome=decision.outcome,
+            reason=signal.reason,
+        )
+
     # ------------------------------------------------------------------
     # Authorization
     # ------------------------------------------------------------------
@@ -807,6 +1003,32 @@ class ProposalService:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    async def origin_proposal(
+        self, session: AsyncSession, broker_ticker: str
+    ) -> TradeProposal | None:
+        """The proposal the current position was opened on, if StockBrain opened it.
+
+        Defined as the most recently executed BUY proposal for this listing in
+        this environment.  A position StockBrain did not open has no thesis to
+        exit against, and inventing one would put a research conclusion's name
+        on a decision it never made.
+        """
+        return (
+            await session.execute(
+                sa.select(TradeProposal)
+                .where(
+                    TradeProposal.broker == self.broker,
+                    TradeProposal.broker_ticker == broker_ticker,
+                    TradeProposal.broker_environment == self.settings.t212_env.value,
+                    TradeProposal.side == OrderSide.BUY,
+                    TradeProposal.status == ProposalStatus.EXECUTED,
+                    TradeProposal.thesis_id.is_not(None),
+                )
+                .order_by(TradeProposal.executed_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
     async def _load_candidate(
         self, session: AsyncSession, thesis_id: uuid.UUID
     ) -> _Candidate | None:

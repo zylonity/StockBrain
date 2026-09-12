@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -13,9 +15,23 @@ from stockbrain.broker.trading212_account import (
     T212Position,
     Trading212AccountClient,
 )
+from stockbrain.db.base import utcnow
 from stockbrain.db.models.portfolio import PositionPeak
+from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.session import Database
-from stockbrain.enums import Broker
+from stockbrain.enums import (
+    Broker,
+    OrderSide,
+    OrderType,
+    PriceSource,
+    ProposalStatus,
+    RuleOutcome,
+    ThesisAction,
+)
+from stockbrain.proposals.service import ProposalService
+from stockbrain.risk.exits import ExitSignal
+from stockbrain.risk.models import RuleResult
+from tests import proposal_helpers as ph
 
 # The documented payload shape, mirroring the double in
 # ``tests/unit/test_trading212_account.py``.  Only the fields ``sync`` reads are
@@ -114,3 +130,118 @@ async def test_closing_a_position_deletes_its_peak(clean_tables: Database) -> No
             await session.execute(sa.select(sa.func.count()).select_from(PositionPeak))
         ).scalar_one()
     assert remaining == 0
+
+
+async def _proposal_service(database: Database) -> ProposalService:
+    """The real service over the shared stub provider, as the proposal tests build it."""
+    return ph.service(database)
+
+
+def _rule(rule_id: str) -> RuleResult:
+    """The ``RuleResult`` a fired exit rule carries, in the shape Task 3 emits."""
+    return RuleResult(
+        rule_id=rule_id,
+        rule_version=1,
+        outcome=RuleOutcome.WARN,
+        reason="the exit rule fired",
+        observed="observed",
+        threshold="threshold",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutedBuy:
+    """The lineage a position StockBrain opened leaves behind."""
+
+    thesis_id: uuid.UUID
+    research_run_id: uuid.UUID
+    proposal_id: uuid.UUID
+
+
+async def _seed_executed_buy(
+    database: Database,
+    *,
+    broker_ticker: str = "AAPL_US_EQ",
+    quantity: Decimal = Decimal("9"),
+) -> _ExecutedBuy:
+    """Seed a funded, held position and the executed BUY proposal that opened it.
+
+    The research chain is ``proposal_helpers``' healthy world; only the final
+    proposal is written directly, because an exit reuses the opening thesis and
+    the ordinary generation path would give that row the same dedupe key an
+    exit proposes under.
+    """
+    await ph.seed(database)
+    await ph.fund(database, positions={broker_ticker: (quantity, quantity)})
+    moment = utcnow()
+    proposal = TradeProposal(
+        thesis_id=ph.THESIS_ID,
+        research_run_id=ph.RUN_ID,
+        broker=Broker.TRADING212,
+        broker_ticker=broker_ticker,
+        account_id=ph.ACCOUNT_ID,
+        broker_environment=ph.settings().t212_env.value,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        proposed_quantity=quantity,
+        reference_price=Decimal("180.50"),
+        reference_currency="USD",
+        price_source=PriceSource.ALPACA_IEX,
+        quote_timestamp=moment,
+        quote_age_ms=0,
+        estimated_notional=quantity * Decimal("180.50"),
+        account_currency="USD",
+        status=ProposalStatus.EXECUTED,
+        executed_at=moment,
+        expires_at=moment + dt.timedelta(days=1),
+    )
+    async with database.transaction() as session:
+        session.add(proposal)
+    return _ExecutedBuy(
+        thesis_id=ph.THESIS_ID,
+        research_run_id=ph.RUN_ID,
+        proposal_id=proposal.id,
+    )
+
+
+async def test_an_exit_proposal_inherits_the_origin_thesis(clean_tables: Database) -> None:
+    """Section 17's lineage requirement, satisfied without a schema change: the
+    exit proposal points at the thesis the position was opened on."""
+    database = clean_tables
+    fixture = await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+
+    service = await _proposal_service(database)
+    signal = ExitSignal(
+        rule_id="hard_stop",
+        action=ThesisAction.SELL,
+        reason="the position is -9.00% against average cost",
+        rule=_rule("hard_stop"),
+    )
+    result = await service.generate_exit("AAPL_US_EQ", signal)
+
+    assert result.created
+    async with database.session() as session:
+        proposal = await session.get(TradeProposal, result.proposal_id)
+    assert proposal is not None
+    assert proposal.thesis_id == fixture.thesis_id
+    assert proposal.research_run_id == fixture.research_run_id
+    assert proposal.side is OrderSide.SELL
+    assert {item["reason"] for item in proposal.sizing_reasons} >= {signal.reason}
+    assert any(rule["rule_id"] == "hard_stop" for rule in proposal.risk_rules)
+
+
+async def test_a_position_with_no_origin_proposal_is_not_exited(clean_tables: Database) -> None:
+    database = clean_tables
+    service = await _proposal_service(database)
+    result = await service.generate_exit(
+        "MSFT_US_EQ",
+        ExitSignal(
+            rule_id="hard_stop",
+            action=ThesisAction.SELL,
+            reason="irrelevant",
+            rule=_rule("hard_stop"),
+        ),
+    )
+    assert not result.created
+    assert result.reason is not None
+    assert "no executed StockBrain buy" in result.reason
