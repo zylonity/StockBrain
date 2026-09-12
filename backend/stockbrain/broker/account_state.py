@@ -25,7 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from stockbrain.broker.trading212_account import Trading212AccountClient
 from stockbrain.db.base import utcnow
-from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
+from stockbrain.db.models.portfolio import PortfolioSnapshot, Position, PositionPeak
 from stockbrain.db.session import Database
 from stockbrain.enums import Broker
 from stockbrain.fx.base import normalize_currency
@@ -161,6 +161,48 @@ class AccountStateService:
                     )
                 )
 
+                if position.current_price is not None:
+                    peak_values = {
+                        "broker": self._broker,
+                        "account_id": account_id,
+                        "broker_ticker": position.broker_ticker,
+                        "peak_price": position.current_price,
+                        "peak_at": captured_at,
+                        "updated_at": captured_at,
+                    }
+                    peak_statement = pg_insert(PositionPeak).values(
+                        created_at=captured_at, observations=1, **peak_values
+                    )
+                    await session.execute(
+                        peak_statement.on_conflict_do_update(
+                            index_elements=[
+                                PositionPeak.broker,
+                                PositionPeak.account_id,
+                                PositionPeak.broker_ticker,
+                            ],
+                            set_={
+                                "peak_price": sa.func.greatest(
+                                    PositionPeak.peak_price,
+                                    peak_statement.excluded.peak_price,
+                                ),
+                                # Only restamp the timestamp when the high is
+                                # actually new, so `peak_at` answers "when did
+                                # this position top out" rather than "when did
+                                # we last look".
+                                "peak_at": sa.case(
+                                    (
+                                        peak_statement.excluded.peak_price
+                                        > PositionPeak.peak_price,
+                                        peak_statement.excluded.peak_at,
+                                    ),
+                                    else_=PositionPeak.peak_at,
+                                ),
+                                "observations": PositionPeak.observations + 1,
+                                "updated_at": peak_statement.excluded.updated_at,
+                            },
+                        )
+                    )
+
             # A position the broker no longer reports is closed. It is deleted
             # rather than zeroed: `positions` mirrors current broker state, and
             # the historical record lives in the snapshot and the audit log.
@@ -171,6 +213,14 @@ class AccountStateService:
             if seen:
                 delete = delete.where(Position.broker_ticker.not_in(seen))
             await session.execute(delete)
+
+            peak_delete = sa.delete(PositionPeak).where(
+                PositionPeak.broker == self._broker,
+                PositionPeak.account_id == account_id,
+            )
+            if seen:
+                peak_delete = peak_delete.where(PositionPeak.broker_ticker.not_in(seen))
+            await session.execute(peak_delete)
 
         log.info(
             "broker_account_synced",

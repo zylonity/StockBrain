@@ -19,7 +19,7 @@ from stockbrain.db.base import Base, JSONDict, TimestampMixin, UUIDPrimaryKeyMix
 from stockbrain.db.models._types import pg_enum
 from stockbrain.enums import Broker, OrderSide, OrderType
 
-__all__ = ["BrokerOrder", "PortfolioSnapshot", "Position"]
+__all__ = ["BrokerOrder", "PortfolioSnapshot", "Position", "PositionPeak"]
 
 
 class PortfolioSnapshot(UUIDPrimaryKeyMixin, Base):
@@ -84,6 +84,41 @@ class Position(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "account_id",
             "broker_ticker",
             name="uq_positions_broker_account_id_broker_ticker",
+        ),
+    )
+
+
+class PositionPeak(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Highest broker-reported price seen while a position was open.
+
+    Fed by every account sync, which costs no extra API call.  The price is
+    broker-supplied and explicitly not real-time, so this is a *trigger*
+    reference only: a proposal's reference price always comes from the
+    market-data path via the evaluator.
+
+    The row is deleted with the position it belongs to.  A name closed and
+    re-bought is a new position with a new thesis, and inheriting the old
+    peak would arm a trailing stop against a high this position never saw.
+    """
+
+    __tablename__ = "position_peaks"
+
+    broker: Mapped[Broker] = mapped_column(pg_enum(Broker, "broker"), nullable=False)
+    account_id: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="default")
+    broker_ticker: Mapped[str] = mapped_column(sa.Text, nullable=False)
+
+    peak_price: Mapped[Decimal] = mapped_column(sa.Numeric(24, 8), nullable=False)
+    peak_at: Mapped[dt.datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    observations: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="1")
+    """How many syncs contributed.  A peak from one observation is a peak the
+    trailing rule should not yet trust, and this is how it can tell."""
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "broker",
+            "account_id",
+            "broker_ticker",
+            name="uq_position_peaks_broker_account_id_broker_ticker",
         ),
     )
 
