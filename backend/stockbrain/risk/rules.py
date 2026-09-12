@@ -39,6 +39,7 @@ from stockbrain.risk.models import ZERO, FxSnapshot, RiskInputs, RuleResult
 
 __all__ = [
     "EXPOSURE_INCREASING_ACTIONS",
+    "RISK_REDUCING_ACTIONS",
     "NotionalCap",
     "action_is_executable",
     "cap_rule_results",
@@ -52,6 +53,10 @@ __all__ = [
 
 #: Actions that add exposure.  Only these are subject to the portfolio caps.
 EXPOSURE_INCREASING_ACTIONS: frozenset[ThesisAction] = frozenset({ThesisAction.BUY})
+
+#: Actions that remove exposure.  Exempt from the caps and the confidence
+#: floor: a control that can stop a position being closed is a hazard.
+RISK_REDUCING_ACTIONS: frozenset[ThesisAction] = frozenset({ThesisAction.SELL, ThesisAction.REDUCE})
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,7 +616,7 @@ def _current_position(inputs: RiskInputs) -> RuleResult:
     held = position.quantity if position else ZERO
     available = position.quantity_available if position else ZERO
 
-    if inputs.action in {ThesisAction.SELL, ThesisAction.REDUCE}:
+    if inputs.action in RISK_REDUCING_ACTIONS:
         if available <= ZERO:
             return RuleResult(
                 rule_id="current_position",
@@ -713,12 +718,23 @@ def _research_confidence_floor(inputs: RiskInputs) -> RuleResult:
     ever used in the conservative direction: below the floor nothing is
     proposed, and above it confidence may shrink -- never grow -- a size that
     the hard caps already permit.
+
+    It gates *entries* only.  A floor that could block a SELL would turn a
+    lukewarm opening thesis into a reason a position can never be closed, which
+    is the hazard this module's header names rather than a control.
     """
     floor = inputs.config.min_research_confidence
+    if inputs.action in RISK_REDUCING_ACTIONS:
+        return _skipped(
+            "research_confidence_floor",
+            2,
+            "the confidence floor gates entries; a reduction is never blocked by it",
+            threshold=str(floor),
+        )
     ok = inputs.confidence >= floor
     return RuleResult(
         rule_id="research_confidence_floor",
-        rule_version=1,
+        rule_version=2,
         outcome=RuleOutcome.PASS if ok else RuleOutcome.BLOCK,
         reason=(
             f"research confidence {inputs.confidence} meets the {floor} floor"

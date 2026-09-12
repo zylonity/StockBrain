@@ -492,6 +492,33 @@ def test_confidence_modulation_can_be_switched_off() -> None:
     assert all(rule.rule_id != "confidence_size_modulation" for rule in decision.rules)
 
 
+@pytest.mark.parametrize("action", [ThesisAction.SELL, ThesisAction.REDUCE])
+def test_low_confidence_never_blocks_a_risk_reducing_action(action: ThesisAction) -> None:
+    """Refusing to close a position because the research was lukewarm is the
+    hazard the rules module's own header names."""
+    assert (
+        outcome_of(
+            h.inputs(
+                action=action,
+                confidence=Decimal("0.10"),
+                state=h.account(positions={"AAPL_US_EQ": h.position()}),
+            ),
+            "research_confidence_floor",
+        )
+        is not RuleOutcome.BLOCK
+    )
+
+
+def test_low_confidence_still_blocks_a_buy() -> None:
+    assert (
+        outcome_of(
+            h.inputs(action=ThesisAction.BUY, confidence=Decimal("0.10")),
+            "research_confidence_floor",
+        )
+        is RuleOutcome.BLOCK
+    )
+
+
 # ---------------------------------------------------------------------------
 # Structural guarantees
 # ---------------------------------------------------------------------------
