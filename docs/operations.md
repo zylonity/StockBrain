@@ -587,6 +587,36 @@ is deliberately never resent: a resend cannot tell "never arrived" from "arrived
 but the status write failed", and the second reading produces a duplicate trade
 alert. Query the table to see what was missed.
 
+### Notification categories
+
+Telegram delivery is per category. The switches are runtime-editable — the
+Settings page, or `PUT /api/v1/system/telegram/preferences` — and every
+category, its label and an estimate of its volume appear there. Three categories
+carry the blocked/deferred work:
+
+| Category | What the message means |
+|---|---|
+| `PROPOSAL_BLOCKED` | Research recommended BUY, SELL or REDUCE and the deterministic risk engine refused the trade before any proposal existed. The message lists the rules that refused it and says nothing was sent to the broker. |
+| `PROPOSAL_DEFERRED` | The only rules that refused the trade named market state — a closed session, a stale quote, no usable FX. Nothing is approved; the thesis waits and is re-evaluated at the next open. |
+| `DAILY_SUMMARY` | One digest a day at `TELEGRAM_DAILY_SUMMARY_TIME`: account totals, every holding with its nearest exit floor, the open proposals, and the last 24 hours of promotions and research. |
+
+All three ship **on**; they are low-volume and each answers "the system said buy
+and then went quiet" without a database query. `EXECUTION_CRITICAL` — the
+ambiguous-order message — is still the one category no preference can switch
+off.
+
+Deferral has a ceiling and a retry cadence. A thesis refused only by market state
+is re-evaluated no more often than `RISK_PROPOSAL_TTL_MINUTES`, and once it is
+older than `PROPOSAL_DEFERRAL_MAX_HOURS` (default `72`, 1–336) the refusal
+becomes final: the next evaluation is announced as `PROPOSAL_BLOCKED`. The
+default outlives a weekend, so a Friday-evening thesis is not discarded before
+Monday's open.
+
+`TELEGRAM_DAILY_SUMMARY_TIME` (default `08:00`, UTC `HH:MM`) is when the digest
+is sent. Empty disables it. A restart after the time still sends that day's
+summary, because "already sent" is the `notifications` dedupe row rather than
+anything held in memory.
+
 ### An order's state is unknown
 
 `EXECUTION_AMBIGUOUS` means StockBrain transmitted a request and did not receive
@@ -712,6 +742,20 @@ the other five.
 ```bash
 curl -s localhost:8080/api/v1/proposals/<proposal_id>/risk | python3 -m json.tool
 ```
+
+**Reading the floors.** The same rules are visible before they fire, and from
+the same computation, so a displayed floor and a fired rule cannot disagree.
+`GET /api/v1/portfolio` carries an `exit` field on every open position — null
+only when the exit service is unavailable — and the Portfolio page renders it in
+two columns. **Nearest exit** is the highest floor —
+the one a fall would reach first — with the rule that owns it (`119.00 ·
+volatility`). **Floors** stacks every floor: `stop`, `vol`, `trail`, `target`
+and the horizon timestamp, with `-` for a rule that is not armed. Telegram's
+`/positions` prints the same set on one `exit:` line, ending `(nearest: …)`.
+
+A position StockBrain never bought has no floors to read: both surfaces say
+`not managed` with the reason. One the risk layer could not price says
+`floors unavailable`. Neither is ever rendered as a zero.
 
 **When Yahoo degrades.** The refresh records one provider, `yahoo_bars`, on
 `GET /api/health/providers` and the System Health screen: `HEALTHY` while the
