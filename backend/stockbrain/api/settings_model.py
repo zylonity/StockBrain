@@ -935,6 +935,47 @@ CATALOGUE: tuple[_Group, ...] = (
                 "How stale broker cash and positions may be.",
                 unit="seconds",
             ),
+            _s(
+                "risk_exit_hard_stop_pct",
+                "Exit hard stop",
+                RESTART,
+                "Loss from average cost at which the whole position is proposed for "
+                "exit. A floor, never widened.",
+            ),
+            _s(
+                "risk_exit_trailing_pct",
+                "Exit trailing distance",
+                RESTART,
+                "How far below the high-water mark the trailing floor sits, once armed.",
+            ),
+            _s(
+                "risk_exit_trailing_arm_pct",
+                "Exit trailing arm",
+                RESTART,
+                "Gain from average cost at which the trailing floor switches on. Below "
+                "it the hard stop is the only floor.",
+            ),
+            _s(
+                "risk_exit_min_peak_observations",
+                "Exit peak observations",
+                RESTART,
+                "Syncs a peak must be built from before the trailing rule trusts it. One "
+                "observation is an entry price wearing a peak's name.",
+                unit="observations",
+            ),
+            _s(
+                "exit_sweep_enabled",
+                "Exit sweep",
+                RESTART,
+                "Whether the scheduled sweep that proposes deterministic exits runs.",
+            ),
+            _s(
+                "exit_sweep_interval_seconds",
+                "Exit sweep interval",
+                RESTART,
+                "How often the exit sweep runs.",
+                unit="seconds",
+            ),
         ),
     ),
     _Group(

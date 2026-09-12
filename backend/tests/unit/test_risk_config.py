@@ -20,6 +20,7 @@ from stockbrain.risk.config import (
     SpreadPolicy,
     risk_config_from_settings,
 )
+from tests import risk_helpers as h
 
 
 def _settings(**overrides: object) -> Settings:
@@ -131,3 +132,25 @@ def test_the_shipped_env_example_loads_and_matches_the_code_defaults() -> None:
     assert risk_config_from_settings(settings).as_dict() == RiskConfig().as_dict()
     assert settings.execution_policy.value == "MANUAL"
     assert settings.t212_automated_trading_consent_confirmed is False
+
+
+def test_exit_thresholds_change_the_policy_version() -> None:
+    baseline = h.config()
+    stricter = h.config(exit_hard_stop_pct=Decimal("0.05"))
+    assert baseline.version != stricter.version
+
+
+def test_the_roi_decay_table_covers_every_horizon() -> None:
+    from stockbrain.enums import TimeHorizon
+
+    covered = {horizon for horizon, _minutes, _target in h.config().exit_roi_decay}
+    assert covered == set(TimeHorizon)
+
+
+def test_the_roi_decay_table_is_non_increasing_within_each_horizon() -> None:
+    from itertools import groupby
+
+    rows = sorted(h.config().exit_roi_decay, key=lambda row: (row[0].value, row[1]))
+    for _horizon, group in groupby(rows, key=lambda row: row[0]):
+        targets = [target for _h, _m, target in group]
+        assert targets == sorted(targets, reverse=True)

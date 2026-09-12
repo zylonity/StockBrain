@@ -819,6 +819,13 @@ class Settings(BaseSettings):
     risk_min_confidence_size_factor: Decimal = Decimal("0.5")
     risk_reduce_fraction: Decimal = Decimal("0.5")
 
+    risk_exit_hard_stop_pct: Decimal = Decimal("0.08")
+    risk_exit_trailing_pct: Decimal = Decimal("0.05")
+    risk_exit_trailing_arm_pct: Decimal = Decimal("0.10")
+    risk_exit_min_peak_observations: int = 3
+    exit_sweep_enabled: bool = False
+    exit_sweep_interval_seconds: float = 300.0
+
     proposal_revalidation_batch: int = 5
     """How many active proposals the invalidation sweep re-prices per tick.
     Bounded so the sweep cannot turn into an unmetered market-data spend."""
@@ -1096,6 +1103,51 @@ class Settings(BaseSettings):
             problems.append("RISK_MAX_ACCOUNT_STATE_AGE_SECONDS must be greater than 0")
         if problems:
             raise ValueError("Invalid risk configuration: " + "; ".join(problems))
+        return self
+
+    @model_validator(mode="after")
+    def _validate_exit_policy(self) -> Settings:
+        """Refuse an exit policy that cannot mean anything.
+
+        A trailing floor wider than the arm threshold would sit below the entry
+        price at the moment it armed, so the trailing rule would fire
+        immediately on every position that reached its arm level -- a take
+        profit wearing a trailing stop's name.
+        """
+        problems: list[str] = []
+        if not 0 < self.risk_exit_hard_stop_pct < 1:
+            problems.append(
+                "RISK_EXIT_HARD_STOP_PCT must be between 0 and 1, exclusive "
+                f"(got {self.risk_exit_hard_stop_pct})"
+            )
+        if not 0 < self.risk_exit_trailing_pct < 1:
+            problems.append(
+                "RISK_EXIT_TRAILING_PCT must be between 0 and 1, exclusive "
+                f"(got {self.risk_exit_trailing_pct})"
+            )
+        if not 0 <= self.risk_exit_trailing_arm_pct < 1:
+            problems.append(
+                "RISK_EXIT_TRAILING_ARM_PCT must be at least 0 and below 1 "
+                f"(got {self.risk_exit_trailing_arm_pct})"
+            )
+        if not 1 <= self.risk_exit_min_peak_observations <= 100:
+            problems.append(
+                "RISK_EXIT_MIN_PEAK_OBSERVATIONS must be between 1 and 100 "
+                f"(got {self.risk_exit_min_peak_observations})"
+            )
+        if not 30.0 <= self.exit_sweep_interval_seconds <= 3600.0:
+            problems.append(
+                "EXIT_SWEEP_INTERVAL_SECONDS must be between 30 and 3600 "
+                f"(got {self.exit_sweep_interval_seconds})"
+            )
+        if problems:
+            raise ValueError("Invalid risk configuration: " + "; ".join(problems))
+        if self.risk_exit_trailing_pct >= self.risk_exit_trailing_arm_pct:
+            raise ValueError(
+                "RISK_EXIT_TRAILING_PCT must be below RISK_EXIT_TRAILING_ARM_PCT: a floor "
+                f"{self.risk_exit_trailing_pct} below a peak armed at "
+                f"{self.risk_exit_trailing_arm_pct} would already be under the entry price"
+            )
         return self
 
     @model_validator(mode="after")

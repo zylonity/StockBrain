@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import itertools
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -260,3 +261,13 @@ def test_env_file_values_ignore_inline_comments_and_quotes(tmp_path: Path) -> No
     assert settings.alpaca_api_key.get_secret_value() == "quoted-key"
     assert settings.t212_api_secret.get_secret_value() == "plain-secret"
     assert settings.market_data_probe_symbol == "MSFT"
+
+
+def test_a_trailing_floor_wider_than_its_arm_threshold_is_refused(
+    make_settings: Any,
+) -> None:
+    with pytest.raises(ValidationError, match="already be under the entry price"):
+        make_settings(
+            RISK_EXIT_TRAILING_PCT="0.20",
+            RISK_EXIT_TRAILING_ARM_PCT="0.10",
+        )

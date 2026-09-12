@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from stockbrain.enums import MarketSession
+from stockbrain.enums import MarketSession, TimeHorizon
 
 if TYPE_CHECKING:
     from stockbrain.config import Settings
@@ -129,6 +129,46 @@ class RiskConfig:
 
     allow_short_selling: bool = False
 
+    # -- Exit policy -------------------------------------------------------
+    exit_hard_stop_pct: Decimal = Decimal("0.08")
+    """Loss from average cost at which the whole position is proposed for exit.
+    A floor, never widened: the one number in this config whose job is to be
+    hit."""
+
+    exit_trailing_pct: Decimal = Decimal("0.05")
+    """How far below the high-water mark the trailing floor sits, once armed."""
+
+    exit_trailing_arm_pct: Decimal = Decimal("0.10")
+    """Gain from average cost at which trailing switches on.  Below this the
+    hard stop is the only floor, so an ordinary wobble after entry does not
+    close a position that never went anywhere."""
+
+    exit_min_peak_observations: int = 3
+    """Syncs a peak must be built from before the trailing rule trusts it.  One
+    observation is an entry price wearing a peak's name."""
+
+    exit_roi_decay: tuple[tuple[TimeHorizon, int, Decimal], ...] = (
+        (TimeHorizon.INTRADAY, 0, Decimal("0.04")),
+        (TimeHorizon.INTRADAY, 240, Decimal("0.02")),
+        (TimeHorizon.INTRADAY, 480, Decimal("0")),
+        (TimeHorizon.DAYS, 0, Decimal("0.06")),
+        (TimeHorizon.DAYS, 1440, Decimal("0.03")),
+        (TimeHorizon.DAYS, 4320, Decimal("0")),
+        (TimeHorizon.WEEKS, 0, Decimal("0.15")),
+        (TimeHorizon.WEEKS, 10080, Decimal("0.08")),
+        (TimeHorizon.WEEKS, 30240, Decimal("0")),
+        (TimeHorizon.MONTHS, 0, Decimal("0.30")),
+        (TimeHorizon.MONTHS, 43200, Decimal("0.15")),
+        (TimeHorizon.MONTHS, 129600, Decimal("0")),
+    )
+    """Profit required to bank a reduction, by thesis horizon and minutes held.
+
+    Demand a lot early, accept less as the thesis ages.  The terminal ``0`` row
+    is the horizon-elapsed boundary: past it the position is closed whatever its
+    result, because an event thesis that has not resolved by then is no longer
+    the reason the position is held.
+    """
+
     _version: str = field(default="", compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -157,6 +197,8 @@ def _jsonable(value: Any) -> Any:
         # format brings it back to ordinary notation.
         return format(value.normalize(), "f")
     if isinstance(value, MarketSession):
+        return value.value
+    if isinstance(value, TimeHorizon):
         return value.value
     if isinstance(value, tuple | list):
         return [_jsonable(item) for item in value]
@@ -203,5 +245,9 @@ def risk_config_from_settings(settings: Settings) -> RiskConfig:
         confidence_modulates_size=settings.risk_confidence_modulates_size,
         min_confidence_size_factor=settings.risk_min_confidence_size_factor,
         reduce_fraction=settings.risk_reduce_fraction,
+        exit_hard_stop_pct=settings.risk_exit_hard_stop_pct,
+        exit_trailing_pct=settings.risk_exit_trailing_pct,
+        exit_trailing_arm_pct=settings.risk_exit_trailing_arm_pct,
+        exit_min_peak_observations=settings.risk_exit_min_peak_observations,
         allow_short_selling=False,
     )
