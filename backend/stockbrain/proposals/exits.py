@@ -122,6 +122,15 @@ class ExitSweepService:
                     counts["skipped_unpriced"] += 1
                     continue
 
+                # The stored ATR is fed to the rule only when it was computed for
+                # the configured period and in this position's own currency.  A
+                # RESTART_REQUIRED period change or a GBX/GBP flip must not
+                # silently apply an ATR measured on a different scale.
+                atr_matches = (
+                    peak is not None
+                    and peak.atr_period == self._config.exit_atr_period
+                    and peak.atr_currency == position.currency
+                )
                 observations.append(
                     ExitObservation(
                         broker_ticker=position.broker_ticker,
@@ -131,8 +140,8 @@ class ExitSweepService:
                         current_price=position.current_price,
                         peak_price=peak.peak_price if peak is not None else None,
                         peak_observations=peak.observations if peak is not None else 0,
-                        atr=peak.atr if peak is not None else None,
-                        atr_as_of=peak.atr_as_of if peak is not None else None,
+                        atr=peak.atr if atr_matches else None,
+                        atr_as_of=peak.atr_as_of if atr_matches else None,
                         opened_at=origin.executed_at,
                         horizon=thesis.time_horizon,
                         thesis_superseded=await self._superseded(session, origin.thesis_id),

@@ -6,6 +6,7 @@ import datetime as dt
 from collections.abc import Sequence
 from decimal import Decimal
 
+import pytest
 import sqlalchemy as sa
 
 from stockbrain.db.models.companies import BrokerInstrument
@@ -344,3 +345,46 @@ async def test_the_exit_sweep_sees_the_stored_atr(clean_tables: Database) -> Non
             )
         ).scalar_one()
     assert any(rule["rule_id"] == "volatility_stop" for rule in rules)
+
+
+@pytest.mark.parametrize(
+    ("atr_period", "atr_currency", "position_currency"),
+    [(20, "USD", "USD"), (14, "GBP", "GBX")],
+)
+async def test_an_atr_with_wrong_provenance_is_not_fed_to_the_sweep(
+    clean_tables: Database,
+    atr_period: int,
+    atr_currency: str,
+    position_currency: str,
+) -> None:
+    """A period-20 or pence-vs-pounds ATR must not arm the volatility stop.
+
+    Cost 101, peak 110, price 103: with a usable ATR the Chandelier floor is
+    104 and the rule fires; without one the flat rules are silent (the trailing
+    stop is not armed at a 8.9% peak gain), so ``proposed`` stays zero exactly
+    when the provenance check drops the ATR.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("101"),
+        current_price=Decimal("103"),
+    )
+    await _set_position_currency(database, broker_ticker="AAPL_US_EQ", currency=position_currency)
+    await _seed_peak(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        peak_price=Decimal("110"),
+        observations=5,
+        atr=Decimal("2"),
+        atr_as_of=NOW.date(),
+        atr_period=atr_period,
+        atr_currency=atr_currency,
+    )
+    await ph.fund(database, captured_at=NOW)
+
+    counts = await (await _exit_sweep(database)).sweep(now=NOW)
+
+    assert counts["proposed"] == 0
