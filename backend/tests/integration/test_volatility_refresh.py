@@ -9,7 +9,7 @@ from decimal import Decimal
 import sqlalchemy as sa
 
 from stockbrain.db.models.companies import BrokerInstrument
-from stockbrain.db.models.portfolio import PositionPeak
+from stockbrain.db.models.portfolio import Position, PositionPeak
 from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.session import Database
 from stockbrain.enums import Broker, OrderSide
@@ -56,14 +56,28 @@ async def _seed_position_with_peak(
     *,
     broker_ticker: str,
     exchange: str,
-    currency: str,
+    currency: str | None,
 ) -> None:
-    """A funded holding, its listing's exchange, and the peak an ATR hangs on."""
+    """A funded holding, its listing's exchange, and the peak an ATR hangs on.
+
+    ``currency`` is stamped on both the account snapshot and the ``Position``
+    row; pass ``None`` for a position whose own currency the broker omitted.
+    """
     await ph.fund(
         database,
-        currency=currency,
+        currency=currency or "USD",
         positions={broker_ticker: (Decimal("9"), Decimal("9"))},
     )
+    if currency is None:
+        async with database.transaction() as session:
+            await session.execute(
+                sa.update(Position)
+                .where(
+                    Position.broker == Broker.TRADING212,
+                    Position.broker_ticker == broker_ticker,
+                )
+                .values(currency=None)
+            )
     async with database.transaction() as session:
         session.add(
             BrokerInstrument(
@@ -155,6 +169,25 @@ async def test_a_currency_mismatch_is_refused_not_converted(clean_tables: Databa
     counts = await service.refresh(now=NOW)
 
     assert counts["currency_mismatch"] == 1 and counts["refreshed"] == 0
+    async with database.session() as session:
+        peak = (await session.execute(sa.select(PositionPeak))).scalar_one()
+    assert peak.atr is None
+
+
+async def test_a_position_with_an_unknown_currency_is_not_fetched(clean_tables: Database) -> None:
+    database = clean_tables
+    await _seed_position_with_peak(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        exchange="NASDAQ",
+        currency=None,
+    )
+    bars = _FakeBars(currency="USD")
+
+    counts = await _volatility_service(database, bars).refresh(now=NOW)
+
+    assert counts["skipped_no_currency"] == 1 and counts["refreshed"] == 0
+    assert bars.calls == []
     async with database.session() as session:
         peak = (await session.execute(sa.select(PositionPeak))).scalar_one()
     assert peak.atr is None

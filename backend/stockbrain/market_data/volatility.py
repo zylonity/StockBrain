@@ -32,6 +32,7 @@ _TALLY_KEYS = (
     "refreshed",
     "skipped_fresh",
     "skipped_no_symbol",
+    "skipped_no_currency",
     "skipped_no_peak",
     "currency_mismatch",
     "insufficient_bars",
@@ -100,6 +101,12 @@ class VolatilityRefreshService:
             if symbol is None:
                 counts["skipped_no_symbol"] += 1
                 continue
+            if position.currency is None:
+                # Without the position's currency there is nothing to assert the
+                # fetched ATR against, so refuse to fetch at all rather than
+                # stamp Yahoo's currency on the row unverified.
+                counts["skipped_no_currency"] += 1
+                continue
             work.append((position.broker_ticker, symbol, position.currency))
 
         errors = 0
@@ -118,7 +125,7 @@ class VolatilityRefreshService:
                     error=str(exc)[:200],
                 )
                 continue
-            if instrument_currency is not None and currency != instrument_currency:
+            if currency != instrument_currency:
                 counts["currency_mismatch"] += 1
                 log.warning(
                     "volatility_currency_mismatch",
