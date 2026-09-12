@@ -1,15 +1,18 @@
 """Deterministic exit rules for open positions.
 
-Five rules, one of which fires, in a precedence that is declared rather than
+Six rules, one of which fires, in a precedence that is declared rather than
 emergent.  Ordering is by what is at stake per unit of delay: limiting a loss
 first, protecting a gain second, acting on changed research third, banking a
 target fourth, and recycling dead capital last.
 
-Every rule is a ratio against ``Position.average_price``, so currency cancels
-and no FX conversion belongs here.  The prices are broker-supplied and
-explicitly not real-time: a signal from this module is a *trigger*, and the
-reference price on the resulting proposal always comes from the market-data
-path through the ordinary evaluator.
+Every rule but ``volatility_stop`` is a ratio against ``Position.average_price``,
+so currency cancels and no FX conversion belongs here.  ``volatility_stop``
+compares a price *difference* -- ``peak - price`` against ``k * ATR`` -- so
+currency does not cancel; it trusts only an ATR whose period and currency match
+the position, and the refresh asserts that currency at write time.  The prices
+are broker-supplied and explicitly not real-time: a signal from this module is a
+*trigger*, and the reference price on the resulting proposal always comes from
+the market-data path through the ordinary evaluator.
 
 Nothing here reads a database, a setting or a clock.  ``now`` is a parameter.
 """

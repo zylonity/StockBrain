@@ -530,9 +530,12 @@ spend. Transport failures can leave unknown provider spend, recorded as failures
 Alpaca remains the market-data source; historical research snapshots never
 clear execution-grade quote checks. FRED uses only DFF/DGS10 with a prior-day
 Chicago vintage. Missing providers and classified errors appear as degradation.
-No optional upstream Yahoo/social/prediction-market network path is enabled for
-research or pricing; the narrow Yahoo daily-bar fetch that scales one exit
-threshold is the sole exception (see Deterministic exits).
+Yahoo is already a research provider: analyst price targets come from yfinance,
+which is enabled by default, and the narrow Yahoo daily-bar fetch that scales
+one exit threshold is a second, equally fenced use of the same unofficial
+source. Polymarket's macro probabilities are likewise on by default. None of
+these is ever a reference price; only the market-data path through the evaluator
+prices a proposal (see Deterministic exits).
 Research confidence is a ranking feature, not a calibrated probability or
 authoritative risk score; Phase 6 below is what consumes it, and it may only
 ever shrink a size inside limits the model never sees.
