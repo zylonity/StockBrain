@@ -976,6 +976,51 @@ CATALOGUE: tuple[_Group, ...] = (
                 "How often the exit sweep runs.",
                 unit="seconds",
             ),
+            _s(
+                "risk_exit_atr_multiplier",
+                "Exit ATR multiplier",
+                RESTART,
+                "How many average true ranges below the peak the volatility floor "
+                "sits. When no ATR is available the flat hard stop is the only floor.",
+            ),
+            _s(
+                "risk_exit_atr_period",
+                "Exit ATR period",
+                RESTART,
+                "Trading days of true range averaged into the ATR.",
+                unit="days",
+            ),
+            _s(
+                "risk_exit_atr_max_age_days",
+                "Exit ATR maximum age",
+                RESTART,
+                "An ATR whose last bar is older than this is not trusted; the rule "
+                "skips and the flat hard stop stands. Three days spans a weekend.",
+                unit="days",
+            ),
+            _s(
+                "volatility_refresh_enabled",
+                "Volatility refresh",
+                RESTART,
+                "Whether the scheduled job that fetches daily bars and stores an ATR "
+                "per open position runs. Off by default.",
+            ),
+            _s(
+                "volatility_refresh_interval_seconds",
+                "Volatility refresh interval",
+                RESTART,
+                "How often the volatility refresh runs. Daily bars change at most once "
+                "a day, so this is measured in hours rather than minutes.",
+                unit="seconds",
+            ),
+            _s(
+                "volatility_bars_days",
+                "Volatility bars window",
+                RESTART,
+                "Calendar days of daily bars requested per symbol. Must comfortably "
+                "cover the ATR period, which is measured in trading days.",
+                unit="days",
+            ),
         ),
     ),
     _Group(

@@ -154,3 +154,8 @@ def test_the_roi_decay_table_is_non_increasing_within_each_horizon() -> None:
     for _horizon, group in groupby(rows, key=lambda row: row[0]):
         targets = [target for _h, _m, target in group]
         assert targets == sorted(targets, reverse=True)
+
+
+def test_atr_thresholds_change_the_policy_version() -> None:
+    assert h.config().version != h.config(exit_atr_multiplier=Decimal("2.5")).version
+    assert h.config().version != h.config(exit_atr_period=20).version

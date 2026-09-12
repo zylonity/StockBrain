@@ -169,6 +169,14 @@ class RiskConfig:
     the reason the position is held.
     """
 
+    exit_atr_multiplier: Decimal = Decimal("3")
+    """Chandelier width: the volatility floor sits this many ATRs below the peak."""
+
+    exit_atr_period: int = 14
+    exit_atr_max_age_days: int = 3
+    """An ATR older than this (by its last bar's date) is not trusted; the rule
+    skips and the flat hard stop stands.  Three days spans a weekend."""
+
     _version: str = field(default="", compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -249,5 +257,8 @@ def risk_config_from_settings(settings: Settings) -> RiskConfig:
         exit_trailing_pct=settings.risk_exit_trailing_pct,
         exit_trailing_arm_pct=settings.risk_exit_trailing_arm_pct,
         exit_min_peak_observations=settings.risk_exit_min_peak_observations,
+        exit_atr_multiplier=settings.risk_exit_atr_multiplier,
+        exit_atr_period=settings.risk_exit_atr_period,
+        exit_atr_max_age_days=settings.risk_exit_atr_max_age_days,
         allow_short_selling=False,
     )

@@ -271,3 +271,45 @@ def test_a_trailing_floor_wider_than_its_arm_threshold_is_refused(
             RISK_EXIT_TRAILING_PCT="0.20",
             RISK_EXIT_TRAILING_ARM_PCT="0.10",
         )
+
+
+def test_volatility_refresh_ships_disabled(make_settings: Any) -> None:
+    settings = make_settings()
+    assert settings.volatility_refresh_enabled is False
+    assert settings.risk_exit_atr_period >= 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("RISK_EXIT_ATR_MULTIPLIER", "0"),
+        ("RISK_EXIT_ATR_MULTIPLIER", "11"),
+        ("RISK_EXIT_ATR_PERIOD", "1"),
+        ("RISK_EXIT_ATR_PERIOD", "61"),
+        ("RISK_EXIT_ATR_MAX_AGE_DAYS", "0"),
+        ("RISK_EXIT_ATR_MAX_AGE_DAYS", "15"),
+        ("VOLATILITY_REFRESH_INTERVAL_SECONDS", "3599"),
+        ("VOLATILITY_REFRESH_INTERVAL_SECONDS", "86401"),
+        ("VOLATILITY_BARS_DAYS", "29"),
+        ("VOLATILITY_BARS_DAYS", "366"),
+    ],
+)
+def test_a_meaningless_volatility_limit_refuses_to_start(
+    make_settings: Any, field: str, value: str
+) -> None:
+    """A silently clamped volatility stop is a stop nobody chose."""
+    with pytest.raises(ValidationError, match="risk configuration"):
+        make_settings(**{field: value})
+
+
+def test_a_bars_window_that_cannot_cover_the_atr_period_is_refused(
+    make_settings: Any,
+) -> None:
+    """Yahoo's period is calendar days and the ATR window is trading days.
+
+    Forty calendar days cannot hold the twenty-two trading closes a period of
+    twenty needs, so the ATR would starve and the rule would silently fall back
+    to the flat hard stop on every position.
+    """
+    with pytest.raises(ValidationError, match="twice RISK_EXIT_ATR_PERIOD"):
+        make_settings(VOLATILITY_BARS_DAYS="40", RISK_EXIT_ATR_PERIOD="20")

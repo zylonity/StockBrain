@@ -113,6 +113,18 @@ class PositionPeak(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """How many syncs contributed.  A peak from one observation is a peak the
     trailing rule should not yet trust, and this is how it can tell."""
 
+    atr: Mapped[Decimal | None] = mapped_column(sa.Numeric(24, 8))
+    """Average true range in the instrument's own quote unit (pence for LSE),
+    from research-grade daily bars.  ``None`` until the volatility refresh has
+    run, and never a reference price."""
+
+    atr_period: Mapped[int | None] = mapped_column(sa.Integer)
+    atr_currency: Mapped[str | None] = mapped_column(sa.String(3))
+    atr_as_of: Mapped[dt.date | None] = mapped_column(sa.Date)
+    """Date of the last bar that fed the ATR.  Staleness is judged against it."""
+
+    atr_source: Mapped[str | None] = mapped_column(sa.Text)
+
     __table_args__ = (
         sa.UniqueConstraint(
             "broker",

@@ -826,6 +826,13 @@ class Settings(BaseSettings):
     exit_sweep_enabled: bool = False
     exit_sweep_interval_seconds: float = 300.0
 
+    risk_exit_atr_multiplier: Decimal = Decimal("3")
+    risk_exit_atr_period: int = 14
+    risk_exit_atr_max_age_days: int = 3
+    volatility_refresh_enabled: bool = False
+    volatility_refresh_interval_seconds: float = 21600.0
+    volatility_bars_days: int = 90
+
     proposal_revalidation_batch: int = 5
     """How many active proposals the invalidation sweep re-prices per tick.
     Bounded so the sweep cannot turn into an unmetered market-data spend."""
@@ -1147,6 +1154,52 @@ class Settings(BaseSettings):
                 "RISK_EXIT_TRAILING_PCT must be below RISK_EXIT_TRAILING_ARM_PCT: a floor "
                 f"{self.risk_exit_trailing_pct} below a peak armed at "
                 f"{self.risk_exit_trailing_arm_pct} would already be under the entry price"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_volatility_policy(self) -> Settings:
+        """Refuse a volatility policy that cannot mean anything.
+
+        The ATR window is measured in trading days, but Yahoo's ``period``
+        argument is calendar days, so the bar request has to cover the window
+        with room for weekends and holidays.  A bars window shorter than twice
+        the period plus a week would starve the ATR of the closes it needs, and
+        a starved ATR reads downstream as "no reading yet" rather than as a
+        configuration error.
+        """
+        problems: list[str] = []
+        if not 0 < self.risk_exit_atr_multiplier <= 10:
+            problems.append(
+                "RISK_EXIT_ATR_MULTIPLIER must be above 0 and at most 10 "
+                f"(got {self.risk_exit_atr_multiplier})"
+            )
+        if not 2 <= self.risk_exit_atr_period <= 60:
+            problems.append(
+                f"RISK_EXIT_ATR_PERIOD must be between 2 and 60 (got {self.risk_exit_atr_period})"
+            )
+        if not 1 <= self.risk_exit_atr_max_age_days <= 14:
+            problems.append(
+                "RISK_EXIT_ATR_MAX_AGE_DAYS must be between 1 and 14 "
+                f"(got {self.risk_exit_atr_max_age_days})"
+            )
+        if not 3600.0 <= self.volatility_refresh_interval_seconds <= 86400.0:
+            problems.append(
+                "VOLATILITY_REFRESH_INTERVAL_SECONDS must be between 3600 and 86400 "
+                f"(got {self.volatility_refresh_interval_seconds})"
+            )
+        if not 30 <= self.volatility_bars_days <= 365:
+            problems.append(
+                f"VOLATILITY_BARS_DAYS must be between 30 and 365 (got {self.volatility_bars_days})"
+            )
+        if problems:
+            raise ValueError("Invalid risk configuration: " + "; ".join(problems))
+        if self.volatility_bars_days < 2 * self.risk_exit_atr_period + 7:
+            raise ValueError(
+                "VOLATILITY_BARS_DAYS must be at least twice RISK_EXIT_ATR_PERIOD plus "
+                "seven, because the ATR window counts trading days and Yahoo's period "
+                f"counts calendar days (got {self.volatility_bars_days} days for a "
+                f"{self.risk_exit_atr_period}-day period)"
             )
         return self
 
