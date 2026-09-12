@@ -217,6 +217,7 @@ async def clean_tables(database: Database) -> AsyncIterator[Database]:
         "risk_evaluations",
         "trade_proposals",
         "portfolio_snapshots",
+        "position_peaks",
         "positions",
         "theses",
         "research_runs",
