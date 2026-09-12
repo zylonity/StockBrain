@@ -50,6 +50,25 @@ _SWEEPABLE_STATUSES: tuple[ProposalStatus, ...] = (
 )
 
 
+async def thesis_is_superseded(session: AsyncSession, thesis_id: uuid.UUID) -> bool:
+    """Whether a newer SUCCEEDED thesis names this one in ``supersedes_thesis_id``.
+
+    Shared by the proposal sweep (a pending proposal built on a superseded
+    thesis is invalidated) and the exit sweep (a held position opened on a
+    superseded thesis is an exit signal).
+    """
+    count = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(Thesis)
+        .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
+        .where(
+            Thesis.supersedes_thesis_id == thesis_id,
+            ResearchRun.status == ResearchStatus.SUCCEEDED,
+        )
+    )
+    return bool(count)
+
+
 class ProposalLifecycle:
     """Lifecycle workflow collaborator for one proposal service."""
 
@@ -250,18 +269,10 @@ class ProposalLifecycle:
         if proposal.company_id is not None and instrument.company_id != proposal.company_id:
             return "the listing is no longer attached to the company this proposal was about"
 
-        if proposal.thesis_id is not None:
-            newer = await session.scalar(
-                sa.select(sa.func.count())
-                .select_from(Thesis)
-                .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
-                .where(
-                    Thesis.supersedes_thesis_id == proposal.thesis_id,
-                    ResearchRun.status == ResearchStatus.SUCCEEDED,
-                )
-            )
-            if newer:
-                return "a newer thesis supersedes the one this proposal was built on"
+        if proposal.thesis_id is not None and await thesis_is_superseded(
+            session, proposal.thesis_id
+        ):
+            return "a newer thesis supersedes the one this proposal was built on"
 
         if proposal.side is OrderSide.SELL:
             account, _reason = await self._service.account_state.load(

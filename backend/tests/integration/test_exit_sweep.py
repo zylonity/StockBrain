@@ -16,17 +16,23 @@ from stockbrain.broker.trading212_account import (
     Trading212AccountClient,
 )
 from stockbrain.db.base import utcnow
+from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
 from stockbrain.db.models.portfolio import Position, PositionPeak
 from stockbrain.db.models.proposals import TradeProposal
+from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     Broker,
+    ImpactDirection,
     OrderSide,
     OrderType,
     PriceSource,
     ProposalStatus,
+    ResearchStatus,
+    ResolutionStatus,
     RuleOutcome,
     ThesisAction,
+    TimeHorizon,
 )
 from stockbrain.proposals.exits import ExitSweepService
 from stockbrain.proposals.service import ProposalService
@@ -172,26 +178,114 @@ class _ExecutedBuy:
     proposal_id: uuid.UUID
 
 
+@dataclass(frozen=True, slots=True)
+class _Listing:
+    """An independent company -> listing -> research -> thesis chain."""
+
+    thesis_id: uuid.UUID
+    research_run_id: uuid.UUID
+
+
+async def _seed_listing(
+    database: Database, *, broker_ticker: str, market_symbol: str, name: str
+) -> _Listing:
+    """A second exitable listing beyond ``proposal_helpers``' one Apple world.
+
+    The sweep's starvation regression needs several positions that each signal
+    and each produce their own proposal, and a proposal's ticker comes from the
+    listing its thesis resolved to -- so each position needs its own listing.
+    """
+    company_id, instrument_id, impact_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    run_id, thesis_id = uuid.uuid4(), uuid.uuid4()
+    isin = f"TEST{market_symbol}"
+    async with database.transaction() as session:
+        session.add(Company(id=company_id, name=name, isin=isin))
+        await session.flush()
+        session.add(
+            BrokerInstrument(
+                id=instrument_id,
+                company_id=company_id,
+                broker=Broker.TRADING212,
+                broker_ticker=broker_ticker,
+                market_symbol=market_symbol,
+                market_code="US",
+                name=name,
+                exchange="NASDAQ",
+                currency="USD",
+                isin=isin,
+                instrument_type="STOCK",
+                is_active=True,
+                max_open_quantity=Decimal("55000"),
+            )
+        )
+        await session.flush()
+        session.add(
+            EventCompanyImpact(
+                id=impact_id,
+                event_id=ph.EVENT_ID,
+                company_id=company_id,
+                company_name_hint=name,
+                company_key=market_symbol.lower(),
+                ticker_hint=market_symbol,
+                direction=ImpactDirection.POSITIVE,
+                materiality_score=0.8,
+                confidence=0.85,
+                impact_path="direct",
+                broker_instrument_id=instrument_id,
+                resolution_status=ResolutionStatus.RESOLVED,
+            )
+        )
+        session.add(
+            ResearchRun(
+                id=run_id,
+                event_id=ph.EVENT_ID,
+                company_id=company_id,
+                impact_id=impact_id,
+                broker_instrument_id=instrument_id,
+                status=ResearchStatus.SUCCEEDED,
+                completed_at=utcnow(),
+            )
+        )
+        await session.flush()
+        session.add(
+            Thesis(
+                id=thesis_id,
+                research_run_id=run_id,
+                action=ThesisAction.BUY,
+                confidence=0.9,
+                time_horizon=TimeHorizon.DAYS,
+                summary="A thesis.",
+            )
+        )
+    return _Listing(thesis_id=thesis_id, research_run_id=run_id)
+
+
 async def _seed_executed_buy(
     database: Database,
     *,
     broker_ticker: str = "AAPL_US_EQ",
     quantity: Decimal = Decimal("9"),
     dedupe_key: str | None = None,
+    listing: _Listing | None = None,
 ) -> _ExecutedBuy:
     """Seed a funded, held position and the executed BUY proposal that opened it.
 
-    The research chain is ``proposal_helpers``' healthy world; the final
+    The research chain is ``proposal_helpers``' healthy world unless ``listing``
+    supplies an independent one (seeded by :func:`_seed_listing`); the final
     proposal is written directly.  ``dedupe_key`` defaults to ``None`` so the
     inherited-thesis test starts from a clean slate; the coexistence regression
     passes the key the ordinary generation path would have stored.
     """
-    await ph.seed(database)
+    if listing is None:
+        await ph.seed(database)
+        thesis_id, run_id = ph.THESIS_ID, ph.RUN_ID
+    else:
+        thesis_id, run_id = listing.thesis_id, listing.research_run_id
     await ph.fund(database, positions={broker_ticker: (quantity, quantity)})
     moment = utcnow()
     proposal = TradeProposal(
-        thesis_id=ph.THESIS_ID,
-        research_run_id=ph.RUN_ID,
+        thesis_id=thesis_id,
+        research_run_id=run_id,
         broker=Broker.TRADING212,
         broker_ticker=broker_ticker,
         account_id=ph.ACCOUNT_ID,
@@ -214,8 +308,8 @@ async def _seed_executed_buy(
     async with database.transaction() as session:
         session.add(proposal)
     return _ExecutedBuy(
-        thesis_id=ph.THESIS_ID,
-        research_run_id=ph.RUN_ID,
+        thesis_id=thesis_id,
+        research_run_id=run_id,
         proposal_id=proposal.id,
     )
 
@@ -413,3 +507,41 @@ async def test_the_sweep_skips_a_position_that_already_has_a_live_proposal(
 
     assert counts["skipped_active_proposal"] == 1
     assert counts["proposed"] == 0
+
+
+async def test_the_sweep_defers_positions_beyond_its_per_tick_budget(
+    clean_tables: Database,
+) -> None:
+    """A stable order plus a query LIMIT would starve every later position.
+
+    Every open position must be evaluated on every tick; ``limit`` is a budget
+    on how many proposals one tick may generate, not a bound on which positions
+    are looked at.  The deferred position must be the one proposed next tick.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    for market_symbol in ("MSFT", "GOOG"):
+        broker_ticker = f"{market_symbol}_US_EQ"
+        listing = await _seed_listing(
+            database, broker_ticker=broker_ticker, market_symbol=market_symbol, name=market_symbol
+        )
+        await _seed_executed_buy(database, broker_ticker=broker_ticker, listing=listing)
+    for broker_ticker in ("AAPL_US_EQ", "GOOG_US_EQ", "MSFT_US_EQ"):
+        await _seed_position(
+            database,
+            broker_ticker=broker_ticker,
+            average_price=Decimal("100"),
+            current_price=Decimal("88"),
+        )
+
+    sweep = await _exit_sweep(database)
+
+    first = await sweep.sweep(limit=2)
+    assert first["signalled"] == 3
+    assert first["proposed"] == 2
+    assert first["deferred"] == 1
+
+    second = await sweep.sweep(limit=2)
+    assert second["skipped_active_proposal"] == 2
+    assert second["proposed"] == 1
+    assert second["deferred"] == 0

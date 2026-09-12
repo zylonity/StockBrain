@@ -24,10 +24,10 @@ from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.portfolio import Position, PositionPeak
 from stockbrain.db.models.proposals import TradeProposal
-from stockbrain.db.models.research import ResearchRun, Thesis
+from stockbrain.db.models.research import Thesis
 from stockbrain.db.session import Database
-from stockbrain.enums import ResearchStatus
 from stockbrain.logging import get_logger
+from stockbrain.proposals.lifecycle import thesis_is_superseded
 from stockbrain.proposals.service import ProposalService
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES
 from stockbrain.risk.config import RiskConfig
@@ -56,10 +56,15 @@ class ExitSweepService:
         self._config = config
 
     async def sweep(self, *, now: dt.datetime | None = None, limit: int = 25) -> dict[str, int]:
-        """Evaluate open positions and propose at most one exit each.
+        """Evaluate every open position and propose at most ``limit`` exits.
 
         Returns a tally rather than raising: one position whose instrument has
-        gone missing must not stop the other holdings being looked at.
+        gone missing must not stop the other holdings being looked at.  Every
+        open position is evaluated on every tick -- the ``limit`` is a per-tick
+        budget on how many proposals may be generated, not a bound on which
+        positions are examined, so a stable ordering cannot starve the
+        positions beyond the first ``limit``; a signalled position the budget
+        did not reach is counted as ``deferred``.
         """
         moment = now or utcnow()
         # Every key is present from the start, so a caller reading a zero count
@@ -74,6 +79,7 @@ class ExitSweepService:
                 "signalled": 0,
                 "proposed": 0,
                 "blocked": 0,
+                "deferred": 0,
             }
         )
 
@@ -91,7 +97,6 @@ class ExitSweepService:
                     )
                     .where(Position.broker == self._proposals.broker, Position.quantity > ZERO)
                     .order_by(Position.broker_ticker)
-                    .limit(limit)
                 )
             ).all()
 
@@ -131,11 +136,19 @@ class ExitSweepService:
                     )
                 )
 
+        attempted = 0
         for observation in observations:
             signal = evaluate_exit(observation, self._config, now=moment)
             if signal is None:
                 continue
             counts["signalled"] += 1
+            if attempted >= limit:
+                # The budget bounds how many exit proposals one tick generates,
+                # never which positions are looked at; the rest are re-signalled
+                # and attempted on the next tick.
+                counts["deferred"] += 1
+                continue
+            attempted += 1
             result = await self._proposals.generate_exit(
                 observation.broker_ticker, signal, now=moment
             )
@@ -160,15 +173,6 @@ class ExitSweepService:
         """Whether research has published a successor to the opening thesis.
 
         The same question `proposals.lifecycle` already asks of a pending
-        proposal, asked of a holding.
+        proposal, asked of a holding -- and answered by the same query.
         """
-        count = await session.scalar(
-            sa.select(sa.func.count())
-            .select_from(Thesis)
-            .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
-            .where(
-                Thesis.supersedes_thesis_id == thesis_id,
-                ResearchRun.status == ResearchStatus.SUCCEEDED,
-            )
-        )
-        return bool(count)
+        return await thesis_is_superseded(session, thesis_id)
