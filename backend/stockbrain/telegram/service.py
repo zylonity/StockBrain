@@ -506,6 +506,14 @@ class TelegramService:
                         for rule in (evaluation.rules or [])
                         if isinstance(rule, dict) and rule.get("outcome") == "BLOCK"
                     )
+                    if not block_reasons:
+                        # A decision can be refused by sizing alone -- no rule
+                        # said BLOCK, the cap simply produced no executable
+                        # order. The evaluation's detail carries that reason so
+                        # the message never renders an empty "Blocked by:" list.
+                        block_reasons = tuple(
+                            part for part in (evaluation.detail or "").split("; ") if part
+                        )
         return ResearchRunView(
             id=run.id,
             status=run.status,

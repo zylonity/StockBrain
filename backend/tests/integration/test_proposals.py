@@ -14,6 +14,7 @@ from decimal import Decimal
 import pytest
 import sqlalchemy as sa
 
+from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument
 from stockbrain.db.models.proposals import RiskEvaluation, TradeProposal
@@ -38,7 +39,9 @@ from stockbrain.errors import (
     ProposalExpired,
     RiskBlocked,
 )
+from stockbrain.observability.health import ProviderHealthRegistry
 from stockbrain.telegram.preferences import NotificationPreferences
+from stockbrain.telegram.service import TelegramService
 from tests import proposal_helpers as ph
 
 pytestmark = pytest.mark.integration
@@ -851,3 +854,35 @@ async def test_a_hold_does_not_announce_a_block(clean_tables: Database) -> None:
             )
         ).scalar_one()
     assert count == 0
+
+
+async def test_a_sizing_refusal_with_no_block_rule_still_explains_itself(
+    clean_tables: Database,
+) -> None:
+    """A cap that sizes to nothing refuses a trade even with no BLOCK rule.
+
+    Nothing in the rule list says "no": the ceiling is simply too small for one
+    share. The durable evaluation must still carry the reason, and the read model
+    must surface it rather than an empty ``Blocked by:`` list.
+    """
+    # 2% of a 500 portfolio is a 10 cap. At a 5.00 ask that buys one share, which
+    # is below the 20 minimum trade notional -- so sizing, not a rule, refuses.
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.95)
+    await ph.fund(clean_tables, total=Decimal("500"), cash=Decimal("400"), invested=Decimal("100"))
+    result = await ph.service(
+        clean_tables,
+        market_data=ph.StubMarketData(bid=Decimal("4.99"), ask=Decimal("5.00")),
+    ).generate(ph.THESIS_ID)
+    assert not result.created
+    assert result.blocks == (), "no BLOCK rule fires; sizing alone refuses"
+
+    telegram = TelegramService(
+        clean_tables,
+        ph.settings(),
+        health=ProviderHealthRegistry(),
+        control=ControlStateService(clean_tables),
+    )
+    view = await telegram.research_run(ph.RUN_ID)
+    assert view is not None
+    assert view.block_reasons
+    assert any("minimum trade notional" in reason for reason in view.block_reasons)

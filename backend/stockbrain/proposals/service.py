@@ -359,7 +359,7 @@ class ProposalService:
                 snapshot=decision.as_dict(),
                 snapshot_hash=decision.snapshot_hash(),
                 actor="system:generator",
-                detail="; ".join(decision.blocks) or None,
+                detail="; ".join(decision.blocks) or "; ".join(decision.sizing.reasons) or None,
             )
             session.add(evaluation)
             await session.flush()
