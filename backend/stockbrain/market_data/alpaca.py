@@ -47,7 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
-from stockbrain.enums import BarTimeframe, CapabilityState, PriceSource
+from stockbrain.enums import BarTimeframe, CapabilityState, MarketSession, PriceSource
 from stockbrain.errors import (
     ProviderAuthError,
     ProviderEntitlementError,
@@ -57,6 +57,7 @@ from stockbrain.errors import (
 from stockbrain.httpclient import ProviderHttpClient, TokenBucket
 from stockbrain.logging import get_logger
 from stockbrain.market_data.base import Bar, ProviderCapability, Quote, Trade, to_decimal
+from stockbrain.market_data.sessions import session_from_us_clock
 from stockbrain.observability.metrics import METRICS
 
 __all__ = [
@@ -343,7 +344,9 @@ class AlpacaMarketDataClient:
     # ------------------------------------------------------------------
     # Capability / entitlement
     # ------------------------------------------------------------------
-    async def capability(self, *, refresh: bool = False) -> ProviderCapability:
+    async def capability(
+        self, *, refresh: bool = False, now: dt.datetime | None = None
+    ) -> ProviderCapability:
         """Actively verify what this account can reach.
 
         One quote request for one liquid symbol.  The result distinguishes a
@@ -351,11 +354,14 @@ class AlpacaMarketDataClient:
         silently switches feed: a deployment configured for SIP that turns out
         not to own SIP is reported, not quietly downgraded, because the price
         source that ends up on a proposal must be the one that was intended.
+
+        ``now`` exists only so a test can place the probe at a known instant;
+        it defaults to the wall clock.
         """
         if not refresh and self._capability.state is not CapabilityState.UNKNOWN:
             return self._capability
 
-        checked = utcnow()
+        checked = now or utcnow()
         symbol = self._settings.market_data_probe_symbol.strip().upper() or DEFAULT_PROBE_SYMBOL
         blockers: list[str] = []
 
@@ -381,9 +387,29 @@ class AlpacaMarketDataClient:
             state, detail = CapabilityState.DOWN, f"{type(exc).__name__}: {exc}"
         else:
             usable = quote.is_two_sided and quote.price is not None
+            # A one-sided book is what the feed looks like outside REGULAR
+            # hours: the closing print has no live bid or ask every night and
+            # weekend. That is the market being shut, not the provider being
+            # broken, so it must not read as DEGRADED on System Health. Inside
+            # REGULAR hours a one-sided probe quote is still a real fault.
+            # Safety is unchanged by design: outside REGULAR hours sizing is
+            # refused anyway, by `market_session` (risk_allowed_sessions is
+            # REGULAR) and by `quote_two_sided`. This only stops the capability
+            # *state* from lying about the provider.
+            in_regular = session_from_us_clock(checked).session is MarketSession.REGULAR
+            expected_outside_hours = not usable and not in_regular
+            if usable:
+                state = CapabilityState.HEALTHY
+                probe_detail = None
+            elif expected_outside_hours:
+                state = CapabilityState.HEALTHY
+                probe_detail = "probe quote carried no live bid/ask (expected outside market hours)"
+            else:
+                state = CapabilityState.DEGRADED
+                probe_detail = "probe quote carried no live bid/ask"
             if not usable:
-                blockers.append("probe quote was not two-sided")
-            state = CapabilityState.HEALTHY if usable else CapabilityState.DEGRADED
+                suffix = " (expected outside market hours)" if expected_outside_hours else ""
+                blockers.append(f"probe quote was not two-sided{suffix}")
 
             # Freshness is reported, not folded into the state. Outside market
             # hours the latest IEX quote is the closing print and is hours old;
@@ -403,7 +429,7 @@ class AlpacaMarketDataClient:
                 provider=self.name,
                 state=state,
                 feed=self._feed,
-                detail=None if usable else "probe quote carried no live bid/ask",
+                detail=probe_detail,
                 checked_at=checked,
                 realtime_pricing_usable=usable,
                 probe_symbol=symbol,

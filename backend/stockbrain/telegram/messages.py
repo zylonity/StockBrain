@@ -13,6 +13,7 @@ Nothing in this module concatenates a raw value into markup.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from stockbrain.control.state import ControlSnapshot
@@ -609,6 +610,25 @@ def _thesis_line(view: ResearchRunView) -> str:
     return f"Thesis: {bold(esc(view.action))}{esc(confidence)}{horizon}"
 
 
+def _transient_reason_rank(reason: str) -> int:
+    """Preference among transient reasons: session, then freshness, then rest."""
+    if reason.startswith("session "):
+        return 0
+    if reason.startswith("quote is "):
+        return 1
+    return 2
+
+
+def _lead_transient_reason(reasons: Sequence[str]) -> str:
+    """The one transient reason to quote when the set is collapsed to a line.
+
+    A shut session is the decisive fact -- the quote is old and the book is
+    one-sided *because* the market is closed -- so it speaks for the rest.
+    Freshness is the next most causal, and anything else falls back to order.
+    """
+    return min(reasons, key=_transient_reason_rank)
+
+
 def render_research_stage(
     view: ResearchRunView, event: PipelineEvent, *, deferral_max_hours: int | None = None
 ) -> str:
@@ -648,7 +668,9 @@ def render_research_stage(
         if view.transient_block_reasons:
             count = len(view.transient_block_reasons)
             plural = "rule" if count == 1 else "rules"
-            first = trim(view.transient_block_reasons[0], _TRANSIENT_REASON_LIMIT)
+            first = trim(
+                _lead_transient_reason(view.transient_block_reasons), _TRANSIENT_REASON_LIMIT
+            )
             lines.append(
                 f"Also blocked right now by market state "
                 f"({count} {plural} — clears at the open): {first}"
@@ -668,8 +690,13 @@ def render_research_stage(
         lines.append(bold("Blocked for now by:"))
         # A deferral is transient-only, so the reasons that refused it live in
         # ``transient_block_reasons``; include both so a future deferral that
-        # also carries a decisive refusal still names it.
-        reasons = (*view.block_reasons, *view.transient_block_reasons)
+        # also carries a decisive refusal still names it. The session leads,
+        # then freshness, because the later reasons are consequences of the
+        # first, whatever order the risk layer produced them in.
+        reasons = sorted(
+            (*view.block_reasons, *view.transient_block_reasons),
+            key=_transient_reason_rank,
+        )
         for reason in reasons[:8]:
             lines.append(f"• {trim(reason, _REASON_LIMIT)}")
         if len(reasons) > 8:

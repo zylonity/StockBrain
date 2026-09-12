@@ -277,6 +277,23 @@ def test_refinement_ignores_a_non_json_body() -> None:
     assert refine_alpaca_error(response, original) is original
 
 
+async def _probe_with(*, one_sided: bool, at: dt.datetime) -> ProviderCapability:
+    """Probe through the fake client at an injected instant.
+
+    ``one_sided`` reproduces Alpaca's "no active bid/ask": a quote whose bid and
+    ask are both the documented zero rather than a missing side.
+    """
+    quote = QUOTE_BODY["quote"]
+    if one_sided:
+        quote = {**quote, "bp": 0, "bs": 0}  # type: ignore[dict-item]
+    body = {"symbol": "AAPL", "quote": quote}
+    client = _client(httpx.MockTransport(lambda _: httpx.Response(200, json=body)))
+    try:
+        return await client.capability(now=at)
+    finally:
+        await client.aclose()
+
+
 async def test_capability_reports_entitlement_missing_without_crashing() -> None:
     client = _client(
         httpx.MockTransport(
@@ -327,13 +344,38 @@ async def test_capability_is_healthy_on_a_two_sided_quote() -> None:
 
 
 async def test_a_one_sided_probe_quote_degrades_rather_than_passes() -> None:
-    """Alpaca documents 0 as "no active bid/ask", not a price of zero."""
-    body = {"symbol": "AAPL", "quote": {**QUOTE_BODY["quote"], "bp": 0, "bs": 0}}  # type: ignore[dict-item]
-    client = _client(httpx.MockTransport(lambda _: httpx.Response(200, json=body)))
-    capability = await client.capability()
-    await client.aclose()
+    """Alpaca documents 0 as "no active bid/ask", not a price of zero.
+
+    Inside REGULAR hours a one-sided book is a real fault, so the probe still
+    reports DEGRADED.
+    """
+    capability = await _probe_with(
+        one_sided=True, at=dt.datetime(2026, 9, 14, 15, 0, tzinfo=dt.UTC)
+    )
     assert capability.state is CapabilityState.DEGRADED
     assert capability.realtime_pricing_usable is False
+
+
+async def test_a_one_sided_probe_quote_outside_market_hours_is_not_degraded() -> None:
+    """The book is one-sided every evening and weekend; the provider is not broken.
+
+    Saturday 12:00 UTC: session CLOSED. The state stays HEALTHY, the quote stays
+    unusable for sizing, and the detail says why the one-sided book is expected.
+    """
+    capability = await _probe_with(
+        one_sided=True, at=dt.datetime(2026, 9, 12, 12, 0, tzinfo=dt.UTC)
+    )
+    assert capability.state is CapabilityState.HEALTHY
+    assert capability.realtime_pricing_usable is False
+    assert "expected outside market hours" in (capability.detail or "")
+
+
+async def test_a_one_sided_probe_quote_during_regular_hours_is_degraded() -> None:
+    """Monday 15:00 UTC = 11:00 ET: REGULAR, so a one-sided book is a fault."""
+    capability = await _probe_with(
+        one_sided=True, at=dt.datetime(2026, 9, 14, 15, 0, tzinfo=dt.UTC)
+    )
+    assert capability.state is CapabilityState.DEGRADED
 
 
 async def test_a_stale_probe_quote_stays_healthy_but_is_flagged() -> None:

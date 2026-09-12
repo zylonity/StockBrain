@@ -466,7 +466,25 @@ def test_a_blocked_proposal_leads_with_decisive_reasons_and_collapses_market_sta
     text = messages.render_research_stage(view, PipelineEvent.PROPOSAL_BLOCKED)
     assert text.index("0.70 floor") < text.index("market state")
     assert "4 rules" in text and "clears at the open" in text
-    assert "session CLOSED" not in text  # collapsed: only the first transient reason is quoted
+    # Collapsed to the one reason that explains the rest: only the session is
+    # quoted, ahead of provider noise.
+    assert "session CLOSED" in text
+    assert "market-data provider is DEGRADED" not in text
+
+
+def test_the_collapsed_market_state_line_quotes_the_session_first() -> None:
+    view = _research_view(
+        action="BUY",
+        confidence=0.68,
+        block_reasons=("research confidence 0.68 is below the 0.70 floor",),
+        transient_block_reasons=(
+            "market-data provider is DEGRADED",
+            "quote is 90680850ms old, older than the 15.0s limit",
+            "session CLOSED is not one of REGULAR",
+        ),
+    )
+    text = messages.render_research_stage(view, PipelineEvent.PROPOSAL_BLOCKED)
+    assert "session CLOSED" in text and "provider is DEGRADED" not in text
 
 
 def test_a_deferred_proposal_lists_the_market_state_reasons() -> None:
@@ -483,6 +501,23 @@ def test_a_deferred_proposal_lists_the_market_state_reasons() -> None:
     assert "session CLOSED is not one of REGULAR" in text
     assert "quote is 90680850ms old, older than the 15.0s limit" in text
     assert "re-evaluate" in text
+
+
+def test_a_deferred_proposal_orders_the_market_state_reasons() -> None:
+    """The session is the decisive fact, so it lists ahead of the stale quote."""
+    view = _research_view(
+        action="BUY",
+        confidence=0.9,
+        block_reasons=(),
+        transient_block_reasons=(
+            "market-data provider is DEGRADED",
+            "quote is 90680850ms old, older than the 15.0s limit",
+            "session CLOSED is not one of REGULAR",
+        ),
+    )
+    text = messages.render_research_stage(view, PipelineEvent.PROPOSAL_DEFERRED)
+    assert text.index("session CLOSED") < text.index("quote is 90680850ms old")
+    assert text.index("quote is 90680850ms old") < text.index("provider is DEGRADED")
 
 
 # ---------------------------------------------------------------------------
