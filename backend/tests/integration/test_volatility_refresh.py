@@ -15,9 +15,11 @@ from stockbrain.db.session import Database
 from stockbrain.enums import Broker, OrderSide
 from stockbrain.market_data.base import Bar
 from stockbrain.market_data.volatility import VolatilityRefreshService
+from stockbrain.market_data.yahoo import DailyBars
 from stockbrain.observability.health import ProviderHealthRegistry
-from stockbrain.risk.config import risk_config_from_settings
+from stockbrain.risk.config import RiskConfig, risk_config_from_settings
 from tests import proposal_helpers as ph
+from tests import risk_helpers as h
 from tests.integration.test_exit_sweep import (
     _exit_sweep,
     _seed_executed_buy,
@@ -49,6 +51,31 @@ class _FakeBars:
             for i in range(self.n)
         ]
         return bars, self.currency
+
+
+class _BadBarBars:
+    """A source that hands back a NaN bar: only the refresh's try may contain it."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def daily_bars(self, symbol: str, *, days: int) -> tuple[Sequence[Bar], str]:
+        self.calls.append(symbol)
+        t0 = NOW - dt.timedelta(days=20)
+        high = Decimal("NaN") if symbol == "AAPL" else Decimal("102")
+        bars = [
+            Bar(
+                symbol=symbol,
+                timestamp=t0 + dt.timedelta(days=i),
+                open=Decimal("100"),
+                high=high,
+                low=Decimal("98"),
+                close=Decimal("100"),
+                volume=1,
+            )
+            for i in range(20)
+        ]
+        return bars, "USD"
 
 
 async def _seed_position_with_peak(
@@ -111,6 +138,8 @@ async def _seed_peak(
     observations: int,
     atr: Decimal | None = None,
     atr_as_of: dt.date | None = None,
+    atr_period: int | None = None,
+    atr_currency: str | None = None,
 ) -> None:
     async with database.transaction() as session:
         session.add(
@@ -122,23 +151,46 @@ async def _seed_peak(
                 peak_at=NOW,
                 observations=observations,
                 atr=atr,
-                atr_period=14 if atr is not None else None,
-                atr_currency="USD" if atr is not None else None,
+                atr_period=atr_period
+                if atr_period is not None
+                else (14 if atr is not None else None),
+                atr_currency=(
+                    atr_currency
+                    if atr_currency is not None
+                    else ("USD" if atr is not None else None)
+                ),
                 atr_as_of=atr_as_of,
                 atr_source="yahoo" if atr is not None else None,
             )
         )
 
 
-def _volatility_service(database: Database, bars: _FakeBars) -> VolatilityRefreshService:
+def _volatility_service(
+    database: Database,
+    bars: DailyBars,
+    *,
+    config: RiskConfig | None = None,
+) -> VolatilityRefreshService:
     settings = ph.settings()
     return VolatilityRefreshService(
         database,
         settings,
         bars=bars,
-        config=risk_config_from_settings(settings),
+        config=config or risk_config_from_settings(settings),
         health=ProviderHealthRegistry(),
     )
+
+
+async def _set_position_currency(database: Database, *, broker_ticker: str, currency: str) -> None:
+    async with database.transaction() as session:
+        await session.execute(
+            sa.update(Position)
+            .where(
+                Position.broker == Broker.TRADING212,
+                Position.broker_ticker == broker_ticker,
+            )
+            .values(currency=currency)
+        )
 
 
 async def test_refresh_stores_an_atr_in_the_instruments_currency(clean_tables: Database) -> None:
@@ -157,6 +209,7 @@ async def test_refresh_stores_an_atr_in_the_instruments_currency(clean_tables: D
     assert peak.atr == Decimal("4")  # every TR is 102-98 = 4
     assert peak.atr_period == 14 and peak.atr_currency == "USD" and peak.atr_source == "yahoo"
     assert peak.atr_as_of == (NOW - dt.timedelta(days=1)).date()
+    assert peak.atr_refreshed_at == NOW  # the attempt clock, not the bar date
 
 
 async def test_a_currency_mismatch_is_refused_not_converted(clean_tables: Database) -> None:
@@ -164,7 +217,8 @@ async def test_a_currency_mismatch_is_refused_not_converted(clean_tables: Databa
     await _seed_position_with_peak(
         database, broker_ticker="VODl_EQ", exchange="London Stock Exchange", currency="GBX"
     )
-    service = _volatility_service(database, _FakeBars(currency="GBP"))
+    bars = _FakeBars(currency="GBP")
+    service = _volatility_service(database, bars)
 
     counts = await service.refresh(now=NOW)
 
@@ -172,6 +226,10 @@ async def test_a_currency_mismatch_is_refused_not_converted(clean_tables: Databa
     async with database.session() as session:
         peak = (await session.execute(sa.select(PositionPeak))).scalar_one()
     assert peak.atr is None
+    # Even a refused fetch stamps the attempt clock, so the symbol is not
+    # hammered again on the next sweep.
+    counts = await service.refresh(now=NOW + dt.timedelta(hours=6))
+    assert counts["skipped_fresh"] == 1 and len(bars.calls) == 1
 
 
 async def test_a_position_with_an_unknown_currency_is_not_fetched(clean_tables: Database) -> None:
@@ -203,6 +261,45 @@ async def test_a_fresh_atr_is_not_refetched(clean_tables: Database) -> None:
     await service.refresh(now=NOW)
     counts = await service.refresh(now=NOW + dt.timedelta(hours=6))
     assert counts["skipped_fresh"] == 1 and len(bars.calls) == 1
+    # 21 hours after the attempt the clock has lapsed; the bar date is irrelevant.
+    counts = await service.refresh(now=NOW + dt.timedelta(hours=21))
+    assert counts["refreshed"] == 1 and len(bars.calls) == 2
+
+
+async def test_a_period_change_refetches_despite_a_fresh_stamp(clean_tables: Database) -> None:
+    database = clean_tables
+    await _seed_position_with_peak(
+        database, broker_ticker="AAPL_US_EQ", exchange="NASDAQ", currency="USD"
+    )
+    bars = _FakeBars(n=30)
+    await _volatility_service(database, bars).refresh(now=NOW)
+
+    service = _volatility_service(database, bars, config=h.config(exit_atr_period=20))
+    counts = await service.refresh(now=NOW + dt.timedelta(hours=6))
+
+    assert counts["refreshed"] == 1 and len(bars.calls) == 2
+
+
+async def test_a_non_finite_bar_fails_only_its_own_position(clean_tables: Database) -> None:
+    database = clean_tables
+    await _seed_position_with_peak(
+        database, broker_ticker="AAPL_US_EQ", exchange="NASDAQ", currency="USD"
+    )
+    await _seed_position_with_peak(
+        database, broker_ticker="MSFT_US_EQ", exchange="NASDAQ", currency="USD"
+    )
+    bars = _BadBarBars()
+
+    counts = await _volatility_service(database, bars).refresh(now=NOW)
+
+    assert counts["failed"] == 1 and counts["refreshed"] == 1
+    async with database.session() as session:
+        peaks = {
+            peak.broker_ticker: peak
+            for peak in (await session.execute(sa.select(PositionPeak))).scalars()
+        }
+    assert peaks["AAPL_US_EQ"].atr is None
+    assert peaks["MSFT_US_EQ"].atr == Decimal("4")
 
 
 async def test_an_unmapped_exchange_is_skipped_and_counted(clean_tables: Database) -> None:

@@ -142,6 +142,16 @@ class YahooDailyBars:
 
         bars: list[Bar] = []
         for row in frame.itertuples():
+            open_ = Decimal(str(row.Open))
+            high = Decimal(str(row.High))
+            low = Decimal(str(row.Low))
+            close = Decimal(str(row.Close))
+            if not (
+                open_.is_finite() and high.is_finite() and low.is_finite() and close.is_finite()
+            ):
+                # Yahoo pads a missing session with NaN/Infinity; one such row
+                # must not poison the series the ATR is computed from.
+                continue
             stamp = row.Index
             if getattr(stamp, "tzinfo", None) is None:
                 stamp = stamp.replace(tzinfo=dt.UTC)
@@ -149,15 +159,17 @@ class YahooDailyBars:
                 Bar(
                     symbol=symbol,
                     timestamp=stamp,
-                    open=Decimal(str(row.Open)),
-                    high=Decimal(str(row.High)),
-                    low=Decimal(str(row.Low)),
-                    close=Decimal(str(row.Close)),
+                    open=open_,
+                    high=high,
+                    low=low,
+                    close=close,
                     volume=int(row.Volume or 0),
                     feed="yahoo",
                 )
             )
         bars.sort(key=lambda bar: bar.timestamp)
+        if len(bars) < 2:
+            raise ProviderResponseError(f"yfinance: fewer than two finite bars for {symbol}")
         return bars, currency
 
     async def daily_bars(self, symbol: str, *, days: int) -> tuple[Sequence[Bar], str]:

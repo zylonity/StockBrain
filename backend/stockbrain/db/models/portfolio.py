@@ -125,6 +125,10 @@ class PositionPeak(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     atr_source: Mapped[str | None] = mapped_column(sa.Text)
 
+    atr_refreshed_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    """When the last fetch was attempted, whatever its outcome -- the rate-discipline
+    clock; bar-date staleness is the rule's concern."""
+
     __table_args__ = (
         sa.UniqueConstraint(
             "broker",

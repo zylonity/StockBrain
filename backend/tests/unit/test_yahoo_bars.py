@@ -161,3 +161,38 @@ async def test_any_yfinance_exception_becomes_a_provider_error(
     monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=_Broken))
     with pytest.raises(ProviderResponseError, match="yfinance"):
         await YahooDailyBars().daily_bars("X", days=5)
+
+
+async def test_a_non_finite_row_is_dropped_not_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One bad bar must not poison the series the ATR is computed from."""
+    t0 = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    frame = _Frame(
+        [
+            (t0, 100.0, 101.5, 99.25, 100.75, 10),
+            (t0 + dt.timedelta(days=1), 100.0, float("nan"), 99.25, 100.75, 10),
+            (t0 + dt.timedelta(days=2), 100.0, 101.5, 99.25, 100.75, 10),
+        ]
+    )
+    _install_fake_yfinance(monkeypatch, frame=frame, currency="USD")
+
+    bars, _ = await YahooDailyBars().daily_bars("X", days=5)
+
+    assert [bar.timestamp for bar in bars] == [t0, t0 + dt.timedelta(days=2)]
+
+
+async def test_fewer_than_two_finite_bars_is_a_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    t0 = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    frame = _Frame(
+        [
+            (t0, 100.0, float("nan"), 99.25, 100.75, 10),
+            (t0 + dt.timedelta(days=1), 100.0, float("inf"), 99.25, 100.75, 10),
+        ]
+    )
+    _install_fake_yfinance(monkeypatch, frame=frame, currency="USD")
+
+    with pytest.raises(ProviderResponseError, match="fewer than two finite bars"):
+        await YahooDailyBars().daily_bars("X", days=5)

@@ -27,6 +27,10 @@ from stockbrain.risk.config import RiskConfig
 __all__ = ["VolatilityRefreshService"]
 
 log = get_logger(__name__)
+#: The rate-discipline clock.  Less than a day so a daily refresh lands on a
+#: slightly different wall-clock time each run, more than the interval so a
+#: symbol is fetched at most once per day at any supported cadence.
+_MIN_REFRESH_INTERVAL = dt.timedelta(hours=20)
 _TALLY_KEYS = (
     "considered",
     "refreshed",
@@ -60,7 +64,6 @@ class VolatilityRefreshService:
 
     async def refresh(self, *, now: dt.datetime | None = None) -> dict[str, int]:
         moment = now or utcnow()
-        today = moment.date()
         counts: Counter[str] = Counter(dict.fromkeys(_TALLY_KEYS, 0))
 
         async with self._database.session() as session:
@@ -92,9 +95,17 @@ class VolatilityRefreshService:
             if peak is None:
                 counts["skipped_no_peak"] += 1
                 continue
-            # Yesterday's bar is the newest a daily series can hold; an ATR whose
-            # last bar is yesterday or today is as fresh as it gets.
-            if peak.atr_as_of is not None and (today - peak.atr_as_of).days <= 1:
+            # The rate-discipline clock is the *attempt* time, not the bar date:
+            # a symbol that failed or mismatched still waits out the interval.
+            # A stored ATR computed under a different period is the one thing
+            # that overrides the wait, so a RESTART_REQUIRED period change is
+            # picked up on the next tick rather than a day later.
+            period_matches = peak.atr is None or peak.atr_period == self._config.exit_atr_period
+            if (
+                peak.atr_refreshed_at is not None
+                and moment - peak.atr_refreshed_at < _MIN_REFRESH_INTERVAL
+                and period_matches
+            ):
                 counts["skipped_fresh"] += 1
                 continue
             symbol = yahoo_symbol(position.broker_ticker, exchange)
@@ -111,10 +122,46 @@ class VolatilityRefreshService:
 
         errors = 0
         for broker_ticker, symbol, instrument_currency in work:
+            # Everything after the fetch runs under the same guard: one bad bar
+            # or one bad write degrades this symbol alone, never the pass.
             try:
                 bars, currency = await self._bars.daily_bars(
                     symbol, days=self._settings.volatility_bars_days
                 )
+                if currency != instrument_currency:
+                    counts["currency_mismatch"] += 1
+                    log.warning(
+                        "volatility_currency_mismatch",
+                        broker_ticker=broker_ticker,
+                        symbol=symbol,
+                        instrument=instrument_currency,
+                        bars=currency,
+                    )
+                    await self._stamp_attempt(broker_ticker, moment)
+                    continue
+                atr = average_true_range(bars, self._config.exit_atr_period)
+                if atr is None:
+                    counts["insufficient_bars"] += 1
+                    await self._stamp_attempt(broker_ticker, moment)
+                    continue
+                async with self._database.transaction() as session:
+                    await session.execute(
+                        sa.update(PositionPeak)
+                        .where(
+                            PositionPeak.broker == self._broker,
+                            PositionPeak.broker_ticker == broker_ticker,
+                        )
+                        .values(
+                            atr=atr,
+                            atr_period=self._config.exit_atr_period,
+                            atr_currency=currency,
+                            atr_as_of=bars[-1].timestamp.date(),
+                            atr_source="yahoo",
+                            atr_refreshed_at=moment,
+                            updated_at=moment,
+                        )
+                    )
+                counts["refreshed"] += 1
             except ProviderError as exc:
                 errors += 1
                 counts["failed"] += 1
@@ -124,38 +171,17 @@ class VolatilityRefreshService:
                     symbol=symbol,
                     error=str(exc)[:200],
                 )
-                continue
-            if currency != instrument_currency:
-                counts["currency_mismatch"] += 1
+                await self._stamp_attempt(broker_ticker, moment)
+            except Exception as exc:
+                errors += 1
+                counts["failed"] += 1
                 log.warning(
-                    "volatility_currency_mismatch",
+                    "volatility_refresh_failed",
                     broker_ticker=broker_ticker,
                     symbol=symbol,
-                    instrument=instrument_currency,
-                    bars=currency,
+                    error_type=type(exc).__name__,
                 )
-                continue
-            atr = average_true_range(bars, self._config.exit_atr_period)
-            if atr is None:
-                counts["insufficient_bars"] += 1
-                continue
-            async with self._database.transaction() as session:
-                await session.execute(
-                    sa.update(PositionPeak)
-                    .where(
-                        PositionPeak.broker == self._broker,
-                        PositionPeak.broker_ticker == broker_ticker,
-                    )
-                    .values(
-                        atr=atr,
-                        atr_period=self._config.exit_atr_period,
-                        atr_currency=currency,
-                        atr_as_of=bars[-1].timestamp.date(),
-                        atr_source="yahoo",
-                        updated_at=moment,
-                    )
-                )
-            counts["refreshed"] += 1
+                await self._stamp_attempt(broker_ticker, moment)
 
         if work:
             self._health.record(
@@ -165,3 +191,20 @@ class VolatilityRefreshService:
             )
         log.info("volatility_refresh_complete", **dict(counts))
         return dict(counts)
+
+    async def _stamp_attempt(self, broker_ticker: str, moment: dt.datetime) -> None:
+        """Record that a fetch was attempted, whatever its outcome.
+
+        Failure branches stamp only the clock: the stored ATR (if any) is left
+        as it was, because a failed refetch is no reason to forget the last
+        reading the rule can still use while it is fresh by bar date.
+        """
+        async with self._database.transaction() as session:
+            await session.execute(
+                sa.update(PositionPeak)
+                .where(
+                    PositionPeak.broker == self._broker,
+                    PositionPeak.broker_ticker == broker_ticker,
+                )
+                .values(atr_refreshed_at=moment)
+            )
