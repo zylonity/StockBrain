@@ -204,6 +204,13 @@ function ExitCells({ position }: { position: PortfolioPosition }) {
       </td>
     );
   }
+  if (exit.managed && exit.hard_stop === null) {
+    return (
+      <td className="tight detail" colSpan={2}>
+        floors unavailable{exit.reason ? ` — ${exit.reason}` : ""}
+      </td>
+    );
+  }
   return (
     <>
       <td className="num">

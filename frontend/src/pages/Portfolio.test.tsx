@@ -69,6 +69,33 @@ const unmanagedPosition = {
   },
 };
 
+/** A managed position whose rules refuse to act: the broker holds no tradable shares. */
+const managedWithoutFloorsPosition = {
+  broker_ticker: "MSFT_US_EQ",
+  name: "Microsoft Corp",
+  quantity: "3.0000",
+  quantity_available: "0.0000",
+  average_price: "300.0000",
+  current_price: "310.0000",
+  ppl: "30.0000",
+  currency: "USD",
+  last_synced_at: "2026-09-06T11:59:00Z",
+  exit: {
+    managed: true,
+    reason: "no tradable shares — held in a pie or not yet settled",
+    hard_stop: null,
+    volatility_floor: null,
+    trailing_floor: null,
+    roi_target_price: null,
+    horizon_ends_at: null,
+    nearest_floor: null,
+    nearest_rule: null,
+    peak_price: null,
+    atr: null,
+    horizon: null,
+  },
+};
+
 describe("Portfolio", () => {
   it("renders the broker's own figures without recomputing them", async () => {
     stubFetch({ "GET /api/v1/portfolio": portfolioResponse });
@@ -109,6 +136,23 @@ describe("Portfolio", () => {
     const unmanaged = screen.getByText("Tesla Inc").closest("tr") as HTMLElement;
     expect(within(unmanaged).getByText(/not managed/)).toBeInTheDocument();
     expect(within(unmanaged).getByText(/no StockBrain buy behind it/)).toBeInTheDocument();
+  });
+
+  it("says floors are unavailable for a managed position with no floors", async () => {
+    stubFetch({
+      "GET /api/v1/portfolio": {
+        ...portfolioResponse,
+        position_count: 1,
+        positions: [managedWithoutFloorsPosition],
+      },
+    });
+    renderAt(<Portfolio />, "/portfolio");
+
+    const row = (await screen.findByText("Microsoft Corp")).closest("tr") as HTMLElement;
+    expect(within(row).getByText(/floors unavailable/)).toBeInTheDocument();
+    expect(within(row).getByText(/no tradable shares/)).toBeInTheDocument();
+    // The normal branch's stacked floor list must not be invented here.
+    expect(within(row).queryByText(/stop/)).toBeNull();
   });
 
   it("says the snapshot is fresh enough to size against when it is", async () => {
