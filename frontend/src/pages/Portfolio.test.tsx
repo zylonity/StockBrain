@@ -15,6 +15,60 @@ import { screen, within } from "@testing-library/react";
 import { Portfolio } from "./Portfolio";
 import { failWith, portfolioResponse, renderAt, stubFetch } from "../test/harness";
 
+/** A position StockBrain opened, carrying the floors its exit rules would act on. */
+const managedPosition = {
+  broker_ticker: "AAPL_US_EQ",
+  name: "Apple Inc",
+  quantity: "2.0000",
+  quantity_available: "2.0000",
+  average_price: "180.0000",
+  current_price: "190.0000",
+  ppl: "20.0000",
+  currency: "USD",
+  last_synced_at: "2026-09-06T11:59:00Z",
+  exit: {
+    managed: true,
+    reason: null,
+    hard_stop: "92.00",
+    volatility_floor: "119.00",
+    trailing_floor: null,
+    roi_target_price: "115.00",
+    horizon_ends_at: "2026-10-01T00:00:00Z",
+    nearest_floor: "119.00",
+    nearest_rule: "volatility_stop",
+    peak_price: "125.00",
+    atr: "2.00",
+    horizon: "weeks",
+  },
+};
+
+/** A position the broker holds but StockBrain has no executed buy behind. */
+const unmanagedPosition = {
+  broker_ticker: "TSLA_US_EQ",
+  name: "Tesla Inc",
+  quantity: "1.0000",
+  quantity_available: "1.0000",
+  average_price: "200.0000",
+  current_price: "210.0000",
+  ppl: "-5.0000",
+  currency: "USD",
+  last_synced_at: "2026-09-06T11:59:00Z",
+  exit: {
+    managed: false,
+    reason: "no StockBrain buy behind it",
+    hard_stop: null,
+    volatility_floor: null,
+    trailing_floor: null,
+    roi_target_price: null,
+    horizon_ends_at: null,
+    nearest_floor: null,
+    nearest_rule: null,
+    peak_price: null,
+    atr: null,
+    horizon: null,
+  },
+};
+
 describe("Portfolio", () => {
   it("renders the broker's own figures without recomputing them", async () => {
     stubFetch({ "GET /api/v1/portfolio": portfolioResponse });
@@ -35,6 +89,26 @@ describe("Portfolio", () => {
     const row = (await screen.findByText("Apple Inc")).closest("tr");
     expect(within(row as HTMLElement).getByText(/AAPL_US_EQ/)).toBeInTheDocument();
     expect(within(row as HTMLElement).getByText("190.00")).toBeInTheDocument();
+  });
+
+  it("shows each position's exit floors, and says when one is not managed", async () => {
+    stubFetch({
+      "GET /api/v1/portfolio": {
+        ...portfolioResponse,
+        position_count: 2,
+        positions: [managedPosition, unmanagedPosition],
+      },
+    });
+    renderAt(<Portfolio />, "/portfolio");
+
+    const managed = (await screen.findByText("Apple Inc")).closest("tr") as HTMLElement;
+    expect(within(managed).getByText("119.00")).toBeInTheDocument();
+    expect(within(managed).getByText(/volatility/)).toBeInTheDocument();
+    expect(within(managed).getByText(/92\.00/)).toBeInTheDocument();
+
+    const unmanaged = screen.getByText("Tesla Inc").closest("tr") as HTMLElement;
+    expect(within(unmanaged).getByText(/not managed/)).toBeInTheDocument();
+    expect(within(unmanaged).getByText(/no StockBrain buy behind it/)).toBeInTheDocument();
   });
 
   it("says the snapshot is fresh enough to size against when it is", async () => {

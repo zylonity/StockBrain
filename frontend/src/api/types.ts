@@ -1155,6 +1155,28 @@ export interface NotificationPreferences {
 
 /* --- Portfolio ------------------------------------------------------------ */
 
+/** Where each exit rule would act for one open position.
+ *
+ * Computed by the same predicates the rules fire on, so the floor shown and the
+ * floor acted on cannot disagree. `managed` is false when StockBrain has no
+ * executed buy behind the position: `reason` then says why and every floor is
+ * null. Decimals arrive as strings; datetimes as ISO strings.
+ */
+export interface PortfolioPositionExit {
+  managed: boolean;
+  reason: string | null;
+  hard_stop: string | null;
+  volatility_floor: string | null;
+  trailing_floor: string | null;
+  roi_target_price: string | null;
+  horizon_ends_at: string | null;
+  nearest_floor: string | null;
+  nearest_rule: string | null;
+  peak_price: string | null;
+  atr: string | null;
+  horizon: string | null;
+}
+
 export interface PortfolioPosition {
   broker_ticker: string;
   name: string | null;
@@ -1165,6 +1187,7 @@ export interface PortfolioPosition {
   ppl: string | null;
   currency: string | null;
   last_synced_at: string;
+  exit: PortfolioPositionExit | null;
 }
 
 export interface PortfolioResponse {

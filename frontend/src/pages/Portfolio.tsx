@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 
 import { api } from "../api/client";
-import type { PortfolioResponse } from "../api/types";
+import type { PortfolioPosition, PortfolioResponse } from "../api/types";
 import { Async, EmptyState, PageHeader, RefreshButton, TableWrap } from "../components/Page";
 import {
   formatDecimal,
@@ -160,6 +160,67 @@ function Summary({ data }: { data: PortfolioResponse }) {
   );
 }
 
+/** A rule id in the words the operator reads, never the raw enum. */
+function exitRuleLabel(rule: string | null): string {
+  switch (rule) {
+    case "hard_stop":
+      return "stop";
+    case "volatility_stop":
+      return "volatility";
+    case "trailing_stop":
+      return "trail";
+    case "roi_target":
+      return "target";
+    case "horizon_elapsed":
+      return "horizon";
+    case "thesis_superseded":
+      return "thesis";
+    default:
+      return rule ?? "—";
+  }
+}
+
+/**
+ * The two exit columns: the nearest floor with its rule, and every floor.
+ *
+ * A position the risk layer could not describe (no floors at all) is not the
+ * same as one StockBrain never opened: the first is a gap in what we know, the
+ * second is a fact about the position, and both are said plainly rather than
+ * rendered as zeroes.
+ */
+function ExitCells({ position }: { position: PortfolioPosition }) {
+  const exit = position.exit;
+  if (!exit) {
+    return (
+      <td className="tight detail" colSpan={2}>
+        floors unavailable
+      </td>
+    );
+  }
+  if (!exit.managed) {
+    return (
+      <td className="tight detail" colSpan={2}>
+        not managed{exit.reason ? ` — ${exit.reason}` : ""}
+      </td>
+    );
+  }
+  return (
+    <>
+      <td className="num">
+        {formatDecimal(exit.nearest_floor, { places: 2 })}
+        <span className="detail"> · {exitRuleLabel(exit.nearest_rule)}</span>
+      </td>
+      <td className="tight detail">
+        <div>stop {formatDecimal(exit.hard_stop, { places: 2 })}</div>
+        <div>vol {formatDecimal(exit.volatility_floor, { places: 2 })}</div>
+        <div>trail {formatDecimal(exit.trailing_floor, { places: 2 })}</div>
+        <div>target {formatDecimal(exit.roi_target_price, { places: 2 })}</div>
+        <div>horizon {formatTimestamp(exit.horizon_ends_at)}</div>
+      </td>
+    </>
+  );
+}
+
 function Positions({ data }: { data: PortfolioResponse }) {
   if (data.positions.length === 0) {
     return (
@@ -188,6 +249,8 @@ function Positions({ data }: { data: PortfolioResponse }) {
               <th className="num">Quantity</th>
               <th className="num">Average</th>
               <th className="num">Current</th>
+              <th className="num">Nearest exit</th>
+              <th className="tight">Floors</th>
               <th className="num">Result</th>
               <th className="tight">Synced</th>
             </tr>
@@ -216,6 +279,7 @@ function Positions({ data }: { data: PortfolioResponse }) {
                 </td>
                 <td className="num">{formatDecimal(position.average_price, { places: 2 })}</td>
                 <td className="num">{formatDecimal(position.current_price, { places: 2 })}</td>
+                <ExitCells position={position} />
                 <td className={`num ${isNegative(position.ppl) ? "metric-bad" : ""}`}>
                   {formatDecimal(position.ppl, { places: 2 })}
                 </td>
