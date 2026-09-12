@@ -469,6 +469,22 @@ def test_a_blocked_proposal_leads_with_decisive_reasons_and_collapses_market_sta
     assert "session CLOSED" not in text  # collapsed: only the first transient reason is quoted
 
 
+def test_a_deferred_proposal_lists_the_market_state_reasons() -> None:
+    view = _research_view(
+        action="BUY",
+        confidence=0.9,
+        block_reasons=(),
+        transient_block_reasons=(
+            "session CLOSED is not one of REGULAR",
+            "quote is 90680850ms old, older than the 15.0s limit",
+        ),
+    )
+    text = messages.render_research_stage(view, PipelineEvent.PROPOSAL_DEFERRED)
+    assert "session CLOSED is not one of REGULAR" in text
+    assert "quote is 90680850ms old, older than the 15.0s limit" in text
+    assert "re-evaluate" in text
+
+
 # ---------------------------------------------------------------------------
 # Daily summary
 # ---------------------------------------------------------------------------

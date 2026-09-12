@@ -666,10 +666,14 @@ def render_research_stage(
         if view.action:
             lines.append(_thesis_line(view))
         lines.append(bold("Blocked for now by:"))
-        for reason in view.block_reasons[:8]:
+        # A deferral is transient-only, so the reasons that refused it live in
+        # ``transient_block_reasons``; include both so a future deferral that
+        # also carries a decisive refusal still names it.
+        reasons = (*view.block_reasons, *view.transient_block_reasons)
+        for reason in reasons[:8]:
             lines.append(f"• {trim(reason, _REASON_LIMIT)}")
-        if len(view.block_reasons) > 8:
-            lines.append(esc(f"… and {len(view.block_reasons) - 8} more"))
+        if len(reasons) > 8:
+            lines.append(esc(f"… and {len(reasons) - 8} more"))
         ceiling = (
             f"for up to {deferral_max_hours} hours"
             if deferral_max_hours is not None
