@@ -556,6 +556,8 @@ class ServiceContainer:
                     )
                     if settings.polymarket_enabled
                     else None,
+                    min_impact_materiality=settings.research_min_impact_materiality,
+                    max_impacts_per_event=settings.research_max_impacts_per_event,
                     timeout_seconds=settings.research_timeout_seconds,
                     max_tokens=settings.research_max_output_tokens,
                     evidence_chars=settings.research_evidence_chars,

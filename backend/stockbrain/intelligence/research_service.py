@@ -61,6 +61,8 @@ class ResearchService:
         timeout_seconds: float = 600,
         max_tokens: int = 3000,
         evidence_chars: int = 12000,
+        min_impact_materiality: float = 0.0,
+        max_impacts_per_event: int = 0,
         macro: MacroDataProvider | None = None,
         supplemental: SupplementalResearchProvider | None = None,
         fundamentals: SupplementalResearchProvider | None = None,
@@ -75,6 +77,11 @@ class ResearchService:
         self.models = models
         self.timeout = timeout_seconds
         self.evidence_chars = evidence_chars
+        # Selection policy, deliberately *not* part of ``config_version``: which
+        # impacts are worth researching does not change what a research run is,
+        # so tightening these must not invalidate and re-run existing work.
+        self.min_impact_materiality = min_impact_materiality
+        self.max_impacts_per_event = max_impacts_per_event
         self.macro = macro
         self.supplemental = supplemental
         self.fundamentals = fundamentals
@@ -584,13 +591,27 @@ class ResearchService:
 
     async def enqueue_event(self, event_id: uuid.UUID | None = None) -> None:
         async with self.database.transaction() as session:
+            ranked = sa.func.row_number().over(
+                partition_by=EventCompanyImpact.event_id,
+                order_by=(
+                    EventCompanyImpact.materiality_score.desc(),
+                    EventCompanyImpact.confidence.desc(),
+                    EventCompanyImpact.id,
+                ),
+            )
+            # Ranked before the cap is applied so "top N" means the N the
+            # classifier thought this story actually bore on, not the N that
+            # happened to be inserted first.  ``id`` breaks ties so a rerun
+            # selects the same impacts rather than a fresh arbitrary subset.
             query = (
                 sa.select(EventCompanyImpact.id)
+                .add_columns(ranked.label("rank"))
                 .join(Event, Event.id == EventCompanyImpact.event_id)
                 .where(
                     EventCompanyImpact.resolution_status == ResolutionStatus.RESOLVED,
                     EventCompanyImpact.company_id.is_not(None),
                     Event.status == EventStatus.CANDIDATE,
+                    EventCompanyImpact.materiality_score >= self.min_impact_materiality,
                 )
             )
             if event_id is not None:
@@ -604,7 +625,11 @@ class ResearchService:
                         )
                     )
                 )
-            for impact_id in await session.scalars(query.limit(25)):
+            selected = query.subquery()
+            capped = sa.select(selected.c.id)
+            if self.max_impacts_per_event:
+                capped = capped.where(selected.c.rank <= self.max_impacts_per_event)
+            for impact_id in await session.scalars(capped.limit(25)):
                 try:
                     await self.request(session, impact_id)
                 except (InstrumentResolutionError, ResearchValidationError):

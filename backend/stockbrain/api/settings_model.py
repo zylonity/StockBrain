@@ -414,6 +414,23 @@ CATALOGUE: tuple[_Group, ...] = (
                 "Whether the multi-agent research runner is built at all.",
             ),
             _s(
+                "research_min_impact_materiality",
+                "Research materiality floor",
+                RESTART,
+                "Materiality an individual company impact must reach before it is "
+                "researched. The classifier's own threshold promotes an event on its "
+                "best-affected company, so without this floor a story's every "
+                "passing mention is researched at full depth.",
+            ),
+            _s(
+                "research_max_impacts_per_event",
+                "Research fan-out cap",
+                RESTART,
+                "Most companies researched for one event, highest materiality first. "
+                "0 disables the cap. A market round-up names dozens of tickers and "
+                "each one is otherwise a full debate.",
+            ),
+            _s(
                 "research_timeout_seconds",
                 "Research timeout",
                 RESTART,

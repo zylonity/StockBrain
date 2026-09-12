@@ -210,6 +210,27 @@ class Settings(BaseSettings):
     research_timeout_seconds: float = Field(default=600, ge=30, le=3600)
     research_max_output_tokens: int = Field(default=3000, ge=256, le=16000)
 
+    research_min_impact_materiality: float = Field(default=0.25, ge=0.0, le=1.0)
+    """Materiality floor applied to each *impact*, not to the event.
+
+    ``classifier_min_materiality`` promotes an event on its **best** company, so
+    one company at 0.9 pulls every other impact on that story into research --
+    including ones the classifier scored at 0.1.  Measured over six days, impacts
+    below 0.40 took 26% of research spend and produced theses no more confident
+    than the rest.  The floor sits at 0.25 rather than 0.40 deliberately: measured
+    against the research layer's own verdicts it is a blunt proxy -- two 13F
+    disclosures the researcher called NO_ACTION at 0.90 confidence scored 0.40 and
+    0.50 here -- so it is set to remove the long tail, and the per-event cap is
+    left to do the real work.  Set to 0.0 to research every resolved impact again.
+    """
+
+    research_max_impacts_per_event: int = Field(default=8, ge=0)
+    """Most impacts researched for one event, highest materiality first.
+
+    A market round-up names dozens of tickers in passing and each one is a full
+    debate: one story fanned out to 45 runs, another to 42.  0 disables the cap.
+    """
+
     research_evidence_chars: int = Field(default=12000, ge=500, le=20000)
     """How much of each evidence document reaches the researcher.
 
