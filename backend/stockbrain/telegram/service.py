@@ -18,7 +18,7 @@ import datetime as dt
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +41,13 @@ from stockbrain.enums import (
 from stockbrain.observability.health import ProviderHealthRegistry
 from stockbrain.proposals.service import STAGE_GENERATION
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES, AUTHORIZABLE_STATUSES
+
+if TYPE_CHECKING:
+    # ``proposals.exits`` imports ``proposals.service``, which imports the
+    # Telegram preferences lazily precisely to avoid a package cycle.  These
+    # names are annotations (and the sweep object is only called, never built)
+    # so nothing here needs them at import time.
+    from stockbrain.proposals.exits import ExitSweepService, PositionExitStatus
 
 __all__ = [
     "EventView",
@@ -102,6 +109,11 @@ class PositionView:
     ppl: Decimal | None
     currency: str | None
     last_synced_at: dt.datetime
+
+    #: Where this position's exit rules would act, when the sweep service was
+    #: injected.  ``None`` keeps a view built without one renderable -- the
+    #: floors are a convenience, not a precondition for reading a position.
+    exit: PositionExitStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,11 +243,13 @@ class TelegramService:
         *,
         health: ProviderHealthRegistry,
         control: ControlStateService,
+        exits: ExitSweepService | None = None,
     ) -> None:
         self._database = database
         self._settings = settings
         self._health = health
         self._control = control
+        self._exits = exits
 
     # ------------------------------------------------------------------
     async def status(self, *, telegram_status: dict[str, object] | None = None) -> StatusView:
@@ -335,6 +349,12 @@ class TelegramService:
                     .limit(limit)
                 )
             ).all()
+            # Read-only and best-effort: the floors are a convenience on a
+            # command that must still answer when the risk subsystem did not
+            # start.  ``status`` reuses the sweep's own observation builder, so
+            # the floor shown is the floor the rule would act on; it never
+            # prices a position or touches a broker.
+            statuses = await self._exits.status(session) if self._exits is not None else {}
         return [
             PositionView(
                 broker_ticker=position.broker_ticker,
@@ -346,6 +366,7 @@ class TelegramService:
                 ppl=position.ppl,
                 currency=position.currency,
                 last_synced_at=position.last_synced_at,
+                exit=statuses.get(position.broker_ticker),
             )
             for position, name in rows
         ]

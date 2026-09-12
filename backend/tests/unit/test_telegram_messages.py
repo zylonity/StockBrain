@@ -21,6 +21,8 @@ from stockbrain.enums import (
     ProviderStatus,
     ResearchStatus,
 )
+from stockbrain.proposals.exits import PositionExitStatus
+from stockbrain.risk.exits import ExitFloors
 from stockbrain.telegram import messages
 from stockbrain.telegram.preferences import PipelineEvent
 from stockbrain.telegram.service import (
@@ -284,29 +286,106 @@ def test_portfolio_reports_an_absent_snapshot_honestly() -> None:
     assert "no broker account snapshot" in rendered
 
 
+def _position_view(**overrides: object) -> PositionView:
+    base: dict[str, object] = {
+        "broker_ticker": "AAPL_US_EQ",
+        "name": "Apple Inc.",
+        "quantity": Decimal("10"),
+        "quantity_available": Decimal("4"),
+        "average_price": Decimal("180"),
+        "current_price": Decimal("200"),
+        "ppl": Decimal("200"),
+        "currency": "GBP",
+        "last_synced_at": utcnow() - dt.timedelta(seconds=30),
+    }
+    base.update(overrides)
+    return PositionView(**base)  # type: ignore[arg-type]
+
+
 def test_positions_separate_held_from_tradable_quantity() -> None:
     """Shares inside a pie are owned but not individually tradable.
 
     Measured live on 13 of 14 real positions; a message that showed one number
     would be showing a quantity the broker would refuse.
     """
+    rendered = messages.render_positions([_position_view()])
+    assert "qty 10 (tradable 4)" in rendered
+    assert "pie" in rendered
+
+
+def test_positions_show_a_managed_positions_exit_floors() -> None:
+    """The floors a position would meet, in the words the operator reads.
+
+    Rendered from the same ``PositionExitStatus`` the API and the web page show,
+    so a floor cannot read differently on two surfaces.  The horizon reuses the
+    file's timestamp helper rather than inventing a second date format.
+    """
     rendered = messages.render_positions(
         [
-            PositionView(
-                broker_ticker="AAPL_US_EQ",
-                name="Apple Inc.",
-                quantity=Decimal("10"),
-                quantity_available=Decimal("4"),
-                average_price=Decimal("180"),
-                current_price=Decimal("200"),
-                ppl=Decimal("200"),
-                currency="GBP",
-                last_synced_at=utcnow() - dt.timedelta(seconds=30),
+            _position_view(
+                exit=PositionExitStatus(
+                    managed=True,
+                    reason=None,
+                    floors=ExitFloors(
+                        hard_stop=Decimal("92.00"),
+                        volatility_floor=Decimal("119.00"),
+                        trailing_floor=None,
+                        roi_target_price=Decimal("115.00"),
+                        horizon_ends_at=dt.datetime(2026, 10, 1, tzinfo=dt.UTC),
+                        nearest_floor=Decimal("119.00"),
+                        nearest_rule="volatility_stop",
+                    ),
+                    peak_price=Decimal("130"),
+                    atr=Decimal("3"),
+                    horizon="days",
+                )
             )
         ]
     )
-    assert "qty 10 (tradable 4)" in rendered
-    assert "pie" in rendered
+    assert (
+        "  exit: stop 92.00 · vol 119.00 · trail - · target 115.00 · "
+        "horizon 2026-10-01 00:00 UTC (nearest: vol 119.00)" in rendered
+    )
+
+
+def test_positions_say_when_a_position_is_not_managed() -> None:
+    """A position StockBrain never opened gets a sentence, not invented floors."""
+    rendered = messages.render_positions(
+        [
+            _position_view(
+                exit=PositionExitStatus(
+                    managed=False,
+                    reason="no StockBrain buy behind it",
+                    floors=None,
+                    peak_price=None,
+                    atr=None,
+                    horizon=None,
+                )
+            )
+        ]
+    )
+    assert "  exit: not managed — no StockBrain buy behind it" in rendered
+
+
+def test_positions_say_when_floors_are_unavailable() -> None:
+    """A gap in what we know is said plainly, never rendered as a price."""
+    rendered = messages.render_positions(
+        [
+            _position_view(),
+            _position_view(
+                broker_ticker="MSFT_US_EQ",
+                exit=PositionExitStatus(
+                    managed=True,
+                    reason=None,
+                    floors=None,
+                    peak_price=None,
+                    atr=None,
+                    horizon=None,
+                ),
+            ),
+        ]
+    )
+    assert rendered.count("  exit: floors unavailable") == 2
 
 
 def test_help_lists_every_command_and_the_kill_switch_promise() -> None:

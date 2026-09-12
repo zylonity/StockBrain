@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, InvalidToken, NetworkError, RetryAfter, TimedOut
@@ -57,6 +57,9 @@ from stockbrain.telegram.preferences import NotificationPreferences
 from stockbrain.telegram.service import TelegramService
 from stockbrain.telegram.tokens import TokenService
 from telegram import InlineKeyboardMarkup, LinkPreviewOptions
+
+if TYPE_CHECKING:
+    from stockbrain.proposals.exits import ExitSweepService
 
 __all__ = ["BotSender", "TelegramRuntime", "error_category"]
 
@@ -131,6 +134,7 @@ class TelegramRuntime:
         proposals: ProposalService | None,
         control: ControlStateService,
         preferences: NotificationPreferences | None = None,
+        exits: ExitSweepService | None = None,
     ) -> None:
         self._settings = settings
         self._database = database
@@ -142,7 +146,9 @@ class TelegramRuntime:
             allowed_chat_ids=settings.telegram_allowed_chat_ids,
             allow_group_chats=settings.telegram_allow_group_chats,
         )
-        self._service = TelegramService(database, settings, health=health, control=control)
+        self._service = TelegramService(
+            database, settings, health=health, control=control, exits=exits
+        )
         self._tokens = TokenService(channel=ApprovalChannel.TELEGRAM)
         self._coordinator = ApprovalCoordinator(
             database,

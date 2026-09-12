@@ -321,6 +321,7 @@ class ServiceContainer:
                 proposals=self.proposals,
                 control=self.control,
                 preferences=self.notification_preferences,
+                exits=self.exits,
             )
 
     async def _announce_discovered_event(self, session: AsyncSession, event_id: uuid.UUID) -> None:

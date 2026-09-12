@@ -276,7 +276,7 @@ def test_the_status_payload_satisfies_the_api_response_model() -> None:
 
 
 def test_the_runtime_never_receives_a_broker_credential() -> None:
-    """The bot's dependencies are a database, health, control and proposals.
+    """The bot's dependencies are a database, health, control, proposals and exits.
 
     None of them is a broker client, and the proposal service it holds has no
     order path -- so there is no credential for a chat handler to reach.
@@ -298,4 +298,7 @@ def test_the_runtime_never_receives_a_broker_credential() -> None:
         # Which notification categories are switched on. Reads and writes one
         # `app_settings` row; it is not a client of anything.
         "preferences",
+        # The read-only source of each position's exit floors. Evaluates the
+        # stored mirror and the risk rules; it prices nothing and sends nothing.
+        "exits",
     }

@@ -13,6 +13,7 @@ Nothing in this module concatenates a raw value into markup.
 from __future__ import annotations
 
 import datetime as dt
+from typing import TYPE_CHECKING
 
 from stockbrain.control.state import ControlSnapshot
 from stockbrain.enums import ProposalStatus, ProviderStatus
@@ -27,6 +28,9 @@ from stockbrain.telegram.service import (
     ResearchView,
     StatusView,
 )
+
+if TYPE_CHECKING:
+    from stockbrain.proposals.exits import PositionExitStatus
 
 __all__ = [
     "AMBIGUOUS_NOTICE",
@@ -198,6 +202,45 @@ def render_portfolio(view: PortfolioView, *, now: dt.datetime | None = None) -> 
     return "\n".join(lines)
 
 
+_EXIT_RULE_LABELS: dict[str, str] = {
+    "hard_stop": "stop",
+    "volatility_stop": "vol",
+    "trailing_stop": "trail",
+    "roi_target": "target",
+    "horizon_elapsed": "horizon",
+    "thesis_superseded": "thesis",
+}
+
+
+def _exit_rule_label(rule: str) -> str:
+    """A rule id in the words the operator reads, never the raw enum."""
+    return _EXIT_RULE_LABELS.get(rule, rule)
+
+
+def _position_exit_line(status: PositionExitStatus) -> str:
+    """The floors under one position, from the sweep's own answer.
+
+    Three states are kept apart rather than merged: a managed position's floors,
+    a position StockBrain never opened, and one the risk layer could not
+    describe.  A missing floor renders as ``-`` through the same ``money``
+    helper as a present one, so a gap is never mistaken for a price.
+    """
+    if not status.managed:
+        suffix = f" — {trim(status.reason, _REASON_LIMIT)}" if status.reason else ""
+        return f"  exit: not managed{suffix}"
+    floors = status.floors
+    if floors is None:
+        return "  exit: floors unavailable"
+    nearest = f"{_exit_rule_label(floors.nearest_rule)} {money(floors.nearest_floor, places=2)}"
+    return (
+        f"  exit: stop {money(floors.hard_stop, places=2)} · "
+        f"vol {money(floors.volatility_floor, places=2)} · "
+        f"trail {money(floors.trailing_floor, places=2)} · "
+        f"target {money(floors.roi_target_price, places=2)} · "
+        f"horizon {esc(stamp(floors.horizon_ends_at))} (nearest: {esc(nearest)})"
+    )
+
+
 def render_positions(views: list[PositionView], *, now: dt.datetime | None = None) -> str:
     if not views:
         return f"{bold('Positions')}\nNo positions in the latest broker snapshot."
@@ -211,6 +254,11 @@ def render_positions(views: list[PositionView], *, now: dt.datetime | None = Non
             f"  qty {esc(held)} (tradable {esc(tradable)}) · "
             f"avg {money(position.average_price, position.currency, places=4)} · "
             f"P/L {money(position.ppl, position.currency)}"
+        )
+        lines.append(
+            _position_exit_line(position.exit)
+            if position.exit is not None
+            else "  exit: floors unavailable"
         )
     lines.append(
         esc(
