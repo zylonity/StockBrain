@@ -38,6 +38,7 @@ from stockbrain.errors import ProviderUnavailable
 from stockbrain.market_data.base import Bar, ProviderCapability, Quote, Trade
 from stockbrain.proposals.service import ProposalService
 from stockbrain.risk.config import RiskConfig, risk_config_from_settings
+from stockbrain.telegram.preferences import NotificationPreferences
 
 COMPANY_ID = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001")
 INSTRUMENT_ID = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000002")
@@ -147,6 +148,7 @@ def service_with(
     market_data: StubMarketData | None = None,
     config: RiskConfig | None = None,
     control: ControlStateService | None = None,
+    preferences: NotificationPreferences | None = None,
 ) -> ProposalService:
     """Build a proposal service around an already-resolved ``Settings``.
 
@@ -163,6 +165,7 @@ def service_with(
         market_data=market_data or StubMarketData(),
         broker=Broker.TRADING212,
         control=control or ControlStateService(database),
+        preferences=preferences,
     )
 
 
@@ -171,6 +174,7 @@ def service(
     *,
     market_data: StubMarketData | None = None,
     config: RiskConfig | None = None,
+    preferences: NotificationPreferences | None = None,
     **setting_overrides: Any,
 ) -> ProposalService:
     return service_with(
@@ -178,6 +182,7 @@ def service(
         settings(**setting_overrides),
         market_data=market_data,
         config=config,
+        preferences=preferences,
     )
 
 

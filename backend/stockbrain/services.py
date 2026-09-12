@@ -231,6 +231,7 @@ class ServiceContainer:
                 fx=self.fx,
                 broker=Broker.TRADING212,
                 control=self.control,
+                preferences=self.notification_preferences,
             )
             log.info(
                 "proposal_service_ready",

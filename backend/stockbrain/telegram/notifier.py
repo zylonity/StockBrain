@@ -152,6 +152,7 @@ _PIPELINE_ENTITY: dict[PipelineEvent, str] = {
     PipelineEvent.EVENT_CANDIDATE: "event",
     PipelineEvent.RESEARCH_STARTED: "research_run",
     PipelineEvent.RESEARCH_COMPLETED: "research_run",
+    PipelineEvent.PROPOSAL_BLOCKED: "research_run",
 }
 
 _PIPELINE_TITLES: dict[PipelineEvent, str] = {
@@ -160,6 +161,7 @@ _PIPELINE_TITLES: dict[PipelineEvent, str] = {
     PipelineEvent.EVENT_CANDIDATE: "Event promoted to research candidate",
     PipelineEvent.RESEARCH_STARTED: "Research started",
     PipelineEvent.RESEARCH_COMPLETED: "Research completed",
+    PipelineEvent.PROPOSAL_BLOCKED: "Trade blocked by risk",
 }
 
 

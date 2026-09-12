@@ -27,7 +27,7 @@ from stockbrain.config import Settings
 from stockbrain.control.state import ControlSnapshot, ControlStateService
 from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
 from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
-from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
+from stockbrain.db.models.proposals import ExecutionAttempt, RiskEvaluation, TradeProposal
 from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.models.sources import Event
 from stockbrain.db.session import Database
@@ -39,6 +39,7 @@ from stockbrain.enums import (
     ResearchStatus,
 )
 from stockbrain.observability.health import ProviderHealthRegistry
+from stockbrain.proposals.service import STAGE_GENERATION
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES, AUTHORIZABLE_STATUSES
 
 __all__ = [
@@ -200,6 +201,7 @@ class ResearchRunView:
     estimated_cost_usd: Decimal | None
     started_at: dt.datetime | None
     completed_at: dt.datetime | None
+    block_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,6 +480,32 @@ class TelegramService:
                 .scalars()
                 .first()
             )
+            # The rules that refused the proposal this thesis generated, if any.
+            # Read from the durable evaluation rather than from the run: the
+            # refusal is a fact about the risk engine, not about research.
+            block_reasons: tuple[str, ...] = ()
+            if thesis is not None:
+                evaluation = (
+                    (
+                        await session.execute(
+                            sa.select(RiskEvaluation)
+                            .where(
+                                RiskEvaluation.stage == STAGE_GENERATION,
+                                RiskEvaluation.thesis_id == thesis.id,
+                            )
+                            .order_by(RiskEvaluation.created_at.desc())
+                            .limit(1)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if evaluation is not None:
+                    block_reasons = tuple(
+                        str(rule["reason"])
+                        for rule in (evaluation.rules or [])
+                        if isinstance(rule, dict) and rule.get("outcome") == "BLOCK"
+                    )
         return ResearchRunView(
             id=run.id,
             status=run.status,
@@ -493,6 +521,7 @@ class TelegramService:
             estimated_cost_usd=run.estimated_cost_usd,
             started_at=run.started_at,
             completed_at=run.completed_at,
+            block_reasons=block_reasons,
         )
 
     # ------------------------------------------------------------------

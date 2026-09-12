@@ -440,6 +440,7 @@ _STAGE_HEADLINES: dict[PipelineEvent, str] = {
     PipelineEvent.EVENT_CANDIDATE: "Promoted to research candidate",
     PipelineEvent.RESEARCH_STARTED: "Research started",
     PipelineEvent.RESEARCH_COMPLETED: "Research completed",
+    PipelineEvent.PROPOSAL_BLOCKED: "Trade blocked by risk",
 }
 
 
@@ -479,6 +480,12 @@ def render_event_stage(view: EventView, event: PipelineEvent) -> str:
     return "\n".join(lines)
 
 
+def _thesis_line(view: ResearchRunView) -> str:
+    confidence = f" · {view.confidence:.0%} confidence" if view.confidence is not None else ""
+    horizon = f" · horizon {esc(view.horizon)}" if view.horizon else ""
+    return f"Thesis: {bold(esc(view.action))}{esc(confidence)}{horizon}"
+
+
 def render_research_stage(view: ResearchRunView, event: PipelineEvent) -> str:
     """One research run, starting or finished.
 
@@ -489,6 +496,22 @@ def render_research_stage(view: ResearchRunView, event: PipelineEvent) -> str:
     reads as certainty unless it is told not to.
     """
     subject = view.company or view.broker_ticker or str(view.id)
+    if event is PipelineEvent.PROPOSAL_BLOCKED:
+        # A refusal is its own message, not a "research completed" with a
+        # footnote: what the operator needs is the rules that said no.
+        lines = [f"{bold(esc(_STAGE_HEADLINES[event]))} — {esc(subject)}"]
+        if view.action:
+            lines.append(_thesis_line(view))
+        lines.append(bold("Blocked by:"))
+        for reason in view.block_reasons[:8]:
+            lines.append(f"• {trim(reason, _REASON_LIMIT)}")
+        if len(view.block_reasons) > 8:
+            lines.append(esc(f"… and {len(view.block_reasons) - 8} more"))
+        lines.append(
+            esc("The proposal was refused before it was created. Nothing was sent to the broker.")
+        )
+        return "\n".join(lines)
+
     lines = [
         f"{bold(esc(_STAGE_HEADLINES[event]))} — {esc(subject)}",
     ]
@@ -502,9 +525,7 @@ def render_research_stage(view: ResearchRunView, event: PipelineEvent) -> str:
 
     lines.append(f"Outcome: {esc(view.status.value)}")
     if view.action:
-        confidence = f" · {view.confidence:.0%} confidence" if view.confidence is not None else ""
-        horizon = f" · horizon {esc(view.horizon)}" if view.horizon else ""
-        lines.append(f"Thesis: {bold(esc(view.action))}{esc(confidence)}{horizon}")
+        lines.append(_thesis_line(view))
         lines.append(esc("Confidence is a model ranking, not a calibrated probability."))
     if view.summary:
         lines.append(trim(view.summary, _TEXT_LIMIT))

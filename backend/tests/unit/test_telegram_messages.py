@@ -19,12 +19,15 @@ from stockbrain.enums import (
     ExecutionPolicy,
     ProposalStatus,
     ProviderStatus,
+    ResearchStatus,
 )
 from stockbrain.telegram import messages
+from stockbrain.telegram.preferences import PipelineEvent
 from stockbrain.telegram.service import (
     EventView,
     PortfolioView,
     PositionView,
+    ResearchRunView,
     ResearchView,
     StatusView,
 )
@@ -327,3 +330,42 @@ def test_start_tells_an_unauthorised_caller_nothing_about_the_system() -> None:
     denied = messages.render_start(authorised=False)
     assert denied == "Not authorised."
     assert "StockBrain" not in denied
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stages
+# ---------------------------------------------------------------------------
+def _research_view(**overrides: object) -> ResearchRunView:
+    base: dict[str, object] = {
+        "id": proposal_view().id,
+        "status": ResearchStatus.SUCCEEDED,
+        "company": "Apple Inc.",
+        "broker_ticker": "AAPL_US_EQ",
+        "event_id": None,
+        "event_title": None,
+        "action": "BUY",
+        "confidence": 0.9,
+        "horizon": "days",
+        "summary": None,
+        "error_class": None,
+        "estimated_cost_usd": None,
+        "started_at": None,
+        "completed_at": None,
+    }
+    base.update(overrides)
+    return ResearchRunView(**base)  # type: ignore[arg-type]
+
+
+def test_a_blocked_proposal_lists_the_rules_that_refused_it() -> None:
+    view = _research_view(
+        action="BUY",
+        confidence=0.64,
+        block_reasons=(
+            "research confidence 0.64 is below the 0.70 floor",
+            "instrument USD != account GBP",
+        ),
+    )
+    text = messages.render_research_stage(view, PipelineEvent.PROPOSAL_BLOCKED)
+    assert "Trade blocked" in text
+    assert "0.70 floor" in text and "USD != account GBP" in text
+    assert "never authorizes" not in text  # that line belongs to RESEARCH_STARTED

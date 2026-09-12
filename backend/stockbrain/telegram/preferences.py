@@ -95,6 +95,11 @@ class NotificationCategory(StrEnum):
     """A research run finished, succeeded or failed, with its action and
     confidence where it produced a thesis."""
 
+    PROPOSAL_BLOCKED = "PROPOSAL_BLOCKED"
+    """Research recommended a trade and the deterministic risk engine refused it.
+    The message names the rules that refused it, so "the system said buy and
+    then went quiet" is answerable from the channel."""
+
     PROPOSAL = "PROPOSAL"
     """A proposal was created and awaits authorization, or was authorized
     automatically."""
@@ -161,6 +166,13 @@ NOTIFICATION_CATEGORY_DETAIL: dict[NotificationCategory, CategoryDetail] = {
         ),
         volume="low",
     ),
+    NotificationCategory.PROPOSAL_BLOCKED: CategoryDetail(
+        label="Trade blocked by risk",
+        description=(
+            "Research recommended a trade and the risk engine refused it. Lists the blocking rules."
+        ),
+        volume="low",
+    ),
     NotificationCategory.PROPOSAL: CategoryDetail(
         label="Proposal created",
         description=(
@@ -210,6 +222,7 @@ DEFAULT_PREFERENCES: dict[NotificationCategory, bool] = {
     NotificationCategory.EVENT_CANDIDATE: True,
     NotificationCategory.RESEARCH_STARTED: False,
     NotificationCategory.RESEARCH_COMPLETED: True,
+    NotificationCategory.PROPOSAL_BLOCKED: True,
     NotificationCategory.PROPOSAL: True,
     NotificationCategory.PROPOSAL_OUTCOME: True,
     NotificationCategory.EXECUTION: True,
@@ -238,6 +251,7 @@ class PipelineEvent(StrEnum):
     EVENT_CANDIDATE = "EVENT_CANDIDATE"
     RESEARCH_STARTED = "RESEARCH_STARTED"
     RESEARCH_COMPLETED = "RESEARCH_COMPLETED"
+    PROPOSAL_BLOCKED = "PROPOSAL_BLOCKED"
 
 
 _PIPELINE_CATEGORIES: dict[PipelineEvent, NotificationCategory] = {
@@ -246,6 +260,7 @@ _PIPELINE_CATEGORIES: dict[PipelineEvent, NotificationCategory] = {
     PipelineEvent.EVENT_CANDIDATE: NotificationCategory.EVENT_CANDIDATE,
     PipelineEvent.RESEARCH_STARTED: NotificationCategory.RESEARCH_STARTED,
     PipelineEvent.RESEARCH_COMPLETED: NotificationCategory.RESEARCH_COMPLETED,
+    PipelineEvent.PROPOSAL_BLOCKED: NotificationCategory.PROPOSAL_BLOCKED,
 }
 
 _PROPOSAL_CATEGORIES: dict[NotificationEvent, NotificationCategory] = {

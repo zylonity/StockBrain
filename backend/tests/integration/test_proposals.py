@@ -18,7 +18,7 @@ from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument
 from stockbrain.db.models.proposals import RiskEvaluation, TradeProposal
 from stockbrain.db.models.research import Thesis
-from stockbrain.db.models.system import AuditLog
+from stockbrain.db.models.system import AuditLog, Job
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     AuthorizationSource,
@@ -38,6 +38,7 @@ from stockbrain.errors import (
     ProposalExpired,
     RiskBlocked,
 )
+from stockbrain.telegram.preferences import NotificationPreferences
 from tests import proposal_helpers as ph
 
 pytestmark = pytest.mark.integration
@@ -816,3 +817,37 @@ async def test_cancellation_is_legal_from_every_pre_execution_state(
     assert result.proposal_id is not None
     await service.cancel(result.proposal_id, actor="web:operator", reason="changed my mind")
     assert (await _proposal(clean_tables)).status is ProposalStatus.CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# The blocked refusal reaches the notification queue
+# ---------------------------------------------------------------------------
+async def test_a_blocked_buy_enqueues_a_proposal_blocked_notification(
+    clean_tables: Database,
+) -> None:
+    # Seed a BUY thesis whose research confidence is below the floor so generation blocks.
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.10)
+    service = ph.service(clean_tables, preferences=NotificationPreferences(clean_tables))
+    result = await service.generate(ph.THESIS_ID)
+    assert not result.created
+    async with clean_tables.session() as session:
+        job = (
+            await session.execute(sa.select(Job).where(Job.job_type == "SEND_NOTIFICATION"))
+        ).scalar_one()
+    assert job.payload["pipeline_event"] == "PROPOSAL_BLOCKED"
+    assert job.payload["entity_id"] == str(ph.RUN_ID)
+
+
+async def test_a_hold_does_not_announce_a_block(clean_tables: Database) -> None:
+    await ph.seed(clean_tables, action=ThesisAction.HOLD, confidence=0.9)
+    service = ph.service(clean_tables, preferences=NotificationPreferences(clean_tables))
+    await service.generate(ph.THESIS_ID)
+    async with clean_tables.session() as session:
+        count = (
+            await session.execute(
+                sa.select(sa.func.count())
+                .select_from(Job)
+                .where(Job.job_type == "SEND_NOTIFICATION")
+            )
+        ).scalar_one()
+    assert count == 0

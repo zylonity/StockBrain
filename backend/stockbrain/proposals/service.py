@@ -42,6 +42,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, Decimal
+from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -104,6 +105,12 @@ from stockbrain.risk.models import (
 from stockbrain.risk.rules import (
     action_is_executable,
 )
+
+if TYPE_CHECKING:
+    # Imported only for the annotation: a module-level import of the Telegram
+    # package from here would close an import cycle (telegram.runtime imports
+    # this module, and this module would import telegram.preferences).
+    from stockbrain.telegram.preferences import NotificationPreferences
 
 __all__ = ["AuthorizationResult", "GenerationResult", "ProposalService", "Revalidation"]
 
@@ -178,6 +185,7 @@ class ProposalService:
         broker: Broker = Broker.TRADING212,
         engine: RiskEngine | None = None,
         control: ControlStateService | None = None,
+        preferences: NotificationPreferences | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -196,6 +204,10 @@ class ProposalService:
         # service without one; absent, nothing is halted, which is the same
         # answer an empty table gives.
         self.control = control or ControlStateService(database)
+        # Optional so a unit test that only exercises proposal state needs no
+        # preference store; ``enqueue_pipeline_notification`` is a no-op without
+        # one, which is exactly the shipped quiet behaviour.
+        self._preferences = preferences
 
     def _evaluator(self) -> ProposalEvaluator:
         return ProposalEvaluator(
@@ -366,6 +378,29 @@ class ProposalService:
                     outcome=decision.outcome.value,
                     blocks=list(decision.block_rule_ids),
                 )
+                # --- PROPOSAL_BLOCKED notification (task 1) ------------------
+                # Without this the operator sees "Research completed: BUY" and
+                # then silence. Announce the refusal from the same transaction
+                # that recorded it, so an announced refusal is a real one.
+                if candidate.action in {
+                    ThesisAction.BUY,
+                    ThesisAction.SELL,
+                    ThesisAction.REDUCE,
+                }:
+                    # Local imports: see the TYPE_CHECKING note above. Both
+                    # packages are fully loaded by the time a proposal is
+                    # generated.
+                    from stockbrain.jobs.notifications import enqueue_pipeline_notification
+                    from stockbrain.telegram.preferences import PipelineEvent
+
+                    await enqueue_pipeline_notification(
+                        session,
+                        self.queue,
+                        self._preferences,
+                        entity_id=candidate.run.id,
+                        event=PipelineEvent.PROPOSAL_BLOCKED,
+                    )
+                # --- end PROPOSAL_BLOCKED notification -----------------------
                 return GenerationResult(
                     thesis_id=thesis_id,
                     created=False,
