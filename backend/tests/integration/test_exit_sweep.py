@@ -20,10 +20,13 @@ from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompa
 from stockbrain.db.models.portfolio import Position, PositionPeak
 from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.models.research import ResearchRun, Thesis
+from stockbrain.db.models.system import Job
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     Broker,
     ImpactDirection,
+    JobType,
+    NotificationEvent,
     OrderSide,
     OrderType,
     PriceSource,
@@ -603,3 +606,44 @@ async def test_a_superseded_thesis_exit_survives_the_precondition_sweep(
     assert refreshed is not None
     assert refreshed.status in ACTIVE_STATUSES
     assert refreshed.invalidated_at is None
+
+
+async def test_an_exit_under_automatic_policy_is_still_notified(
+    clean_tables: Database,
+) -> None:
+    """An exit is never auto-authorized until a per-kind policy exists.
+
+    ``generate_exit`` never runs the automatic-authorization tail, so under
+    ``ExecutionPolicy.AUTOMATIC`` the proposal is created READY and never
+    announced -- an exit no human is told about.  Under either policy a human
+    must see it, so the manual notification is unconditional.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    resolved = ph.settings(execution_policy="automatic")
+    service = ph.service_with(database, resolved)
+
+    result = await service.generate_exit(
+        "AAPL_US_EQ",
+        ExitSignal(
+            rule_id="hard_stop",
+            action=ThesisAction.SELL,
+            reason="the position is -9.00% against average cost",
+            rule=_rule("hard_stop"),
+        ),
+    )
+    assert result.created, result.reason
+
+    async with database.session() as session:
+        jobs = list(
+            (
+                await session.execute(
+                    sa.select(Job).where(Job.job_type == JobType.SEND_NOTIFICATION.value)
+                )
+            ).scalars()
+        )
+    assert any(
+        job.payload["proposal_id"] == str(result.proposal_id)
+        and job.payload["event"] == NotificationEvent.PROPOSAL_MANUAL.value
+        for job in jobs
+    )

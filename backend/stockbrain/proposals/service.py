@@ -672,8 +672,9 @@ class ProposalService:
                     },
                 )
             )
-            if proposal.execution_policy is ExecutionPolicy.MANUAL:
-                await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_MANUAL)
+            # An exit is never auto-authorized until a per-kind policy exists, so
+            # under either execution policy a human must see it.
+            await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_MANUAL)
             proposal_id = proposal.id
             evaluation_id = evaluation.id
 
