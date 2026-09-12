@@ -80,6 +80,16 @@ POLYMARKET_MIN_VOLUME = 10_000.0
 #: Outcome buckets kept per event. A rate-path question can carry a dozen.
 POLYMARKET_MAX_OUTCOMES = 12
 
+#: Buckets the crowd has priced at essentially zero are summarised as a count and
+#: a combined probability rather than listed one by one.  A thirteen-bucket rate
+#: distribution is typically two buckets carrying the mass and eleven carrying
+#: rounding, and this block is repeated into every research call of the day.
+POLYMARKET_MIN_OUTCOME_PROBABILITY = 0.02
+
+#: Always kept regardless of probability, so a genuinely flat distribution still
+#: arrives as a distribution rather than as a single summary line.
+POLYMARKET_ALWAYS_KEPT_OUTCOMES = 4
+
 
 def require_live_cutoff(
     as_of: dt.datetime, *, now: dt.datetime | None = None, tolerance: dt.timedelta | None = None
@@ -372,7 +382,43 @@ class PolymarketMacroProvider:
             if label is None or probability is None:
                 continue
             rows.append({"outcome": str(label)[:60], "probability": probability})
-        return rows[:POLYMARKET_MAX_OUTCOMES]
+        return PolymarketMacroProvider._trim(rows[:POLYMARKET_MAX_OUTCOMES])
+
+    @staticmethod
+    def _trim(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Summarise the near-zero tail, preserving bucket order and labels.
+
+        Order is not disturbed and no bucket is silently dropped: the omitted
+        ones are replaced by one self-describing row carrying their combined
+        probability, so the distribution still reads as a distribution.
+        """
+
+        def probability(row: dict[str, Any]) -> float:
+            try:
+                return float(row["probability"])
+            except (TypeError, ValueError):
+                return 0.0
+
+        ranked = sorted(range(len(rows)), key=lambda index: probability(rows[index]), reverse=True)
+        always = set(ranked[:POLYMARKET_ALWAYS_KEPT_OUTCOMES])
+        kept: list[dict[str, Any]] = []
+        omitted_mass = 0.0
+        omitted = 0
+        for index, row in enumerate(rows):
+            if index in always or probability(row) >= POLYMARKET_MIN_OUTCOME_PROBABILITY:
+                kept.append(row)
+            else:
+                omitted += 1
+                omitted_mass += probability(row)
+        if omitted:
+            kept.append(
+                {
+                    "outcome": f"{omitted} further buckets each below "
+                    f"{POLYMARKET_MIN_OUTCOME_PROBABILITY:.0%}",
+                    "probability": f"{omitted_mass:.4f}",
+                }
+            )
+        return kept
 
     @staticmethod
     def _forward_looking(payload: object, topic: str, as_of: dt.datetime) -> list[dict[str, Any]]:

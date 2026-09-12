@@ -65,9 +65,16 @@ async def test_fred_request_dates_vintage_and_missing_values(value: str) -> None
     assert query["observation_end"] == "2026-09-03"
     assert query["limit"] == "100" and query["units"] == "lin"
     assert "not-a-real-key" not in result[0].model_dump_json()
-    assert json.loads(result[0].text)["observations"][0]["value"] == (
-        None if value == "." else value
-    )
+    summary = json.loads(result[0].text)
+    if value == ".":
+        # A vintage whose only observation is missing summarises to nothing rather
+        # than reporting a level it does not have.
+        assert summary["observations"] == 0
+    else:
+        assert summary["latest"]["value"] == value
+        assert summary["range"]["min"] == summary["range"]["max"] == value
+        assert summary["window"]["observations"] == 1
+        assert [row["value"] for row in summary["recent_levels"]] == [value]
 
 
 async def test_fred_missing_key_never_requests() -> None:

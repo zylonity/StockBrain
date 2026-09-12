@@ -40,6 +40,52 @@ class Observations(BaseModel):
     observations: list[Observation] = Field(max_length=100)
 
 
+#: Points kept when reporting a macro series.  These blocks reach every research
+#: call for every company on a given day, so their shape is paid for thousands of
+#: times over; a policy rate repeated unchanged for sixty rows is one fact priced
+#: as sixty.  The series is reported as a level, its recent moves and its range,
+#: with runs of an identical value collapsed to the date the value began.
+MACRO_SERIES_LEVELS = 12
+
+
+def summarize_series(values: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compact a newest-first observation list to level, moves and range.
+
+    Nothing a macro backdrop is read for is lost: the current level, how far it
+    has travelled recently, and the band it moved in all survive.  The per-day
+    path beyond the most recent changes does not, which is the point.
+    """
+    dated = [row for row in values if row["value"] is not None]
+    if not dated:
+        return {"observations": 0, "note": "no observations in vintage window"}
+    numbers = [Decimal(row["value"]) for row in dated]
+    latest = dated[0]
+
+    # Runs of one value collapse to the date that value began.
+    collapsed: list[dict[str, Any]] = []
+    for row in dated:
+        if not collapsed or collapsed[-1]["value"] != row["value"]:
+            collapsed.append(dict(row))
+        else:
+            collapsed[-1]["since"] = row["date"]
+
+    latest_date = dt.date.fromisoformat(latest["date"])
+    change: dict[str, str] = {}
+    for label, days in (("7d", 7), ("30d", 30), ("90d", 90)):
+        target = latest_date - dt.timedelta(days=days)
+        prior = next((r for r in dated if dt.date.fromisoformat(r["date"]) <= target), None)
+        if prior is not None:
+            change[label] = str(numbers[0] - Decimal(prior["value"]))
+    return {
+        "latest": latest,
+        "change": change,
+        "range": {"min": str(min(numbers)), "max": str(max(numbers))},
+        "window": {"start": dated[-1]["date"], "end": latest["date"], "observations": len(dated)},
+        "recent_levels": collapsed[:MACRO_SERIES_LEVELS],
+        "levels_truncated": len(collapsed) > MACRO_SERIES_LEVELS,
+    }
+
+
 def fred_error(response: httpx.Response, error: Exception) -> Exception:
     if response.status_code == 400 and "api_key" in response.text.lower():
         return ProviderAuthError("fred: API key rejected")
@@ -128,7 +174,7 @@ class FredMacroProvider:
                         {
                             "series_id": series_id,
                             "vintage": vintage.isoformat(),
-                            "observations": values,
+                            **summarize_series(values),
                         }
                     ),
                 )
