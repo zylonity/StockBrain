@@ -452,3 +452,12 @@ def test_no_blocker_message_contains_a_secret_value() -> None:
         "scrypt$",
     ):
         assert secret not in everything, secret
+
+
+# ---------------------------------------------------------------------------
+# The deterministic exit sweep
+# ---------------------------------------------------------------------------
+def test_the_exit_sweep_is_not_scheduled_by_default() -> None:
+    """Enabling it is an explicit operator act, not a default."""
+    settings = _settings()
+    assert settings.exit_sweep_enabled is False

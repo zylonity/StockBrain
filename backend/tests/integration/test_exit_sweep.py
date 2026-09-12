@@ -16,7 +16,7 @@ from stockbrain.broker.trading212_account import (
     Trading212AccountClient,
 )
 from stockbrain.db.base import utcnow
-from stockbrain.db.models.portfolio import PositionPeak
+from stockbrain.db.models.portfolio import Position, PositionPeak
 from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.session import Database
 from stockbrain.enums import (
@@ -28,7 +28,9 @@ from stockbrain.enums import (
     RuleOutcome,
     ThesisAction,
 )
+from stockbrain.proposals.exits import ExitSweepService
 from stockbrain.proposals.service import ProposalService
+from stockbrain.risk.config import risk_config_from_settings
 from stockbrain.risk.exits import ExitSignal
 from stockbrain.risk.models import RuleResult
 from tests import proposal_helpers as ph
@@ -137,6 +139,18 @@ async def _proposal_service(database: Database) -> ProposalService:
     return ph.service(database)
 
 
+async def _exit_sweep(database: Database) -> ExitSweepService:
+    """The real sweep over the shared stub provider.
+
+    The proposal service and the sweep share one ``Settings`` and one
+    ``RiskConfig``, exactly as the container wires them.
+    """
+    resolved = ph.settings()
+    config = risk_config_from_settings(resolved)
+    proposals = ph.service_with(database, resolved, config=config)
+    return ExitSweepService(database, resolved, proposals=proposals, config=config)
+
+
 def _rule(rule_id: str) -> RuleResult:
     """The ``RuleResult`` a fired exit rule carries, in the shape Task 3 emits."""
     return RuleResult(
@@ -204,6 +218,60 @@ async def _seed_executed_buy(
         research_run_id=ph.RUN_ID,
         proposal_id=proposal.id,
     )
+
+
+async def _seed_position(
+    database: Database,
+    *,
+    broker_ticker: str,
+    average_price: Decimal,
+    current_price: Decimal,
+) -> None:
+    """Reprice the funded holding ``_seed_executed_buy`` left behind.
+
+    The broker's own price is what the sweep reads; the market-data quote is a
+    separate path and is untouched.
+    """
+    async with database.transaction() as session:
+        position = (
+            await session.execute(
+                sa.select(Position).where(
+                    Position.broker == Broker.TRADING212,
+                    Position.broker_ticker == broker_ticker,
+                )
+            )
+        ).scalar_one()
+        position.average_price = average_price
+        position.current_price = current_price
+
+
+async def _seed_live_proposal(database: Database, *, broker_ticker: str) -> None:
+    """One non-terminal proposal already occupies the listing.
+
+    The database's one-active-proposal-per-listing index is the invariant the
+    sweep must respect without spending a quote to discover it.
+    """
+    moment = utcnow()
+    proposal = TradeProposal(
+        broker=Broker.TRADING212,
+        broker_ticker=broker_ticker,
+        account_id=ph.ACCOUNT_ID,
+        broker_environment=ph.settings().t212_env.value,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        proposed_quantity=Decimal("1"),
+        reference_price=Decimal("100"),
+        reference_currency="USD",
+        price_source=PriceSource.ALPACA_IEX,
+        quote_timestamp=moment,
+        quote_age_ms=0,
+        estimated_notional=Decimal("100"),
+        account_currency="USD",
+        status=ProposalStatus.READY,
+        expires_at=moment + dt.timedelta(days=1),
+    )
+    async with database.transaction() as session:
+        session.add(proposal)
 
 
 async def test_an_exit_proposal_inherits_the_origin_thesis(clean_tables: Database) -> None:
@@ -284,3 +352,64 @@ async def test_a_position_with_no_origin_proposal_is_not_exited(clean_tables: Da
     assert not result.created
     assert result.reason is not None
     assert "no executed StockBrain buy" in result.reason
+
+
+async def test_the_sweep_proposes_an_exit_for_a_losing_position(clean_tables: Database) -> None:
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("88"),
+    )
+
+    sweep = await _exit_sweep(database)
+    counts = await sweep.sweep()
+
+    assert counts["proposed"] == 1
+    assert counts["signalled"] == 1
+    async with database.session() as session:
+        proposal = (
+            await session.execute(
+                sa.select(TradeProposal).where(TradeProposal.side == OrderSide.SELL)
+            )
+        ).scalar_one()
+    assert any(rule["rule_id"] == "hard_stop" for rule in proposal.risk_rules)
+
+
+async def test_the_sweep_holds_a_healthy_position(clean_tables: Database) -> None:
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("101"),
+    )
+
+    counts = await (await _exit_sweep(database)).sweep()
+
+    assert counts["signalled"] == 0
+    assert counts["proposed"] == 0
+
+
+async def test_the_sweep_skips_a_position_that_already_has_a_live_proposal(
+    clean_tables: Database,
+) -> None:
+    """One active proposal per listing is a database invariant; the sweep must
+    not spend a quote request discovering it."""
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("88"),
+    )
+    await _seed_live_proposal(database, broker_ticker="AAPL_US_EQ")
+
+    counts = await (await _exit_sweep(database)).sweep()
+
+    assert counts["skipped_active_proposal"] == 1
+    assert counts["proposed"] == 0

@@ -104,6 +104,7 @@ from stockbrain.market_data.base import ProviderCapability
 from stockbrain.observability.alerts import OperationalAlerts
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
+from stockbrain.proposals.exits import ExitSweepService
 from stockbrain.proposals.service import ProposalService
 from stockbrain.risk.config import RiskConfig, risk_config_from_settings
 from stockbrain.telegram.preferences import NotificationPreferences, PipelineEvent
@@ -168,6 +169,7 @@ class ServiceContainer:
     account_state: AccountStateService = field(init=False)
     instrument_sync: InstrumentSyncService | None = field(default=None, init=False)
     proposals: ProposalService | None = field(default=None, init=False)
+    exits: ExitSweepService | None = field(default=None, init=False)
     risk_config: RiskConfig = field(init=False)
     resolution: ResolutionService | None = field(default=None, init=False)
     market_data: AlpacaMarketDataClient | None = field(default=None, init=False)
@@ -243,6 +245,18 @@ class ServiceContainer:
                     "permitted" if self.settings.order_transmission_permitted else "blocked"
                 ),
             )
+        if self.proposals is not None:
+            # Shares the proposal service and the exact RiskConfig it was built
+            # with; the sweep owns no thresholds of its own. Constructed here
+            # rather than on first tick so a missing wiring fails at startup.
+            self.exits = ExitSweepService(
+                self.database,
+                self.settings,
+                proposals=self.proposals,
+                config=self.risk_config,
+            )
+        else:
+            self.exits = None
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
@@ -796,6 +810,18 @@ class ServiceContainer:
                     jitter_ratio=0.05,
                 )
             )
+        if self.exits is not None and self.settings.exit_sweep_enabled:
+            # Ships disabled. The sweep only ever generates proposals; every
+            # authorization and transmission gate is unchanged by it.
+            scheduler.add(
+                ScheduledTask(
+                    name="position_exit_sweep",
+                    interval_seconds=self.settings.exit_sweep_interval_seconds,
+                    run=self._exit_sweep,
+                    initial_delay_seconds=100.0,
+                    jitter_ratio=0.1,
+                )
+            )
         if self.execution is not None:
             # The scheduler only ever *enqueues*; the handler transmits. That
             # separation is what keeps a slow broker from delaying the cadence,
@@ -1149,6 +1175,10 @@ class ServiceContainer:
             return
         await self.proposals.sweep()
         await self.proposals.enqueue_pending()
+
+    async def _exit_sweep(self) -> None:
+        if self.exits is not None:
+            await self.exits.sweep()
 
     async def _enqueue_pending_resolutions(self) -> None:
         """Sweep impacts whose resolution never ran.
