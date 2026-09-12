@@ -797,6 +797,53 @@ balance. `quantityAvailableForTrading` is kept separate from `quantity` all the
 way to the engine, because shares inside a pie are owned but not individually
 tradable.
 
+### Deterministic exits
+
+A held position leaves through exactly one of five rules, and the precedence is
+declared rather than emergent: `hard_stop` → `trailing_stop` →
+`thesis_superseded` → `roi_target` → `horizon_elapsed`. `evaluate_exit` returns
+the first rule that fires and does not evaluate the rest, so two rules can never
+argue for two orders on one position.
+
+| Rule | Action | Fires when |
+|---|---|---|
+| `hard_stop` | SELL | the loss against average cost passes `RISK_EXIT_HARD_STOP_PCT` (8%). A floor, never widened. |
+| `trailing_stop` | SELL | the position first gained `RISK_EXIT_TRAILING_ARM_PCT` (10%), then fell `RISK_EXIT_TRAILING_PCT` (5%) below its peak. |
+| `thesis_superseded` | SELL | research has published a newer thesis than the one the position was opened on. |
+| `roi_target` | REDUCE | the gain meets the decaying target for the thesis's horizon and age. |
+| `horizon_elapsed` | SELL | the position is past its thesis horizon. |
+
+By construction the last two cannot both fire: `roi_target` needs a target
+above zero, and a zero target is the horizon-elapsed boundary. `horizon_elapsed`
+fires **regardless of P/L** — an event thesis that has run out of time is no
+longer a reason to hold, profit or loss alike — and `hard_stop` outranks it,
+because a position past the floor has already been evaluated as a loss first.
+
+Four of the five propose a full `SELL`; only `roi_target` proposes `REDUCE`, the
+same deterministic half-exit the research path can already ask for. Every one is
+an ordinary proposal on the ordinary risk path: `generate_exit` re-prices it
+through the market-data evaluator, and no rule here touches a broker.
+
+Two prices meet at this boundary and they are deliberately different things:
+
+* the **peak** comes from broker-supplied position snapshots, mirrored into
+  `position_peaks`. Broker prices are display-grade and explicitly not
+  real-time; the peak may track a high-water mark but may never be the
+  reference price on a proposal. A peak is trusted only once it is built from
+  `RISK_EXIT_MIN_PEAK_OBSERVATIONS` (default 3) snapshots — one observation is
+  an entry price wearing a peak's name;
+* the proposal's **reference price** comes from the ordinary market-data path,
+  execution-grade and freshly fetched, exactly as it would for a research
+  proposal. A signal says *that* to exit; it never says *what price*.
+
+The sweep interval is the real resolution of every price-based rule. The
+scheduled sweep evaluates each open position once per `EXIT_SWEEP_INTERVAL_SECONDS`
+(default 300s), so a fast move can travel through both the hard stop and the
+trailing floor between two ticks, and the exit is proposed when the sweep
+reaches it and no sooner. The interval bounds reaction time, not the threshold:
+nothing evaluates a stop continuously, and an operator reading a drawdown should
+read it with that lag in mind.
+
 ## Phase 7 Telegram control and approvals
 
 ### Where the trust boundary is

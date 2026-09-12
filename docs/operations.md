@@ -653,6 +653,49 @@ the user is warned. At the hard limit, new deep research stops while ingestion,
 deduplication, broker reconciliation and portfolio safety alerts continue.
 Broker-state monitoring is never stopped by an LLM budget.
 
+## Position exit policy
+
+The deterministic sweep that proposes exits for open positions **ships
+disabled**. Turn it on with:
+
+```
+EXIT_SWEEP_ENABLED=true
+```
+
+`EXIT_SWEEP_INTERVAL_SECONDS` (default `300`) is how often it runs, between 30
+and 3600 seconds. That interval is the real resolution of the price-based rules:
+a stop is not watched continuously, and a fast move can travel through both the
+hard stop and the trailing floor between two ticks. Raising the interval slows
+how fast the system reacts to a breach; it does not widen the thresholds.
+
+Every threshold is `RESTART_REQUIRED`. There is no write route for settings —
+edit `.env` and restart the process. The values are validated at startup, so an
+impossible policy refuses to start rather than failing open later.
+
+| Variable | Default | What it means |
+|---|---|---|
+| `RISK_EXIT_HARD_STOP_PCT` | `0.08` | Loss from average cost at which the whole position is proposed for exit. A floor, never widened. |
+| `RISK_EXIT_TRAILING_ARM_PCT` | `0.10` | Gain from average cost at which the trailing floor switches on. Below it the hard stop is the only floor. |
+| `RISK_EXIT_TRAILING_PCT` | `0.05` | How far below the peak the trailing floor sits, once armed. Must be below the arm threshold, otherwise the floor would already be under the entry price when it armed. |
+| `RISK_EXIT_MIN_PEAK_OBSERVATIONS` | `3` | Broker snapshots a peak must be built from before the trailing rule trusts it. One observation is an entry price wearing a peak's name. |
+| `EXIT_SWEEP_INTERVAL_SECONDS` | `300` | How often the sweep evaluates each open position. |
+
+**Reading which rule fired.** An exit proposal carries the rule in its
+`risk_rules` list: the entry whose `rule_id` is one of `hard_stop`,
+`trailing_stop`, `thesis_superseded`, `roi_target` or `horizon_elapsed`. Its
+`observed` and `threshold` fields are the numbers that decided it, and the
+`reason` is the same sentence the GUI and Telegram show. The proposal's
+`research_action` is `REDUCE` when `roi_target` fired and `SELL` for the other
+four.
+
+```bash
+curl -s localhost:8080/api/v1/proposals/<proposal_id>/risk | python3 -m json.tool
+```
+
+Exit proposals are not otherwise special: they are approved, rejected, expired
+and executed on the same lifecycle as a research proposal, and the sweep only
+ever creates them. Nothing about it authorizes or transmits an order.
+
 ## Job queue
 
 The queue *is* the audit trail, which is only a virtue if somebody can read it.
