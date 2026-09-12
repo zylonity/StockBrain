@@ -696,10 +696,17 @@ def _duplicate_or_conflicting_proposal(inputs: RiskInputs) -> RuleResult:
 def _max_active_proposals(inputs: RiskInputs) -> RuleResult:
     limit = inputs.config.max_active_proposals
     count = inputs.reserved.count
+    if inputs.action in RISK_REDUCING_ACTIONS:
+        return _skipped(
+            "max_active_proposals",
+            2,
+            "the active-proposal cap gates entries; a reduction is never blocked by it",
+            threshold=str(limit),
+        )
     ok = count < limit
     return RuleResult(
         rule_id="max_active_proposals",
-        rule_version=1,
+        rule_version=2,
         outcome=RuleOutcome.PASS if ok else RuleOutcome.BLOCK,
         reason=(
             f"{count} of {limit} active proposal slots in use"

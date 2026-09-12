@@ -444,6 +444,33 @@ def test_the_active_proposal_count_limit_blocks() -> None:
     assert "max_active_proposals" in decision.block_rule_ids
 
 
+@pytest.mark.parametrize("action", [ThesisAction.SELL, ThesisAction.REDUCE])
+def test_the_active_proposal_cap_never_blocks_a_reduction(action: ThesisAction) -> None:
+    """The cap gates entries; a control that can stop a position being closed is
+    a hazard rather than a control."""
+    assert (
+        outcome_of(
+            h.inputs(
+                action=action,
+                reserved=ReservedExposure(count=5),
+                state=h.account(positions={"AAPL_US_EQ": h.position()}),
+            ),
+            "max_active_proposals",
+        )
+        is not RuleOutcome.BLOCK
+    )
+
+
+def test_the_active_proposal_cap_still_blocks_a_buy() -> None:
+    assert (
+        outcome_of(
+            h.inputs(reserved=ReservedExposure(count=5)),
+            "max_active_proposals",
+        )
+        is RuleOutcome.BLOCK
+    )
+
+
 # ---------------------------------------------------------------------------
 # Research confidence: bounded, and never authoritative
 # ---------------------------------------------------------------------------
