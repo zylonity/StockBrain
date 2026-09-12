@@ -36,6 +36,7 @@ from stockbrain.enums import (
 )
 from stockbrain.proposals.exits import ExitSweepService
 from stockbrain.proposals.service import ProposalService
+from stockbrain.proposals.state_machine import ACTIVE_STATUSES
 from stockbrain.risk.config import risk_config_from_settings
 from stockbrain.risk.exits import ExitSignal
 from stockbrain.risk.models import RuleResult
@@ -545,3 +546,60 @@ async def test_the_sweep_defers_positions_beyond_its_per_tick_budget(
     assert second["skipped_active_proposal"] == 2
     assert second["proposed"] == 1
     assert second["deferred"] == 0
+
+
+async def test_a_superseded_thesis_exit_survives_the_precondition_sweep(
+    clean_tables: Database,
+) -> None:
+    """A ``thesis_superseded`` exit must not be invalidated by the same sweep.
+
+    The exit proposal reuses the origin thesis, and that thesis is superseded --
+    that is *why* the exit exists.  Invalidating every active proposal on a
+    superseded thesis would cancel the exit within one proposal-sweep tick and
+    re-create it on the next, forever.  A superseded thesis says "do not enter
+    on this"; for a reduction it is the reason to act.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("100"),
+    )
+    async with database.transaction() as session:
+        session.add(
+            Thesis(
+                id=uuid.uuid4(),
+                research_run_id=ph.RUN_ID,
+                action=ThesisAction.SELL,
+                confidence=0.8,
+                time_horizon=TimeHorizon.DAYS,
+                supersedes_thesis_id=ph.THESIS_ID,
+            )
+        )
+
+    resolved = ph.settings()
+    config = risk_config_from_settings(resolved)
+    proposals = ph.service_with(database, resolved, config=config)
+    sweep = ExitSweepService(database, resolved, proposals=proposals, config=config)
+
+    counts = await sweep.sweep()
+    assert counts["proposed"] == 1
+
+    async with database.session() as session:
+        proposal = (
+            await session.execute(
+                sa.select(TradeProposal).where(TradeProposal.side == OrderSide.SELL)
+            )
+        ).scalar_one()
+        proposal_id = proposal.id
+        assert any(rule["rule_id"] == "thesis_superseded" for rule in proposal.risk_rules)
+
+    await proposals.sweep()
+
+    async with database.session() as session:
+        refreshed = await session.get(TradeProposal, proposal_id)
+    assert refreshed is not None
+    assert refreshed.status in ACTIVE_STATUSES
+    assert refreshed.invalidated_at is None

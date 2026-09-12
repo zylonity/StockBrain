@@ -269,8 +269,12 @@ class ProposalLifecycle:
         if proposal.company_id is not None and instrument.company_id != proposal.company_id:
             return "the listing is no longer attached to the company this proposal was about"
 
-        if proposal.thesis_id is not None and await thesis_is_superseded(
-            session, proposal.thesis_id
+        # A superseded thesis says "do not enter on this"; for a reduction,
+        # supersession is the reason to act, so this invalidation is entry-only.
+        if (
+            proposal.thesis_id is not None
+            and proposal.side is OrderSide.BUY
+            and await thesis_is_superseded(session, proposal.thesis_id)
         ):
             return "a newer thesis supersedes the one this proposal was built on"
 
