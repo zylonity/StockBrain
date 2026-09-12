@@ -338,9 +338,15 @@ def exit_floors(
 
     ``None`` when the observation is unusable in the same way ``evaluate_exit``
     refuses it: a non-positive cost basis or current price has no meaningful
-    floors, and dividing by one would raise instead of answering.
+    floors, and dividing by one would raise instead of answering.  No shares are
+    available to trade (held in a pie, or not yet settled) is refused for the
+    same reason: the sweep would never act on a floor it cannot sell against.
     """
-    if observation.average_price <= ZERO or observation.current_price <= ZERO:
+    if (
+        observation.average_price <= ZERO
+        or observation.current_price <= ZERO
+        or observation.quantity_available <= ZERO
+    ):
         return None
 
     target = roi_target_for(observation.horizon, observation.minutes_held(now), config)

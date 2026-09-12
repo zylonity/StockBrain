@@ -98,3 +98,8 @@ def test_an_unusable_observation_has_no_floors(overrides: dict[str, Any]) -> Non
     """A basis or price the rules cannot use yields no floors, not a divide."""
     obs = observe(peak_price=Decimal("120"), **overrides)
     assert exit_floors(obs, h.config(), now=NOW) is None
+
+
+def test_no_tradable_shares_has_no_floors() -> None:
+    """The sweep will never act on a position with nothing available to sell."""
+    assert exit_floors(observe(quantity_available=Decimal("0")), h.config(), now=NOW) is None

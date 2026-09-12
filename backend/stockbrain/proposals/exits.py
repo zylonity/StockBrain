@@ -45,6 +45,12 @@ ZERO = Decimal(0)
 NO_ORIGIN_REASON = "no StockBrain buy behind it"
 UNPRICED_REASON = "unpriced"
 
+#: A managed position can still have nothing to sell: the broker holds the
+#: shares in a pie or has not settled them, so the rules refuse to signal.  The
+#: operator sees no floors and this reason rather than numbers nothing would act
+#: on.
+NO_TRADABLE_SHARES_REASON = "no tradable shares — held in a pie or not yet settled"
+
 
 @dataclass(frozen=True, slots=True)
 class PositionExitStatus:
@@ -262,10 +268,15 @@ class ExitSweepService:
                     horizon=None,
                 )
                 continue
+            floors = exit_floors(observation, self._config, now=moment)
             statuses[position.broker_ticker] = PositionExitStatus(
                 managed=True,
-                reason=None,
-                floors=exit_floors(observation, self._config, now=moment),
+                reason=(
+                    NO_TRADABLE_SHARES_REASON
+                    if floors is None and observation.quantity_available <= ZERO
+                    else None
+                ),
+                floors=floors,
                 peak_price=observation.peak_price,
                 atr=observation.atr,
                 horizon=observation.horizon.value,

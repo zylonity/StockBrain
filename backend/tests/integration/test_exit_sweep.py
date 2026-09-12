@@ -800,3 +800,36 @@ async def test_status_reports_floors_even_while_a_proposal_is_pending(
     assert status.managed is True
     assert status.floors is not None
     assert status.floors.hard_stop == Decimal("92")
+
+
+async def test_status_reports_no_floors_for_a_position_with_no_tradable_shares(
+    clean_tables: Database,
+) -> None:
+    """A pie-held or unsettled position has floors the sweep would never act on.
+
+    It is still managed -- there is a thesis and a buy behind it -- but the
+    rules refuse to signal without tradeable shares, so no floor is shown and
+    the reason says why.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("88"),
+    )
+    async with database.transaction() as session:
+        position = (
+            await session.execute(sa.select(Position).where(Position.broker_ticker == "AAPL_US_EQ"))
+        ).scalar_one()
+        position.quantity_available = Decimal("0")
+
+    async with database.session() as session:
+        statuses = await (await _exit_sweep(database)).status(session)
+
+    status = statuses["AAPL_US_EQ"]
+    assert status.managed is True
+    assert status.floors is None
+    assert status.reason is not None
+    assert "no tradable shares" in status.reason
