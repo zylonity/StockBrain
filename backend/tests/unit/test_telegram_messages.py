@@ -26,6 +26,7 @@ from stockbrain.risk.exits import ExitFloors
 from stockbrain.telegram import messages
 from stockbrain.telegram.preferences import PipelineEvent
 from stockbrain.telegram.service import (
+    DailySummaryView,
     EventView,
     PortfolioView,
     PositionView,
@@ -448,3 +449,91 @@ def test_a_blocked_proposal_lists_the_rules_that_refused_it() -> None:
     assert "Trade blocked" in text
     assert "0.70 floor" in text and "USD != account GBP" in text
     assert "never authorizes" not in text  # that line belongs to RESEARCH_STARTED
+
+
+# ---------------------------------------------------------------------------
+# Daily summary
+# ---------------------------------------------------------------------------
+def _daily_view(**overrides: object) -> DailySummaryView:
+    base: dict[str, object] = {
+        "available": True,
+        "currency": "GBP",
+        "total_value": Decimal("1234.56"),
+        "invested_value": Decimal("1000.00"),
+        "result_value": Decimal("234.56"),
+        "cash_available": Decimal("234.56"),
+        "captured_at": utcnow() - dt.timedelta(seconds=30),
+        "broker_environment": "demo",
+        "positions": [],
+        "open_proposals": 1,
+        "candidates_24h": 2,
+        "research_completed_24h": [
+            ("Apple Inc.", "BUY"),
+            ("Microsoft", "HOLD"),
+            ("Nvidia", "SELL"),
+        ],
+    }
+    base.update(overrides)
+    return DailySummaryView(**base)  # type: ignore[arg-type]
+
+
+def test_a_daily_summary_reports_the_portfolio_positions_and_counts() -> None:
+    """One message carrying the account, each holding's nearest floor and the day's counts.
+
+    The floors come from the same ``PositionExitStatus`` the API and the web page
+    show, so a floor cannot read differently on two surfaces.
+    """
+    rendered = messages.render_daily_summary(
+        _daily_view(
+            positions=[
+                _position_view(
+                    exit=PositionExitStatus(
+                        managed=True,
+                        reason=None,
+                        floors=ExitFloors(
+                            hard_stop=Decimal("92.00"),
+                            volatility_floor=Decimal("119.00"),
+                            trailing_floor=None,
+                            roi_target_price=Decimal("115.00"),
+                            horizon_ends_at=dt.datetime(2026, 10, 1, tzinfo=dt.UTC),
+                            nearest_floor=Decimal("119.00"),
+                            nearest_rule="volatility_stop",
+                        ),
+                        peak_price=Decimal("130"),
+                        atr=Decimal("3"),
+                        horizon="days",
+                    )
+                )
+            ]
+        )
+    )
+    assert "Total value: 1,234.56 GBP" in rendered
+    assert "Open proposals: 1" in rendered
+    assert "Research (24h): 3" in rendered
+    assert "AAPL_US_EQ" in rendered
+    assert "nearest vol 119.00" in rendered
+
+
+def test_a_daily_summary_caps_the_position_list() -> None:
+    """A chat message that needs scrolling to read is a message nobody reads."""
+    positions = [_position_view(broker_ticker=f"TICK{i}_US_EQ") for i in range(16)]
+    rendered = messages.render_daily_summary(_daily_view(positions=positions))
+    assert "… and 1 more" in rendered
+    assert "TICK14_US_EQ" in rendered
+    assert "TICK15_US_EQ" not in rendered
+
+
+def test_a_hostile_position_name_is_escaped_in_the_daily_summary() -> None:
+    rendered = messages.render_daily_summary(
+        _daily_view(positions=[_position_view(name=HOSTILE_NAME)])
+    )
+    assert "<a href" not in rendered
+    assert "&lt;a href=" in rendered
+
+
+def test_a_daily_summary_without_a_snapshot_says_so() -> None:
+    rendered = messages.render_daily_summary(
+        DailySummaryView(available=False, reason="no broker account snapshot has been captured yet")
+    )
+    assert "Unavailable" in rendered
+    assert "no broker account snapshot" in rendered

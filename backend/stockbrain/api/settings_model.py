@@ -1069,6 +1069,14 @@ CATALOGUE: tuple[_Group, ...] = (
                 "The master switch. Individual categories are runtime-editable below.",
             ),
             _s(
+                "telegram_daily_summary_time",
+                "Daily summary time",
+                RESTART,
+                "UTC HH:MM at which one portfolio summary is sent each day. Empty or "
+                "unset disables it; a restart after the time still sends that day's.",
+                unit="UTC HH:MM",
+            ),
+            _s(
                 "notification_preferences",
                 "Notification categories",
                 RUNTIME,

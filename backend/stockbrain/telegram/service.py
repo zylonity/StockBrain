@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.config import Settings
 from stockbrain.control.state import ControlSnapshot, ControlStateService
+from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
 from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
 from stockbrain.db.models.proposals import ExecutionAttempt, RiskEvaluation, TradeProposal
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from stockbrain.proposals.exits import ExitSweepService, PositionExitStatus
 
 __all__ = [
+    "DailySummaryView",
     "EventView",
     "PortfolioView",
     "PositionView",
@@ -63,6 +65,11 @@ __all__ = [
 #: How many rows a list command shows.  A chat message that needs scrolling to
 #: read is a message nobody reads.
 LIST_LIMIT = 8
+
+#: How many holdings the daily summary reads before it caps the rendered list.
+#: Generous next to the 15 lines the message shows, so the "… and N more" count
+#: is the true remainder for any real portfolio.
+DAILY_SUMMARY_POSITION_LIMIT = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +121,33 @@ class PositionView:
     #: injected.  ``None`` keeps a view built without one renderable -- the
     #: floors are a convenience, not a precondition for reading a position.
     exit: PositionExitStatus | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DailySummaryView:
+    """One day's portfolio digest, assembled from data the system already has.
+
+    The account fields mirror :class:`PortfolioView`; ``positions`` carries each
+    holding with the same :class:`PositionExitStatus` the API and web page show.
+    The three counts answer "what happened in the last 24 hours" without a
+    second message: proposals still open, events promoted to research, and the
+    research runs that finished (with the action each one published, when it
+    published one).
+    """
+
+    available: bool
+    reason: str | None = None
+    currency: str | None = None
+    total_value: Decimal | None = None
+    invested_value: Decimal | None = None
+    result_value: Decimal | None = None
+    cash_available: Decimal | None = None
+    captured_at: dt.datetime | None = None
+    broker_environment: str | None = None
+    positions: list[PositionView] = field(default_factory=list)
+    open_proposals: int = 0
+    candidates_24h: int = 0
+    research_completed_24h: list[tuple[str, str | None]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +404,89 @@ class TelegramService:
             )
             for position, name in rows
         ]
+
+    # ------------------------------------------------------------------
+    async def daily_summary(self, now: dt.datetime | None = None) -> DailySummaryView:
+        """One day's digest, read entirely from state the system already has.
+
+        Never prices a position, calls a provider or touches a broker: a
+        scheduled message must not be the thing that spends money.  The holdings
+        carry the same exit floors ``/positions`` shows, and the last-24h counts
+        are over rows already written rather than a new ledger.
+        """
+        moment = now or utcnow()
+        since = moment - dt.timedelta(hours=24)
+        portfolio = await self.portfolio()
+        positions = await self.positions(limit=DAILY_SUMMARY_POSITION_LIMIT)
+        async with self._database.session() as session:
+            open_proposals = int(
+                (
+                    await session.execute(
+                        sa.select(sa.func.count())
+                        .select_from(TradeProposal)
+                        .where(TradeProposal.status.in_(ACTIVE_STATUSES))
+                    )
+                ).scalar_one()
+            )
+            # "Promoted to candidate" is the classification that set the status;
+            # ``classified_at`` is when that happened.  A candidate since
+            # researched is no longer CANDIDATE, so this reads "still awaiting
+            # research", which is the honest version of the count.
+            candidates = int(
+                (
+                    await session.execute(
+                        sa.select(sa.func.count())
+                        .select_from(Event)
+                        .where(
+                            Event.status == EventStatus.CANDIDATE,
+                            Event.classified_at.is_not(None),
+                            Event.classified_at >= since,
+                        )
+                    )
+                ).scalar_one()
+            )
+            latest_action = (
+                sa.select(Thesis.action)
+                .where(Thesis.research_run_id == ResearchRun.id)
+                .order_by(Thesis.created_at.desc())
+                .limit(1)
+                .correlate(ResearchRun)
+                .scalar_subquery()
+            )
+            research_rows = (
+                await session.execute(
+                    sa.select(Company.name, latest_action)
+                    .select_from(ResearchRun)
+                    .outerjoin(Company, Company.id == ResearchRun.company_id)
+                    .where(
+                        ResearchRun.completed_at.is_not(None),
+                        ResearchRun.completed_at >= since,
+                    )
+                    .order_by(ResearchRun.completed_at.desc())
+                )
+            ).all()
+        research_completed = [
+            (
+                str(name) if name is not None else "research run",
+                action.value if action is not None else None,
+            )
+            for name, action in research_rows
+        ]
+        return DailySummaryView(
+            available=portfolio.available,
+            reason=portfolio.reason,
+            currency=portfolio.currency,
+            total_value=portfolio.total_value,
+            invested_value=portfolio.invested_value,
+            result_value=portfolio.result_value,
+            cash_available=portfolio.cash_available,
+            captured_at=portfolio.captured_at,
+            broker_environment=portfolio.broker_environment,
+            positions=positions,
+            open_proposals=open_proposals,
+            candidates_24h=candidates,
+            research_completed_24h=research_completed,
+        )
 
     # ------------------------------------------------------------------
     async def proposals(self, *, limit: int = LIST_LIMIT) -> list[ProposalView]:

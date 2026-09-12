@@ -120,6 +120,11 @@ class NotificationCategory(StrEnum):
     EXECUTION_CRITICAL = "EXECUTION_CRITICAL"
     """An order's state is unknown.  Cannot be disabled."""
 
+    DAILY_SUMMARY = "DAILY_SUMMARY"
+    """The once-a-day portfolio digest: totals, every holding's exit floor, and
+    what the pipeline did in the last 24 hours.  On by default: it replaces the
+    "the system said buy and then went quiet" question with a standing answer."""
+
     OPERATIONAL = "OPERATIONAL"
     """Provider outages, budget exhaustion, a stalled queue, a halted system --
     the operational alert scan's output."""
@@ -218,6 +223,14 @@ NOTIFICATION_CATEGORY_DETAIL: dict[NotificationCategory, CategoryDetail] = {
         ),
         volume="rare",
     ),
+    NotificationCategory.DAILY_SUMMARY: CategoryDetail(
+        label="Daily summary",
+        description=(
+            "One message a day: the account totals, every open position with its nearest "
+            "exit floor, the open proposals, and the events and research of the last 24 hours."
+        ),
+        volume="rare",
+    ),
     NotificationCategory.OPERATIONAL: CategoryDetail(
         label="Health and budget alerts",
         description=(
@@ -241,6 +254,7 @@ DEFAULT_PREFERENCES: dict[NotificationCategory, bool] = {
     NotificationCategory.PROPOSAL_OUTCOME: True,
     NotificationCategory.EXECUTION: True,
     NotificationCategory.EXECUTION_CRITICAL: True,
+    NotificationCategory.DAILY_SUMMARY: True,
     NotificationCategory.OPERATIONAL: True,
 }
 
@@ -267,6 +281,10 @@ class PipelineEvent(StrEnum):
     RESEARCH_COMPLETED = "RESEARCH_COMPLETED"
     PROPOSAL_BLOCKED = "PROPOSAL_BLOCKED"
     PROPOSAL_DEFERRED = "PROPOSAL_DEFERRED"
+    PORTFOLIO_SUMMARY = "PORTFOLIO_SUMMARY"
+    """The once-a-day digest.  Its entity is the date, not a row: one message
+    per UTC day, claimed through the same ``notifications`` unique index every
+    other stage uses."""
 
 
 _PIPELINE_CATEGORIES: dict[PipelineEvent, NotificationCategory] = {
@@ -277,6 +295,7 @@ _PIPELINE_CATEGORIES: dict[PipelineEvent, NotificationCategory] = {
     PipelineEvent.RESEARCH_COMPLETED: NotificationCategory.RESEARCH_COMPLETED,
     PipelineEvent.PROPOSAL_BLOCKED: NotificationCategory.PROPOSAL_BLOCKED,
     PipelineEvent.PROPOSAL_DEFERRED: NotificationCategory.PROPOSAL_DEFERRED,
+    PipelineEvent.PORTFOLIO_SUMMARY: NotificationCategory.DAILY_SUMMARY,
 }
 
 _PROPOSAL_CATEGORIES: dict[NotificationEvent, NotificationCategory] = {

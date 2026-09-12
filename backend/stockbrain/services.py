@@ -109,6 +109,7 @@ from stockbrain.observability.metrics import METRICS
 from stockbrain.proposals.exits import ExitSweepService
 from stockbrain.proposals.service import ProposalService
 from stockbrain.risk.config import RiskConfig, risk_config_from_settings
+from stockbrain.telegram.notifier import pipeline_dedupe_key, summary_entity_id
 from stockbrain.telegram.preferences import NotificationPreferences, PipelineEvent
 from stockbrain.telegram.runtime import TelegramRuntime
 
@@ -835,6 +836,19 @@ class ServiceContainer:
                     jitter_ratio=0.1,
                 )
             )
+        if self.telegram is not None and self.settings.telegram_daily_summary_time:
+            # Ticks every minute and decides nothing about cadence: the row the
+            # delivery side claims is the cadence. A restart after the configured
+            # time therefore still sends that day's summary, and a second tick
+            # never sends a second one.
+            scheduler.add(
+                ScheduledTask(
+                    name="telegram_daily_summary",
+                    interval_seconds=60.0,
+                    run=self._telegram_daily_summary,
+                    jitter_ratio=0.05,
+                )
+            )
         if self.volatility is not None and self.settings.volatility_refresh_enabled:
             scheduler.add(
                 ScheduledTask(
@@ -1202,6 +1216,43 @@ class ServiceContainer:
     async def _exit_sweep(self) -> None:
         if self.exits is not None:
             await self.exits.sweep()
+
+    async def _telegram_daily_summary(self) -> None:
+        """Enqueue the day's summary once the configured UTC time has passed.
+
+        The tick is every minute, so the interesting decisions are all elsewhere:
+        the time comparison is UTC, the "already sent" mark is the delivery row's
+        own dedupe key rather than this process's memory, and the enqueue itself
+        is gated on the ``DAILY_SUMMARY`` notification category like every other
+        pipeline stage.
+        """
+        configured = self.settings.telegram_daily_summary_time
+        if not configured:
+            return
+        hour, minute = (int(part) for part in configured.split(":"))
+        parsed = dt.time(hour, minute)
+        now = utcnow()
+        # ``utcnow()`` is UTC-aware, while the ``.time()`` accessor drops the
+        # tzinfo, so both sides of this comparison are naive UTC wall-clock times.
+        if now.time() < parsed:
+            return
+        entity_id = summary_entity_id(now.date())
+        dedupe = pipeline_dedupe_key(entity_id, PipelineEvent.PORTFOLIO_SUMMARY)
+        async with self.database.transaction() as session:
+            already = await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(Notification)
+                .where(Notification.dedupe_key == dedupe)
+            )
+            if already:
+                return
+            await enqueue_pipeline_notification(
+                session,
+                self.queue,
+                self.notification_preferences,
+                entity_id=entity_id,
+                event=PipelineEvent.PORTFOLIO_SUMMARY,
+            )
 
     async def _volatility_refresh(self) -> None:
         if self.volatility is not None:

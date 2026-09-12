@@ -20,6 +20,7 @@ from stockbrain.enums import ProposalStatus, ProviderStatus
 from stockbrain.telegram.formatting import age, bold, code, esc, money, quantity, stamp, trim
 from stockbrain.telegram.preferences import PipelineEvent
 from stockbrain.telegram.service import (
+    DailySummaryView,
     EventView,
     PortfolioView,
     PositionView,
@@ -37,6 +38,7 @@ __all__ = [
     "AUTHORIZATION_NOTICE",
     "control_line",
     "render_control",
+    "render_daily_summary",
     "render_event_stage",
     "render_events",
     "render_help",
@@ -267,6 +269,74 @@ def render_positions(views: list[PositionView], *, now: dt.datetime | None = Non
         )
     )
     lines.append(esc(f"Synced {age(views[0].last_synced_at, now=now)}."))
+    return "\n".join(lines)
+
+
+#: The digest is one message, and a chat message that needs scrolling to read is
+#: a message nobody reads.  Fifteen holdings covers the observed account with two
+#: digits of headroom; the remainder is stated as a count, never truncated away.
+_DAILY_SUMMARY_POSITION_LINES = 15
+
+
+def _daily_position_line(position: PositionView) -> str:
+    """One holding in the digest: identity, P/L, and its nearest exit floor.
+
+    The floor is the one the exit rules computed -- the same
+    :class:`~stockbrain.proposals.exits.PositionExitStatus` the API, the web page
+    and ``/positions`` render -- never a second calculation that could disagree.
+    """
+    label = trim(position.name or position.broker_ticker, _NAME_LIMIT)
+    line = (
+        f"• {code(position.broker_ticker)} {label} · qty "
+        f"{esc(quantity(position.quantity))} · P/L {money(position.ppl, position.currency)}"
+    )
+    status = position.exit
+    if status is None:
+        return f"{line} · floors unavailable"
+    if not status.managed:
+        suffix = f" — {trim(status.reason, _REASON_LIMIT)}" if status.reason else ""
+        return f"{line} · not managed{suffix}"
+    floors = status.floors
+    if floors is None:
+        return f"{line} · floors unavailable"
+    nearest = f"{_exit_rule_label(floors.nearest_rule)} {money(floors.nearest_floor, places=2)}"
+    return f"{line} · nearest {esc(nearest)}"
+
+
+def render_daily_summary(view: DailySummaryView, *, now: dt.datetime | None = None) -> str:
+    """The once-a-day digest: account, holdings and the last 24 hours.
+
+    Every untrusted value -- a company name, a reason -- goes through ``trim`` or
+    ``esc``, exactly as the command renderers do; nothing here concatenates a raw
+    value into markup.
+    """
+    if not view.available:
+        return f"{bold('Daily summary')}\nUnavailable — {esc(view.reason or 'no snapshot')}."
+    lines = [
+        bold("Daily summary"),
+        f"Total value: {money(view.total_value, view.currency)}",
+        f"Invested: {money(view.invested_value, view.currency)} · "
+        f"result {money(view.result_value, view.currency)}",
+        f"Cash available: {money(view.cash_available, view.currency)}",
+        f"Open proposals: {view.open_proposals}",
+        f"Events promoted (24h): {view.candidates_24h}",
+        f"Research (24h): {len(view.research_completed_24h)}",
+    ]
+    if view.research_completed_24h:
+        actions = ", ".join(
+            f"{trim(subject, 40)} {esc(action or 'no action')}"
+            for subject, action in view.research_completed_24h[:6]
+        )
+        lines.append(f"  {actions}")
+    if view.positions:
+        lines.append(bold("Positions"))
+        for position in view.positions[:_DAILY_SUMMARY_POSITION_LINES]:
+            lines.append(_daily_position_line(position))
+        if len(view.positions) > _DAILY_SUMMARY_POSITION_LINES:
+            lines.append(esc(f"… and {len(view.positions) - _DAILY_SUMMARY_POSITION_LINES} more"))
+    else:
+        lines.append("No open positions in the latest broker snapshot.")
+    lines.append(f"Snapshot: {esc(age(view.captured_at, now=now))}")
     return "\n".join(lines)
 
 

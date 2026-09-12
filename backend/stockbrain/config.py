@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -893,6 +894,15 @@ class Settings(BaseSettings):
     confirmation exists to prove the person is still there and still means it."""
 
     telegram_notifications_enabled: bool = True
+
+    telegram_daily_summary_time: str | None = "08:00"
+    """UTC ``HH:MM`` at which the once-a-day portfolio summary is sent.
+
+    Empty or unset disables it entirely.  UTC rather than the display timezone
+    because the scheduler fires with no operator present to interpret a local
+    time, and a restart after the configured moment still sends that day's
+    summary as long as the day has no delivery row yet."""
+
     telegram_research_interval_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
     """Minimum spacing between ``/research`` invocations per user (spec section
     20: "manual research should be rate limited"). This command only reads a
@@ -1025,6 +1035,28 @@ class Settings(BaseSettings):
         if level not in allowed:
             raise ValueError(f"LOG_LEVEL must be one of {sorted(allowed)}")
         return level
+
+    @field_validator("telegram_daily_summary_time", mode="after")
+    @classmethod
+    def _normalise_daily_summary_time(cls, value: str | None) -> str | None:
+        """Normalise ``HH:MM``, treating blank as "disabled".
+
+        A malformed value refuses to start rather than silently degrading to the
+        default: a summary that stopped arriving because of a typo is worse than
+        a startup error, because nothing says it stopped.
+        """
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        match = re.fullmatch(r"(\d{2}):(\d{2})", text)
+        if match is None:
+            raise ValueError("TELEGRAM_DAILY_SUMMARY_TIME must be HH:MM in UTC, e.g. 08:00")
+        hours, minutes = int(match.group(1)), int(match.group(2))
+        if hours >= 24 or minutes >= 60:
+            raise ValueError(f"TELEGRAM_DAILY_SUMMARY_TIME must be a real UTC time, got {text!r}")
+        return text
 
     @model_validator(mode="after")
     def _validate_execution_gate(self) -> Settings:

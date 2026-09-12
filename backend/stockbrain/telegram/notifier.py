@@ -69,10 +69,12 @@ from stockbrain.telegram.transport import MessageSender
 
 __all__ = [
     "CHANNEL",
+    "DAILY_SUMMARY_NAMESPACE",
     "NotificationResult",
     "ProposalNotifier",
     "dedupe_key",
     "pipeline_dedupe_key",
+    "summary_entity_id",
 ]
 
 log = get_logger(__name__)
@@ -154,6 +156,7 @@ _PIPELINE_ENTITY: dict[PipelineEvent, str] = {
     PipelineEvent.RESEARCH_COMPLETED: "research_run",
     PipelineEvent.PROPOSAL_BLOCKED: "research_run",
     PipelineEvent.PROPOSAL_DEFERRED: "research_run",
+    PipelineEvent.PORTFOLIO_SUMMARY: "portfolio",
 }
 
 _PIPELINE_TITLES: dict[PipelineEvent, str] = {
@@ -164,6 +167,7 @@ _PIPELINE_TITLES: dict[PipelineEvent, str] = {
     PipelineEvent.RESEARCH_COMPLETED: "Research completed",
     PipelineEvent.PROPOSAL_BLOCKED: "Trade blocked by risk",
     PipelineEvent.PROPOSAL_DEFERRED: "Trade waiting for the market",
+    PipelineEvent.PORTFOLIO_SUMMARY: "Daily summary",
 }
 
 
@@ -179,6 +183,18 @@ def pipeline_dedupe_key(entity_id: uuid.UUID, event: PipelineEvent) -> str:
     proposal key shape leaves pipeline history alone.
     """
     return f"{CHANNEL}:pipeline:{entity_id}:{event.value}"
+
+
+#: Namespace for the daily summary's synthetic entity.  A summary is about a
+#: *date*, not a row, so it needs a stable id every worker derives identically
+#: rather than one generated and coordinated.  Fixed, never regenerated: changing
+#: it would orphan a recorded "already sent today" behind a different key.
+DAILY_SUMMARY_NAMESPACE = uuid.UUID("6f1b6b3e-0d7e-4d6b-9b0a-2b6f1c0d9e11")
+
+
+def summary_entity_id(day: dt.date) -> uuid.UUID:
+    """The portfolio summary's entity id for one UTC date."""
+    return uuid.uuid5(DAILY_SUMMARY_NAMESPACE, day.isoformat())
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,7 +330,7 @@ class ProposalNotifier:
         category = category_for_pipeline_event(event)
         entity_type = _PIPELINE_ENTITY[event]
 
-        title, body, text = await self._render_pipeline(entity_id, event)
+        title, body, text = await self._render_pipeline(entity_id, event, now=moment)
         if text is None:
             return NotificationResult(
                 NotificationStatus.SUPPRESSED, reason=f"{entity_type} not found"
@@ -381,10 +397,16 @@ class ProposalNotifier:
         return NotificationResult(NotificationStatus.SENT, delivered=delivered)
 
     async def _render_pipeline(
-        self, entity_id: uuid.UUID, event: PipelineEvent
+        self, entity_id: uuid.UUID, event: PipelineEvent, *, now: dt.datetime
     ) -> tuple[str, str, str | None]:
         """``(title, body, rendered)`` for one stage, or a ``None`` rendering."""
         title = _PIPELINE_TITLES[event]
+        if _PIPELINE_ENTITY[event] == "portfolio":
+            # The digest is read fresh at delivery time rather than carried in
+            # the job payload: a summary must describe the world that exists,
+            # not the world at the moment the tick enqueued it.
+            rendered = messages.render_daily_summary(await self._service.daily_summary(now=now))
+            return (title, rendered.splitlines()[0], rendered)
         if _PIPELINE_ENTITY[event] == "event":
             view = await self._service.event(entity_id)
             if view is None:
