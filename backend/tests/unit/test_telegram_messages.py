@@ -451,6 +451,24 @@ def test_a_blocked_proposal_lists_the_rules_that_refused_it() -> None:
     assert "never authorizes" not in text  # that line belongs to RESEARCH_STARTED
 
 
+def test_a_blocked_proposal_leads_with_decisive_reasons_and_collapses_market_state() -> None:
+    view = _research_view(
+        action="BUY",
+        confidence=0.68,
+        block_reasons=("research confidence 0.68 is below the 0.70 floor",),
+        transient_block_reasons=(
+            "market-data provider is DEGRADED",
+            "quote is 90680850ms old, older than the 15.0s limit",
+            "spread 910.0571 bps exceeds the 50 bps ceiling",
+            "session CLOSED is not one of REGULAR",
+        ),
+    )
+    text = messages.render_research_stage(view, PipelineEvent.PROPOSAL_BLOCKED)
+    assert text.index("0.70 floor") < text.index("market state")
+    assert "4 rules" in text and "clears at the open" in text
+    assert "session CLOSED" not in text  # collapsed: only the first transient reason is quoted
+
+
 # ---------------------------------------------------------------------------
 # Daily summary
 # ---------------------------------------------------------------------------

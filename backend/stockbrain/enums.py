@@ -15,6 +15,7 @@ from enum import StrEnum
 
 __all__ = [
     "EXECUTION_GRADE_PRICE_SOURCES",
+    "TRANSIENT_RULE_IDS",
     "ActorType",
     "AliasType",
     "ApprovalChannel",
@@ -782,6 +783,39 @@ class PriceSource(StrEnum):
 #: data, not execution data.
 EXECUTION_GRADE_PRICE_SOURCES: frozenset[PriceSource] = frozenset(
     {PriceSource.ALPACA_SIP, PriceSource.ALPACA_IEX}
+)
+
+#: Rules that can refuse a trade over *market state* -- a shut session, a stale
+#: or absent quote, an account snapshot not yet taken, a missing FX rate.  These
+#: describe the moment the evaluation happened, not the trade, so a refusal they
+#: are solely responsible for is transient: it is recorded and retried rather
+#: than treated as final.
+#:
+#: The definition is deliberately by rule id, and deliberately *never* judgment.
+#: A rule that judges the trade itself -- its confidence, its currency
+#: alignment, a concentration or cash-reserve cap, a duplicate proposal -- does
+#: not fix itself by waiting, and putting one of those in this set would turn
+#: "retry at the next open" into an unbounded loop.  The unit test beside the
+#: risk rule set pins both directions.
+#:
+#: It lives in this dependency-free vocabulary module rather than in
+#: ``stockbrain.risk.rules`` because the Telegram read model has to classify a
+#: refusal to split its message, and Telegram is deliberately forbidden from
+#: importing the risk engine at all.  ``stockbrain.risk.rules`` re-exports it, so
+#: its canonical risk-side name is unchanged.
+TRANSIENT_RULE_IDS: frozenset[str] = frozenset(
+    {
+        "price_source_execution_grade",
+        "quote_available",
+        "quote_freshness",
+        "quote_two_sided",
+        "spread_ceiling",
+        "market_session",
+        "account_state_available",
+        "account_state_freshness",
+        "fx_available",
+        "fx_freshness",
+    }
 )
 
 _CAPABILITY_TO_PROVIDER_STATUS: dict[CapabilityState, ProviderStatus] = {

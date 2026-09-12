@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from stockbrain.enums import (
+    TRANSIENT_RULE_IDS,
     MarketSession,
     ResolutionStatus,
     RuleOutcome,
@@ -59,32 +60,9 @@ EXPOSURE_INCREASING_ACTIONS: frozenset[ThesisAction] = frozenset({ThesisAction.B
 #: floor: a control that can stop a position being closed is a hazard.
 RISK_REDUCING_ACTIONS: frozenset[ThesisAction] = frozenset({ThesisAction.SELL, ThesisAction.REDUCE})
 
-#: Rules that can refuse a trade over *market state* -- a shut session, a stale
-#: or absent quote, an account snapshot not yet taken, a missing FX rate.  These
-#: describe the moment the evaluation happened, not the trade, so a refusal they
-#: are solely responsible for is transient: it is recorded and retried rather
-#: than treated as final.
-#:
-#: The definition is deliberately by rule id, and deliberately *never* judgment.
-#: A rule that judges the trade itself -- its confidence, its currency
-#: alignment, a concentration or cash-reserve cap, a duplicate proposal -- does
-#: not fix itself by waiting, and putting one of those in this set would turn
-#: "retry at the next open" into an unbounded loop.  The unit test beside this
-#: set pins both directions.
-TRANSIENT_RULE_IDS: frozenset[str] = frozenset(
-    {
-        "price_source_execution_grade",
-        "quote_available",
-        "quote_freshness",
-        "quote_two_sided",
-        "spread_ceiling",
-        "market_session",
-        "account_state_available",
-        "account_state_freshness",
-        "fx_available",
-        "fx_freshness",
-    }
-)
+# ``TRANSIENT_RULE_IDS`` is defined in :mod:`stockbrain.enums` and re-exported
+# here under its canonical risk-side name; see that definition for why it lives
+# in the dependency-free vocabulary module.
 
 
 @dataclass(frozen=True, slots=True)

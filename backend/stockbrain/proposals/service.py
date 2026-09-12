@@ -103,6 +103,7 @@ from stockbrain.risk.models import (
     RuleResult,
 )
 from stockbrain.risk.rules import (
+    RISK_REDUCING_ACTIONS,
     TRANSIENT_RULE_IDS,
     action_is_executable,
 )
@@ -425,7 +426,23 @@ class ProposalService:
                 # Without this the operator sees "Research completed: BUY" and
                 # then silence. Announce the refusal from the same transaction
                 # that recorded it, so an announced refusal is a real one.
-                if candidate.action in {
+                #
+                # A SELL or REDUCE on a listing the account does not hold is not
+                # a trade that was blocked; it is a thesis about a position that
+                # does not exist. Announcing it would be noise, so it is logged
+                # and dropped.
+                no_position = (
+                    candidate.action in RISK_REDUCING_ACTIONS
+                    and "current_position" in decision.block_rule_ids
+                )
+                if no_position:
+                    log.info(
+                        "proposal_block_not_announced",
+                        thesis_id=str(thesis_id),
+                        broker_ticker=fresh_identity.broker_ticker,
+                        reason="no_position",
+                    )
+                elif candidate.action in {
                     ThesisAction.BUY,
                     ThesisAction.SELL,
                     ThesisAction.REDUCE,

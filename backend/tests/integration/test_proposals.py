@@ -61,6 +61,16 @@ async def _evaluations(database: Database) -> list[RiskEvaluation]:
         )
 
 
+def _telegram_service(database: Database) -> TelegramService:
+    """The read model behind a pipeline notification, built the way the runtime builds it."""
+    return TelegramService(
+        database,
+        ph.settings(),
+        health=ProviderHealthRegistry(),
+        control=ControlStateService(database),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
@@ -876,13 +886,50 @@ async def test_a_sizing_refusal_with_no_block_rule_still_explains_itself(
     assert not result.created
     assert result.blocks == (), "no BLOCK rule fires; sizing alone refuses"
 
-    telegram = TelegramService(
-        clean_tables,
-        ph.settings(),
-        health=ProviderHealthRegistry(),
-        control=ControlStateService(clean_tables),
-    )
+    telegram = _telegram_service(clean_tables)
     view = await telegram.research_run(ph.RUN_ID)
     assert view is not None
     assert view.block_reasons
     assert any("minimum trade notional" in reason for reason in view.block_reasons)
+
+
+async def test_a_sell_on_a_listing_with_no_position_is_not_announced(
+    clean_tables: Database,
+) -> None:
+    """A SELL on a listing the account does not hold is not a blocked trade.
+
+    Refusing to close a position that does not exist is a fact about the thesis,
+    not a refusal the operator needs to act on: there is nothing to reduce and
+    nothing is sent. Announcing it as a blocked trade would be noise.
+    """
+    await ph.seed(clean_tables, action=ThesisAction.SELL, confidence=0.9)
+    await ph.fund(clean_tables)  # funded, no positions
+    service = ph.service(clean_tables, preferences=NotificationPreferences(clean_tables))
+    result = await service.generate(ph.THESIS_ID)
+    assert not result.created
+    async with clean_tables.session() as session:
+        count = (
+            await session.execute(
+                sa.select(sa.func.count())
+                .select_from(Job)
+                .where(Job.job_type == "SEND_NOTIFICATION")
+            )
+        ).scalar_one()
+    assert count == 0
+
+
+async def test_block_reasons_exclude_market_state_rules(clean_tables: Database) -> None:
+    """A stale quote plus a low confidence: the view lists only the confidence."""
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.10)
+    await ph.fund(clean_tables)
+    service = ph.service(
+        clean_tables,
+        market_data=ph.StubMarketData(age_ms=60_000),
+        preferences=NotificationPreferences(clean_tables),
+    )
+    await service.generate(ph.THESIS_ID)
+    view = await _telegram_service(clean_tables).research_run(ph.RUN_ID)
+    assert view is not None
+    assert any("0.70 floor" in r for r in view.block_reasons)
+    assert not any("older than" in r for r in view.block_reasons)
+    assert any("older than" in r for r in view.transient_block_reasons)

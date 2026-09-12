@@ -79,6 +79,10 @@ _NAME_LIMIT = 64
 _TEXT_LIMIT = 320
 _REASON_LIMIT = 200
 _TITLE_LIMIT = 140
+#: The collapsed market-state line names only the first transient reason and
+#: quotes it short: the whole point of the line is that it says "the market,
+#: again" in one breath, not that it enumerates every way the market is closed.
+_TRANSIENT_REASON_LIMIT = 120
 
 
 def render_start(authorised: bool) -> str:
@@ -623,15 +627,32 @@ def render_research_stage(
     subject = view.company or view.broker_ticker or str(view.id)
     if event is PipelineEvent.PROPOSAL_BLOCKED:
         # A refusal is its own message, not a "research completed" with a
-        # footnote: what the operator needs is the rules that said no.
+        # footnote: what the operator needs is the rules that said no. Rules
+        # that refused over *market state* are collapsed into one line, because
+        # a shut session refuses four or five ways at once and listing them all
+        # buries the one judgment -- a confidence floor, a cap -- the operator
+        # has to act on.
         lines = [f"{bold(esc(_STAGE_HEADLINES[event]))} — {esc(subject)}"]
         if view.action:
             lines.append(_thesis_line(view))
         lines.append(bold("Blocked by:"))
-        for reason in view.block_reasons[:8]:
+        decisive = view.block_reasons
+        if not decisive and view.transient_block_reasons:
+            # Should not happen once a decision is deferrable, but a BLOCK rule
+            # the transient set does not yet name must still say something.
+            decisive = view.transient_block_reasons
+        for reason in decisive[:8]:
             lines.append(f"• {trim(reason, _REASON_LIMIT)}")
-        if len(view.block_reasons) > 8:
-            lines.append(esc(f"… and {len(view.block_reasons) - 8} more"))
+        if len(decisive) > 8:
+            lines.append(esc(f"… and {len(decisive) - 8} more"))
+        if view.transient_block_reasons:
+            count = len(view.transient_block_reasons)
+            plural = "rule" if count == 1 else "rules"
+            first = trim(view.transient_block_reasons[0], _TRANSIENT_REASON_LIMIT)
+            lines.append(
+                f"Also blocked right now by market state "
+                f"({count} {plural} — clears at the open): {first}"
+            )
         lines.append(
             esc("The proposal was refused before it was created. Nothing was sent to the broker.")
         )

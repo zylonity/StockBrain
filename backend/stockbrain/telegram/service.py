@@ -33,6 +33,7 @@ from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.models.sources import Event
 from stockbrain.db.session import Database
 from stockbrain.enums import (
+    TRANSIENT_RULE_IDS,
     EventStatus,
     ExecutionPolicy,
     ProposalStatus,
@@ -248,6 +249,7 @@ class ResearchRunView:
     started_at: dt.datetime | None
     completed_at: dt.datetime | None
     block_reasons: tuple[str, ...] = ()
+    transient_block_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +624,7 @@ class TelegramService:
             # Read from the durable evaluation rather than from the run: the
             # refusal is a fact about the risk engine, not about research.
             block_reasons: tuple[str, ...] = ()
+            transient_block_reasons: tuple[str, ...] = ()
             if thesis is not None:
                 evaluation = (
                     (
@@ -639,12 +642,23 @@ class TelegramService:
                     .first()
                 )
                 if evaluation is not None:
-                    block_reasons = tuple(
-                        str(rule["reason"])
-                        for rule in (evaluation.rules or [])
-                        if isinstance(rule, dict) and rule.get("outcome") == "BLOCK"
-                    )
-                    if not block_reasons:
+                    # A refusal over market state -- a shut session, a stale
+                    # quote -- is not a judgment about the trade and will lift
+                    # itself; keeping it out of the decisive list is what stops
+                    # a real reason from being buried under four transient ones.
+                    decisive: list[str] = []
+                    transient: list[str] = []
+                    for rule in evaluation.rules or []:
+                        if not isinstance(rule, dict) or rule.get("outcome") != "BLOCK":
+                            continue
+                        reason = str(rule["reason"])
+                        if str(rule.get("rule_id")) in TRANSIENT_RULE_IDS:
+                            transient.append(reason)
+                        else:
+                            decisive.append(reason)
+                    block_reasons = tuple(decisive)
+                    transient_block_reasons = tuple(transient)
+                    if not block_reasons and not transient_block_reasons:
                         # A decision can be refused by sizing alone -- no rule
                         # said BLOCK, the cap simply produced no executable
                         # order. The evaluation's detail carries that reason so
@@ -668,6 +682,7 @@ class TelegramService:
             started_at=run.started_at,
             completed_at=run.completed_at,
             block_reasons=block_reasons,
+            transient_block_reasons=transient_block_reasons,
         )
 
     # ------------------------------------------------------------------
