@@ -441,6 +441,7 @@ _STAGE_HEADLINES: dict[PipelineEvent, str] = {
     PipelineEvent.RESEARCH_STARTED: "Research started",
     PipelineEvent.RESEARCH_COMPLETED: "Research completed",
     PipelineEvent.PROPOSAL_BLOCKED: "Trade blocked by risk",
+    PipelineEvent.PROPOSAL_DEFERRED: "Trade waiting for the market",
 }
 
 
@@ -486,7 +487,9 @@ def _thesis_line(view: ResearchRunView) -> str:
     return f"Thesis: {bold(esc(view.action))}{esc(confidence)}{horizon}"
 
 
-def render_research_stage(view: ResearchRunView, event: PipelineEvent) -> str:
+def render_research_stage(
+    view: ResearchRunView, event: PipelineEvent, *, deferral_max_hours: int | None = None
+) -> str:
     """One research run, starting or finished.
 
     A finished run reports its action and confidence and nothing else from the
@@ -494,6 +497,10 @@ def render_research_stage(view: ResearchRunView, event: PipelineEvent) -> str:
     cannot be rendered here, and the confidence is a ranking rather than a
     calibrated probability -- which the message says, because a number in a chat
     reads as certainty unless it is told not to.
+
+    ``deferral_max_hours`` is the setting behind the deferral ceiling and is
+    only read by the ``PROPOSAL_DEFERRED`` branch, which the notifier renders
+    from its own settings.
     """
     subject = view.company or view.broker_ticker or str(view.id)
     if event is PipelineEvent.PROPOSAL_BLOCKED:
@@ -509,6 +516,31 @@ def render_research_stage(view: ResearchRunView, event: PipelineEvent) -> str:
             lines.append(esc(f"… and {len(view.block_reasons) - 8} more"))
         lines.append(
             esc("The proposal was refused before it was created. Nothing was sent to the broker.")
+        )
+        return "\n".join(lines)
+
+    if event is PipelineEvent.PROPOSAL_DEFERRED:
+        # The refusal is real but temporary: name what refused the trade and how
+        # long the wait can last, so the operator is not left wondering whether
+        # the system silently forgot it.
+        lines = [f"{bold(esc(_STAGE_HEADLINES[event]))} — {esc(subject)}"]
+        if view.action:
+            lines.append(_thesis_line(view))
+        lines.append(bold("Blocked for now by:"))
+        for reason in view.block_reasons[:8]:
+            lines.append(f"• {trim(reason, _REASON_LIMIT)}")
+        if len(view.block_reasons) > 8:
+            lines.append(esc(f"… and {len(view.block_reasons) - 8} more"))
+        ceiling = (
+            f"for up to {deferral_max_hours} hours"
+            if deferral_max_hours is not None
+            else "until the deferral age limit"
+        )
+        lines.append(
+            esc(
+                "Only market-state rules refused it. StockBrain will re-evaluate at the "
+                f"next open, {ceiling}."
+            )
         )
         return "\n".join(lines)
 

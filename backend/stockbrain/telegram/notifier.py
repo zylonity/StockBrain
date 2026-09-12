@@ -153,6 +153,7 @@ _PIPELINE_ENTITY: dict[PipelineEvent, str] = {
     PipelineEvent.RESEARCH_STARTED: "research_run",
     PipelineEvent.RESEARCH_COMPLETED: "research_run",
     PipelineEvent.PROPOSAL_BLOCKED: "research_run",
+    PipelineEvent.PROPOSAL_DEFERRED: "research_run",
 }
 
 _PIPELINE_TITLES: dict[PipelineEvent, str] = {
@@ -162,6 +163,7 @@ _PIPELINE_TITLES: dict[PipelineEvent, str] = {
     PipelineEvent.RESEARCH_STARTED: "Research started",
     PipelineEvent.RESEARCH_COMPLETED: "Research completed",
     PipelineEvent.PROPOSAL_BLOCKED: "Trade blocked by risk",
+    PipelineEvent.PROPOSAL_DEFERRED: "Trade waiting for the market",
 }
 
 
@@ -393,7 +395,13 @@ class ProposalNotifier:
             return (title, "", None)
         subject = run.company or run.broker_ticker or str(run.id)
         body = f"{subject} — {run.status.value}"
-        return (title, body[:400], messages.render_research_stage(run, event))
+        return (
+            title,
+            body[:400],
+            messages.render_research_stage(
+                run, event, deferral_max_hours=self._settings.proposal_deferral_max_hours
+            ),
+        )
 
     # ------------------------------------------------------------------
     async def _claim(

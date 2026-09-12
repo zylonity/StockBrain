@@ -40,6 +40,7 @@ from stockbrain.risk.models import ZERO, FxSnapshot, RiskInputs, RuleResult
 __all__ = [
     "EXPOSURE_INCREASING_ACTIONS",
     "RISK_REDUCING_ACTIONS",
+    "TRANSIENT_RULE_IDS",
     "NotionalCap",
     "action_is_executable",
     "cap_rule_results",
@@ -57,6 +58,33 @@ EXPOSURE_INCREASING_ACTIONS: frozenset[ThesisAction] = frozenset({ThesisAction.B
 #: Actions that remove exposure.  Exempt from the caps and the confidence
 #: floor: a control that can stop a position being closed is a hazard.
 RISK_REDUCING_ACTIONS: frozenset[ThesisAction] = frozenset({ThesisAction.SELL, ThesisAction.REDUCE})
+
+#: Rules that can refuse a trade over *market state* -- a shut session, a stale
+#: or absent quote, an account snapshot not yet taken, a missing FX rate.  These
+#: describe the moment the evaluation happened, not the trade, so a refusal they
+#: are solely responsible for is transient: it is recorded and retried rather
+#: than treated as final.
+#:
+#: The definition is deliberately by rule id, and deliberately *never* judgment.
+#: A rule that judges the trade itself -- its confidence, its currency
+#: alignment, a concentration or cash-reserve cap, a duplicate proposal -- does
+#: not fix itself by waiting, and putting one of those in this set would turn
+#: "retry at the next open" into an unbounded loop.  The unit test beside this
+#: set pins both directions.
+TRANSIENT_RULE_IDS: frozenset[str] = frozenset(
+    {
+        "price_source_execution_grade",
+        "quote_available",
+        "quote_freshness",
+        "quote_two_sided",
+        "spread_ceiling",
+        "market_session",
+        "account_state_available",
+        "account_state_freshness",
+        "fx_available",
+        "fx_freshness",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)

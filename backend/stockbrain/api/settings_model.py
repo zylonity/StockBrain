@@ -886,6 +886,14 @@ CATALOGUE: tuple[_Group, ...] = (
                 unit="minutes",
             ),
             _s(
+                "proposal_deferral_max_hours",
+                "Deferral ceiling",
+                RESTART,
+                "How long a thesis refused only by market state is re-evaluated at "
+                "each open before the block becomes final.",
+                unit="hours",
+            ),
+            _s(
                 "risk_max_reference_price_drift_pct",
                 "Price drift envelope",
                 RESTART,

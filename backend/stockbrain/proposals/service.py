@@ -103,6 +103,7 @@ from stockbrain.risk.models import (
     RuleResult,
 )
 from stockbrain.risk.rules import (
+    TRANSIENT_RULE_IDS,
     action_is_executable,
 )
 
@@ -371,13 +372,55 @@ class ProposalService:
 
             if not decision.allowed:
                 reason = "; ".join(decision.blocks) or "; ".join(decision.sizing.reasons)
+                # Local imports: see the TYPE_CHECKING note above. Both packages
+                # are fully loaded by the time a proposal is generated.
+                from stockbrain.jobs.notifications import enqueue_pipeline_notification
+                from stockbrain.telegram.preferences import PipelineEvent
+
+                # A refusal whose every rule names market state is a refusal
+                # that has not happened yet: the session reopens or the quote
+                # refreshes, so the thesis is retried rather than retired.  One
+                # judgment rule makes it terminal -- waiting cannot lift a
+                # confidence floor -- and the retry also stops once the thesis
+                # is older than the deferral ceiling, which is what keeps a
+                # thesis from waiting forever.
+                transient_only = (
+                    bool(decision.block_rule_ids)
+                    and set(decision.block_rule_ids) <= TRANSIENT_RULE_IDS
+                )
+                fresh_enough = (moment - candidate.thesis.created_at) <= dt.timedelta(
+                    hours=self.settings.proposal_deferral_max_hours
+                )
+                evaluation.deferred = transient_only and fresh_enough
                 log.info(
                     "proposal_blocked",
                     thesis_id=str(thesis_id),
                     broker_ticker=fresh_identity.broker_ticker,
                     outcome=decision.outcome.value,
                     blocks=list(decision.block_rule_ids),
+                    deferred=evaluation.deferred,
                 )
+                if evaluation.deferred:
+                    log.info(
+                        "proposal_deferred",
+                        thesis_id=str(thesis_id),
+                        blocks=list(decision.block_rule_ids),
+                    )
+                    await enqueue_pipeline_notification(
+                        session,
+                        self.queue,
+                        self._preferences,
+                        entity_id=candidate.run.id,
+                        event=PipelineEvent.PROPOSAL_DEFERRED,
+                    )
+                    return GenerationResult(
+                        thesis_id=thesis_id,
+                        created=False,
+                        evaluation_id=evaluation.id,
+                        outcome=decision.outcome,
+                        reason="deferred: " + reason,
+                        blocks=decision.blocks,
+                    )
                 # --- PROPOSAL_BLOCKED notification (task 1) ------------------
                 # Without this the operator sees "Research completed: BUY" and
                 # then silence. Announce the refusal from the same transaction
@@ -387,12 +430,6 @@ class ProposalService:
                     ThesisAction.SELL,
                     ThesisAction.REDUCE,
                 }:
-                    # Local imports: see the TYPE_CHECKING note above. Both
-                    # packages are fully loaded by the time a proposal is
-                    # generated.
-                    from stockbrain.jobs.notifications import enqueue_pipeline_notification
-                    from stockbrain.telegram.preferences import PipelineEvent
-
                     await enqueue_pipeline_notification(
                         session,
                         self.queue,

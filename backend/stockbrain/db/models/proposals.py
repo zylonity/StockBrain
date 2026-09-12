@@ -362,6 +362,14 @@ class RiskEvaluation(UUIDPrimaryKeyMixin, Base):
     snapshot_hash: Mapped[str | None] = mapped_column(sa.String(64))
     actor: Mapped[str | None] = mapped_column(sa.Text)
     detail: Mapped[str | None] = mapped_column(sa.Text)
+    deferred: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
+    """True when every rule that refused this evaluation named market state.
+
+    A deferred row is a refusal that has not happened yet: the thesis is retried
+    on the next proposal-TTL tick, and the row becomes terminal -- and stops
+    being retried -- once the thesis passes the deferral age limit.  A terminal
+    refusal (``False``) is the ordinary blocked evaluation and is never retried.
+    """
 
     __table_args__ = (
         sa.Index("ix_risk_evaluations_thesis_id", "thesis_id"),

@@ -581,3 +581,33 @@ def test_the_snapshot_hash_changes_when_any_input_changes() -> None:
     different = ENGINE.evaluate(h.inputs(confidence=Decimal("0.8")), now=h.NOW).snapshot_hash()
     assert base == same
     assert base != different
+
+
+def test_the_transient_rule_set_names_only_market_state_rules() -> None:
+    from stockbrain.risk.rules import TRANSIENT_RULE_IDS
+
+    assert (
+        frozenset(
+            {
+                "price_source_execution_grade",
+                "quote_available",
+                "quote_freshness",
+                "quote_two_sided",
+                "spread_ceiling",
+                "market_session",
+                "account_state_available",
+                "account_state_freshness",
+                "fx_available",
+                "fx_freshness",
+            }
+        )
+        == TRANSIENT_RULE_IDS
+    )
+    for judgment in (
+        "currency_alignment",
+        "research_confidence_floor",
+        "max_position_concentration",
+        "min_cash_reserve",
+        "duplicate_or_conflicting_proposal",
+    ):
+        assert judgment not in TRANSIENT_RULE_IDS

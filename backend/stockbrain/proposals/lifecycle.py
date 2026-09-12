@@ -401,10 +401,17 @@ class ProposalLifecycle:
         Restart-safe by construction: the backlog is derived from the database,
         not from an in-memory list, and the dedupe key means re-enqueuing a
         thesis that already has a pending job is a no-op.
+
+        A *deferred* generation refusal is not a terminal answer, so it is
+        retried -- but at most once per ``proposal_ttl_minutes``, so a shut market
+        produces one attempt per tick-window rather than one per scheduler tick.
+        A *terminal* refusal is never retried; asking the same rules the same
+        question forever is how a backlog becomes a loop.
         """
         if blockers := await self._service.control_blockers():
             log.debug("proposal_backlog_skipped", blockers=blockers)
             return 0
+        now = utcnow()
         enqueued = 0
         async with self._service.database.transaction() as session:
             thesis_ids = list(
@@ -424,6 +431,20 @@ class ProposalLifecycle:
                                     RiskEvaluation.thesis_id == Thesis.id,
                                     RiskEvaluation.stage == STAGE_GENERATION,
                                     RiskEvaluation.policy_version == self._service.config.version,
+                                    RiskEvaluation.deferred.is_(False),
+                                )
+                            ),
+                            ~sa.exists(
+                                sa.select(RiskEvaluation.id).where(
+                                    RiskEvaluation.thesis_id == Thesis.id,
+                                    RiskEvaluation.stage == STAGE_GENERATION,
+                                    RiskEvaluation.policy_version == self._service.config.version,
+                                    RiskEvaluation.deferred.is_(True),
+                                    RiskEvaluation.created_at
+                                    > now
+                                    - dt.timedelta(
+                                        minutes=self._service.config.proposal_ttl_minutes
+                                    ),
                                 )
                             ),
                         )

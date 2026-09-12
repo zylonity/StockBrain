@@ -837,6 +837,13 @@ class Settings(BaseSettings):
     """How many active proposals the invalidation sweep re-prices per tick.
     Bounded so the sweep cannot turn into an unmetered market-data spend."""
 
+    proposal_deferral_max_hours: int = 72
+    """How long a thesis blocked only by market state keeps being retried.
+
+    A Friday-evening thesis has to survive the weekend, so the default spans
+    three days.  Past this the deferral gives up and the block becomes terminal,
+    which is what stops a shut market from retrying a thesis forever."""
+
     # ------------------------------------------------------------------
     # Telegram
     # ------------------------------------------------------------------
@@ -1104,6 +1111,11 @@ class Settings(BaseSettings):
             problems.append("RISK_MIN_TRADE_NOTIONAL must not be negative")
         if self.risk_proposal_ttl_minutes <= 0:
             problems.append("RISK_PROPOSAL_TTL_MINUTES must be greater than 0")
+        if not 1 <= self.proposal_deferral_max_hours <= 336:
+            problems.append(
+                "PROPOSAL_DEFERRAL_MAX_HOURS must be between 1 and 336 "
+                f"(got {self.proposal_deferral_max_hours})"
+            )
         if self.risk_max_active_proposals <= 0:
             problems.append("RISK_MAX_ACTIVE_PROPOSALS must be greater than 0")
         if self.risk_max_account_state_age_seconds <= 0:
