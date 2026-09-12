@@ -664,9 +664,27 @@ EXIT_SWEEP_ENABLED=true
 
 `EXIT_SWEEP_INTERVAL_SECONDS` (default `300`) is how often it runs, between 30
 and 3600 seconds. That interval is the real resolution of the price-based rules:
-a stop is not watched continuously, and a fast move can travel through both the
-hard stop and the trailing floor between two ticks. Raising the interval slows
-how fast the system reacts to a breach; it does not widen the thresholds.
+a stop is not watched continuously, and a fast move can travel through the hard
+stop and the volatility or trailing floor between two ticks. Raising the
+interval slows how fast the system reacts to a breach; it does not widen the
+thresholds.
+
+The volatility-scaled stop is a second switch. It needs the sweep above **and**
+the daily-bar refresh:
+
+```
+VOLATILITY_REFRESH_ENABLED=true
+```
+
+Off by default, and off is the safe side: with no stored ATR the rule cannot
+fire and the flat stops carry the position. The refresh fetches about
+`VOLATILITY_BARS_DAYS` (default `90`) of Yahoo daily bars for each open position
+at most once a day — never on the sweep's tick — asserts the bars' currency
+against the instrument's, computes the ATR, and stores it on the position's peak
+row. `VOLATILITY_REFRESH_INTERVAL_SECONDS` (default `21600`, six hours) is how
+often the job looks for positions whose ATR has aged out; a daily bar changes at
+most once a day, so the interval is measured in hours rather than minutes.
+Nothing here touches a broker, a reference price, or an LLM.
 
 Every threshold is `RESTART_REQUIRED`. There is no write route for settings —
 edit `.env` and restart the process. The values are validated at startup, so an
@@ -675,6 +693,9 @@ impossible policy refuses to start rather than failing open later.
 | Variable | Default | What it means |
 |---|---|---|
 | `RISK_EXIT_HARD_STOP_PCT` | `0.08` | Loss from average cost at which the whole position is proposed for exit. A floor, never widened. |
+| `RISK_EXIT_ATR_MULTIPLIER` | `3` | How many ATRs below the peak the volatility floor sits. The higher the number, the more room the position gets; the hard stop still caps the loss. |
+| `RISK_EXIT_ATR_PERIOD` | `14` | Trading days of true range averaged into the ATR. |
+| `RISK_EXIT_ATR_MAX_AGE_DAYS` | `3` | An ATR whose last bar is older than this is not trusted; the rule skips and the flat hard stop stands. Three days spans a weekend. |
 | `RISK_EXIT_TRAILING_ARM_PCT` | `0.10` | Gain from average cost at which the trailing floor switches on. Below it the hard stop is the only floor. |
 | `RISK_EXIT_TRAILING_PCT` | `0.05` | How far below the peak the trailing floor sits, once armed. Must be below the arm threshold, otherwise the floor would already be under the entry price when it armed. |
 | `RISK_EXIT_MIN_PEAK_OBSERVATIONS` | `3` | Broker snapshots a peak must be built from before the trailing rule trusts it. One observation is an entry price wearing a peak's name. |
@@ -682,15 +703,39 @@ impossible policy refuses to start rather than failing open later.
 
 **Reading which rule fired.** An exit proposal carries the rule in its
 `risk_rules` list: the entry whose `rule_id` is one of `hard_stop`,
-`trailing_stop`, `thesis_superseded`, `roi_target` or `horizon_elapsed`. Its
-`observed` and `threshold` fields are the numbers that decided it, and the
-`reason` is the same sentence the GUI and Telegram show. The proposal's
-`research_action` is `REDUCE` when `roi_target` fired and `SELL` for the other
-four.
+`volatility_stop`, `trailing_stop`, `thesis_superseded`, `roi_target` or
+`horizon_elapsed`. Its `observed` and `threshold` fields are the numbers that
+decided it, and the `reason` is the same sentence the GUI and Telegram show. The
+proposal's `research_action` is `REDUCE` when `roi_target` fired and `SELL` for
+the other five.
 
 ```bash
 curl -s localhost:8080/api/v1/proposals/<proposal_id>/risk | python3 -m json.tool
 ```
+
+**When Yahoo degrades.** The refresh records one provider, `yahoo_bars`, on
+`GET /api/health/providers` and the System Health screen: `HEALTHY` while the
+fetches succeed, `DEGRADED` with `<n> of <m> daily-bar fetches failed` as soon
+as any request fails. It starts `UNKNOWN` and is first updated by a run that had
+at least one position to fetch. A degraded `yahoo_bars` is not an outage: the
+affected positions simply have no fresh ATR, so `volatility_stop` skips and the
+flat `hard_stop` stands. `yahoo_bars` is deliberately not folded into any
+subsystem, so a Yahoo failure never turns the overall application status red.
+
+**Reading the refresh.** Each run logs one `volatility_refresh_complete` event
+whose tallies explain it:
+
+| Tally | Meaning |
+|---|---|
+| `considered` | open positions examined |
+| `refreshed` | ATR fetched, currency verified and stored |
+| `skipped_fresh` | an ATR from yesterday or today is already on the row |
+| `skipped_no_symbol` | the ticker's exchange has no Yahoo mapping; it is never guessed |
+| `skipped_no_currency` | the position has no currency to assert the bars against |
+| `skipped_no_peak` | no peak row yet, so nowhere to store an ATR |
+| `currency_mismatch` | the bars' currency disagreed with the instrument; refused, not converted |
+| `insufficient_bars` | not enough history to compute the period |
+| `failed` | the fetch raised; that provider degrades and nothing else changes |
 
 Exit proposals are not otherwise special: they are approved, rejected, expired
 and executed on the same lifecycle as a research proposal, and the sweep only

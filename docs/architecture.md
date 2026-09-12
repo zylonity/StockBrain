@@ -530,7 +530,9 @@ spend. Transport failures can leave unknown provider spend, recorded as failures
 Alpaca remains the market-data source; historical research snapshots never
 clear execution-grade quote checks. FRED uses only DFF/DGS10 with a prior-day
 Chicago vintage. Missing providers and classified errors appear as degradation.
-No optional upstream Yahoo/social/prediction-market network path is enabled.
+No optional upstream Yahoo/social/prediction-market network path is enabled for
+research or pricing; the narrow Yahoo daily-bar fetch that scales one exit
+threshold is the sole exception (see Deterministic exits).
 Research confidence is a ranking feature, not a calibrated probability or
 authoritative risk score; Phase 6 below is what consumes it, and it may only
 ever shrink a size inside limits the model never sees.
@@ -799,15 +801,16 @@ tradable.
 
 ### Deterministic exits
 
-A held position leaves through exactly one of five rules, and the precedence is
-declared rather than emergent: `hard_stop` → `trailing_stop` →
-`thesis_superseded` → `roi_target` → `horizon_elapsed`. `evaluate_exit` returns
-the first rule that fires and does not evaluate the rest, so two rules can never
-argue for two orders on one position.
+A held position leaves through exactly one of six rules, and the precedence is
+declared rather than emergent: `hard_stop` → `volatility_stop` →
+`trailing_stop` → `thesis_superseded` → `roi_target` → `horizon_elapsed`.
+`evaluate_exit` returns the first rule that fires and does not evaluate the
+rest, so two rules can never argue for two orders on one position.
 
 | Rule | Action | Fires when |
 |---|---|---|
 | `hard_stop` | SELL | the loss against average cost passes `RISK_EXIT_HARD_STOP_PCT` (8%). A floor, never widened. |
+| `volatility_stop` | SELL | the price falls below a Chandelier floor of `peak − RISK_EXIT_ATR_MULTIPLIER` × ATR(`RISK_EXIT_ATR_PERIOD`) — by default `peak − 3 × ATR(14)` — computed from Yahoo daily bars. |
 | `trailing_stop` | SELL | the position first gained `RISK_EXIT_TRAILING_ARM_PCT` (10%), then fell `RISK_EXIT_TRAILING_PCT` (5%) below its peak. |
 | `thesis_superseded` | SELL | research has published a newer thesis than the one the position was opened on. |
 | `roi_target` | REDUCE | the gain meets the decaying target for the thesis's horizon and age. |
@@ -819,10 +822,36 @@ fires **regardless of P/L** — an event thesis that has run out of time is no
 longer a reason to hold, profit or loss alike — and `hard_stop` outranks it,
 because a position past the floor has already been evaluated as a loss first.
 
-Four of the five propose a full `SELL`; only `roi_target` proposes `REDUCE`, the
+Five of the six propose a full `SELL`; only `roi_target` proposes `REDUCE`, the
 same deterministic half-exit the research path can already ask for. Every one is
 an ordinary proposal on the ordinary risk path: `generate_exit` re-prices it
 through the market-data evaluator, and no rule here touches a broker.
+
+`volatility_stop` is the one floor scaled to the instrument rather than fixed: a
+quiet name is stopped tight, a wild one is given room. It is a Chandelier level,
+`peak − RISK_EXIT_ATR_MULTIPLIER × ATR` (by default `peak − 3 × ATR(14)`), where
+the ATR is the simple mean of the last `RISK_EXIT_ATR_PERIOD` true ranges —
+`max(H−L, |H−prevC|, |L−prevC|)` — over roughly `VOLATILITY_BARS_DAYS` (90) of
+Yahoo daily bars. Wilder smoothing is deliberately not used; its statefulness
+buys nothing for a threshold read once per sweep. The rule reuses the same
+broker-sampled peak the trailing rule trusts, so a position that never rose
+degrades to `entry − 3 × ATR`: a volatility-scaled hard stop.
+
+Yahoo is research-grade, never a reference price. It is not a `PriceSource`, it
+is never added to `EXECUTION_GRADE_PRICE_SOURCES`, and no proposal's
+`reference_price` may come from it: it feeds exactly one rule's *threshold*, and
+the evaluator still prices the resulting proposal. It is also allowed to be
+absent. A missing ATR, one whose last bar is older than
+`RISK_EXIT_ATR_MAX_AGE_DAYS` (default 3 days, enough to span a weekend), or a
+position with no trustworthy peak makes `volatility_stop` skip while the flat
+`hard_stop` keeps standing. The refresh that stores the ATR ships disabled, so
+out of the box the rule cannot fire at all.
+
+Currency is asserted per instrument, never assumed and never converted. A bar
+series whose currency does not match the instrument's is refused and the
+position is skipped; LSE trades in pence (`GBX`), which Yahoo spells `GBp`, and
+a pence/pound mix-up is a factor of 100. Only a verified match is stored, tagged
+with the instrument's currency.
 
 Two prices meet at this boundary and they are deliberately different things:
 
@@ -838,11 +867,11 @@ Two prices meet at this boundary and they are deliberately different things:
 
 The sweep interval is the real resolution of every price-based rule. The
 scheduled sweep evaluates each open position once per `EXIT_SWEEP_INTERVAL_SECONDS`
-(default 300s), so a fast move can travel through both the hard stop and the
-trailing floor between two ticks, and the exit is proposed when the sweep
-reaches it and no sooner. The interval bounds reaction time, not the threshold:
-nothing evaluates a stop continuously, and an operator reading a drawdown should
-read it with that lag in mind.
+(default 300s), so a fast move can travel through the hard stop and the
+volatility or trailing floor between two ticks, and the exit is proposed when
+the sweep reaches it and no sooner. The interval bounds reaction time, not the
+threshold: nothing evaluates a stop continuously, and an operator reading a
+drawdown should read it with that lag in mind.
 
 ## Phase 7 Telegram control and approvals
 
