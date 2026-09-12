@@ -38,6 +38,7 @@ ZERO = Decimal(0)
 #: not evaluated, so two rules can never propose two orders for one position.
 EXIT_PRECEDENCE: tuple[str, ...] = (
     "hard_stop",
+    "volatility_stop",
     "trailing_stop",
     "thesis_superseded",
     "roi_target",
@@ -59,6 +60,8 @@ class ExitObservation:
     opened_at: dt.datetime
     horizon: TimeHorizon
     thesis_superseded: bool
+    atr: Decimal | None = None
+    atr_as_of: dt.date | None = None
 
     @property
     def gain(self) -> Decimal:
@@ -140,9 +143,44 @@ def evaluate_exit(
             ),
         )
 
-    # 2. trailing_stop -- armed only once the position has genuinely run, and
-    #    only against a peak built from enough observations to mean something.
+    # 2. volatility_stop -- a Chandelier floor, `k` ATRs under the high-water
+    #    mark.  Volatility-scaled where the flat rules are not: a quiet name is
+    #    stopped tight, a wild one is given room.  ATR is research-grade data
+    #    and may be missing or stale; then this rule skips and the flat stops
+    #    stand.  Needs the same trustworthy peak the trailing rule needs.
     peak = observation.peak_price
+    atr = observation.atr
+    atr_fresh = (
+        observation.atr_as_of is not None
+        and (now.date() - observation.atr_as_of).days <= config.exit_atr_max_age_days
+    )
+    if (
+        peak is not None
+        and atr is not None
+        and atr > ZERO
+        and atr_fresh
+        and observation.peak_observations >= config.exit_min_peak_observations
+    ):
+        floor = peak - config.exit_atr_multiplier * atr
+        if observation.current_price < floor:
+            return ExitSignal(
+                rule_id="volatility_stop",
+                action=ThesisAction.SELL,
+                reason=(
+                    f"the price fell to {observation.current_price}, through the volatility "
+                    f"floor at {floor} ({config.exit_atr_multiplier} x ATR {atr} below the "
+                    f"peak of {peak})"
+                ),
+                rule=_fired(
+                    "volatility_stop",
+                    "the volatility floor was breached",
+                    str(observation.current_price),
+                    str(floor),
+                ),
+            )
+
+    # 3. trailing_stop -- armed only once the position has genuinely run, and
+    #    only against a peak built from enough observations to mean something.
     if (
         peak is not None
         and observation.peak_observations >= config.exit_min_peak_observations
@@ -166,7 +204,7 @@ def evaluate_exit(
                 ),
             )
 
-    # 3. thesis_superseded -- research has published a newer conclusion about
+    # 4. thesis_superseded -- research has published a newer conclusion about
     #    this company, so the reason recorded for holding is out of date.
     if observation.thesis_superseded:
         return ExitSignal(
@@ -183,7 +221,7 @@ def evaluate_exit(
 
     target = roi_target_for(observation.horizon, minutes, config)
 
-    # 4. roi_target -- bank half into strength.  A zero target belongs to
+    # 5. roi_target -- bank half into strength.  A zero target belongs to
     #    horizon_elapsed, not here: "any profit at all" is a statement about
     #    the thesis expiring, not about a target being met.
     if target > ZERO and gain >= target:
@@ -199,7 +237,7 @@ def evaluate_exit(
             ),
         )
 
-    # 5. horizon_elapsed -- the thesis has run out of time and the position is
+    # 6. horizon_elapsed -- the thesis has run out of time and the position is
     #    closed whatever its result; a loss past the hard-stop floor never
     #    reaches this rule because hard_stop is evaluated first.
     if target == ZERO:

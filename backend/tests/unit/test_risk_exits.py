@@ -151,6 +151,7 @@ def test_the_hard_stop_outranks_every_other_rule() -> None:
 def test_precedence_is_declared_and_complete() -> None:
     assert EXIT_PRECEDENCE == (
         "hard_stop",
+        "volatility_stop",
         "trailing_stop",
         "thesis_superseded",
         "roi_target",
@@ -166,6 +167,114 @@ def test_a_non_positive_basis_produces_no_signal(price: Decimal) -> None:
 def test_nothing_is_proposed_when_no_shares_are_available_to_trade() -> None:
     signal = evaluate_exit(
         observe(current_price=Decimal("80"), quantity_available=Decimal("0")),
+        h.config(),
+        now=NOW,
+    )
+    assert signal is None
+
+
+def test_the_volatility_stop_fires_below_peak_minus_k_atr() -> None:
+    # peak 110, ATR 2, k=3 → floor 104.  Price 103 is below it and above the -8% hard stop.
+    signal = evaluate_exit(
+        observe(
+            current_price=Decimal("103"),
+            peak_price=Decimal("110"),
+            average_price=Decimal("101"),
+            atr=Decimal("2"),
+            atr_as_of=NOW.date(),
+        ),
+        h.config(),
+        now=NOW,
+    )
+    assert signal is not None and signal.rule_id == "volatility_stop"
+    assert signal.action is ThesisAction.SELL
+
+
+def test_the_volatility_stop_holds_at_exactly_the_floor() -> None:
+    signal = evaluate_exit(
+        observe(
+            current_price=Decimal("104"),
+            peak_price=Decimal("110"),
+            average_price=Decimal("101"),
+            atr=Decimal("2"),
+            atr_as_of=NOW.date(),
+        ),
+        h.config(),
+        now=NOW,
+    )
+    assert signal is None
+
+
+def test_a_stale_atr_is_ignored_and_the_flat_rules_stand() -> None:
+    signal = evaluate_exit(
+        observe(
+            current_price=Decimal("103"),
+            peak_price=Decimal("110"),
+            average_price=Decimal("101"),
+            atr=Decimal("2"),
+            atr_as_of=NOW.date() - dt.timedelta(days=10),
+        ),
+        h.config(),
+        now=NOW,
+    )
+    assert signal is None  # 103 vs cost 101 is +2%: no hard stop, trailing not armed
+
+
+def test_a_missing_atr_skips_the_rule() -> None:
+    assert (
+        evaluate_exit(
+            observe(
+                current_price=Decimal("103"),
+                peak_price=Decimal("110"),
+                average_price=Decimal("101"),
+            ),
+            h.config(),
+            now=NOW,
+        )
+        is None
+    )
+
+
+def test_the_hard_stop_still_outranks_the_volatility_stop() -> None:
+    signal = evaluate_exit(
+        observe(
+            current_price=Decimal("80"),
+            peak_price=Decimal("110"),
+            atr=Decimal("2"),
+            atr_as_of=NOW.date(),
+        ),
+        h.config(),
+        now=NOW,
+    )
+    assert signal is not None and signal.rule_id == "hard_stop"
+
+
+def test_a_volatile_name_gets_room_a_quiet_one_does_not() -> None:
+    quiet = observe(
+        current_price=Decimal("96"),
+        peak_price=Decimal("100"),
+        atr=Decimal("1"),
+        atr_as_of=NOW.date(),
+    )
+    wild = observe(
+        current_price=Decimal("96"),
+        peak_price=Decimal("100"),
+        atr=Decimal("3"),
+        atr_as_of=NOW.date(),
+    )
+    assert evaluate_exit(quiet, h.config(), now=NOW) is not None  # floor 97
+    assert evaluate_exit(wild, h.config(), now=NOW) is None  # floor 91
+
+
+def test_the_volatility_stop_respects_min_peak_observations() -> None:
+    signal = evaluate_exit(
+        observe(
+            current_price=Decimal("103"),
+            peak_price=Decimal("110"),
+            peak_observations=1,
+            atr=Decimal("2"),
+            atr_as_of=NOW.date(),
+        ),
         h.config(),
         now=NOW,
     )
