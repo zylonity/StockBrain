@@ -18,13 +18,15 @@ from asgi_lifespan import LifespanManager
 
 from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
-from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
+from stockbrain.db.models.portfolio import PortfolioSnapshot, Position, PositionPeak
+from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.models.system import AppSetting
 from stockbrain.db.session import Database
-from stockbrain.enums import Broker
+from stockbrain.enums import Broker, OrderSide, OrderType, PriceSource, ProposalStatus
 from stockbrain.logging import get_logger
 from stockbrain.main import create_app
 from stockbrain.services import DISCOVERY_PAUSED_KEY
+from tests import proposal_helpers as ph
 
 pytestmark = pytest.mark.integration
 
@@ -380,3 +382,102 @@ async def test_the_portfolio_route_never_calls_the_broker(client: httpx.AsyncCli
     source = inspect.getsource(module)
     for forbidden in ("Trading212", "httpx", "t212_api_key", "AccountStateService"):
         assert forbidden not in source
+
+
+async def _seed_managed_position(database: Database) -> None:
+    """A held Apple position with an executed StockBrain buy behind it."""
+    await ph.seed(database)
+    await ph.fund(database, positions={"AAPL_US_EQ": (Decimal("9"), Decimal("9"))})
+    moment = utcnow()
+    async with database.transaction() as session:
+        session.add(
+            TradeProposal(
+                thesis_id=ph.THESIS_ID,
+                research_run_id=ph.RUN_ID,
+                broker=Broker.TRADING212,
+                broker_ticker="AAPL_US_EQ",
+                account_id=ph.ACCOUNT_ID,
+                broker_environment=ph.settings().t212_env.value,
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                proposed_quantity=Decimal("9"),
+                reference_price=Decimal("180.50"),
+                reference_currency="USD",
+                price_source=PriceSource.ALPACA_IEX,
+                quote_timestamp=moment,
+                quote_age_ms=0,
+                estimated_notional=Decimal("9") * Decimal("180.50"),
+                account_currency="USD",
+                status=ProposalStatus.EXECUTED,
+                executed_at=moment,
+                expires_at=moment + dt.timedelta(days=1),
+            )
+        )
+        session.add(
+            PositionPeak(
+                broker=Broker.TRADING212,
+                account_id=ph.ACCOUNT_ID,
+                broker_ticker="AAPL_US_EQ",
+                peak_price=Decimal("200"),
+                peak_at=moment,
+                observations=5,
+            )
+        )
+
+
+async def test_portfolio_exposes_each_positions_exit_floors(
+    client: httpx.AsyncClient, database: Database
+) -> None:
+    """The stored mirror now carries the risk engine's floors, not just prices.
+
+    A portfolio page that shows a position's P&L without the floor it would be
+    stopped at makes the operator do the arithmetic the engine already did.
+    """
+    await _seed_managed_position(database)
+
+    body = (await client.get("/api/v1/portfolio")).json()
+
+    assert body["available"] is True
+    [position] = body["positions"]
+    assert position["broker_ticker"] == "AAPL_US_EQ"
+    exit_status = position["exit"]
+    assert exit_status["managed"] is True
+    # 180 average cost, 8% hard stop.
+    assert Decimal(exit_status["hard_stop"]) == Decimal("165.60")
+
+
+async def test_portfolio_says_when_a_position_is_not_stockbrain_managed(
+    client: httpx.AsyncClient, database: Database
+) -> None:
+    """A position with no executed buy gets a reason, never invented floors."""
+    captured = utcnow()
+    async with database.transaction() as session:
+        session.add(
+            PortfolioSnapshot(
+                broker=Broker.TRADING212,
+                account_id="acct-1",
+                currency="GBP",
+                broker_environment="demo",
+                captured_at=captured,
+            )
+        )
+        session.add(
+            Position(
+                account_id="acct-1",
+                broker=Broker.TRADING212,
+                broker_ticker="AAPL_US_EQ",
+                quantity=Decimal("2"),
+                quantity_available=Decimal("2"),
+                average_price=Decimal("180.00"),
+                current_price=Decimal("190.00"),
+                currency="USD",
+                last_synced_at=captured,
+            )
+        )
+
+    body = (await client.get("/api/v1/portfolio")).json()
+
+    [position] = body["positions"]
+    assert position["exit"]["managed"] is False
+    assert "no StockBrain buy" in (position["exit"]["reason"] or "")
+    assert position["exit"]["hard_stop"] is None

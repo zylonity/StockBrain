@@ -707,3 +707,96 @@ async def test_the_sweep_isolates_one_positions_failure(
             )
         ).scalar_one()
     assert proposed.broker_ticker == "MSFT_US_EQ"
+
+
+async def _seed_peak(
+    database: Database,
+    *,
+    broker_ticker: str,
+    peak_price: Decimal,
+    observations: int = 3,
+) -> None:
+    """The high-water mark the volatility and trailing rules read."""
+    async with database.transaction() as session:
+        session.add(
+            PositionPeak(
+                broker=Broker.TRADING212,
+                account_id=ph.ACCOUNT_ID,
+                broker_ticker=broker_ticker,
+                peak_price=peak_price,
+                peak_at=utcnow(),
+                observations=observations,
+            )
+        )
+
+
+async def test_status_reports_a_managed_positions_floors(clean_tables: Database) -> None:
+    """The operator sees the same hard floor the exit rule would act on.
+
+    ``status`` shares the observation builder with ``sweep``, so the number here
+    is computed by the very predicate that fires the rule -- it cannot drift.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("101"),
+    )
+    await _seed_peak(database, broker_ticker="AAPL_US_EQ", peak_price=Decimal("105"))
+
+    async with database.session() as session:
+        statuses = await (await _exit_sweep(database)).status(session)
+
+    status = statuses["AAPL_US_EQ"]
+    assert status.managed is True
+    assert status.reason is None
+    assert status.floors is not None
+    assert status.floors.hard_stop == Decimal("100") * Decimal("0.92")
+    assert status.peak_price == Decimal("105")
+    assert status.horizon == TimeHorizon.DAYS.value
+
+
+async def test_status_reports_an_unmanaged_position_without_inventing_floors(
+    clean_tables: Database,
+) -> None:
+    """A position StockBrain never opened has no thesis, so no floors."""
+    database = clean_tables
+    await ph.fund(database, positions={"AAPL_US_EQ": (Decimal("9"), Decimal("9"))})
+
+    async with database.session() as session:
+        statuses = await (await _exit_sweep(database)).status(session)
+
+    status = statuses["AAPL_US_EQ"]
+    assert status.managed is False
+    assert status.reason is not None
+    assert "no StockBrain buy" in status.reason
+    assert status.floors is None
+
+
+async def test_status_reports_floors_even_while_a_proposal_is_pending(
+    clean_tables: Database,
+) -> None:
+    """The sweep skips a listing with a live proposal; the operator must not.
+
+    An exit already waiting for approval is exactly when its floors matter most,
+    so ``status`` never applies the sweep's active-proposal skip.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("88"),
+    )
+    await _seed_live_proposal(database, broker_ticker="AAPL_US_EQ")
+
+    async with database.session() as session:
+        statuses = await (await _exit_sweep(database)).status(session)
+
+    status = statuses["AAPL_US_EQ"]
+    assert status.managed is True
+    assert status.floors is not None
+    assert status.floors.hard_stop == Decimal("92")

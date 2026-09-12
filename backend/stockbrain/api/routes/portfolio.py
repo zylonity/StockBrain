@@ -19,22 +19,55 @@ no route here that changes anything.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import sqlalchemy as sa
 from fastapi import APIRouter, Query
 
-from stockbrain.api.dependencies import DbSession, SettingsDep
-from stockbrain.api.schemas import PortfolioPositionResponse, PortfolioResponse
+from stockbrain.api.dependencies import DbSession, ServicesDep, SettingsDep
+from stockbrain.api.schemas import (
+    PortfolioPositionResponse,
+    PortfolioResponse,
+    PositionExitResponse,
+)
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument
 from stockbrain.db.models.portfolio import PortfolioSnapshot, Position
 
+if TYPE_CHECKING:
+    from stockbrain.proposals.exits import PositionExitStatus
+
 router = APIRouter(prefix="/api/v1", tags=["portfolio"])
+
+
+def _exit_response(status: PositionExitStatus) -> PositionExitResponse:
+    """The wire shape of one position's exit floors.
+
+    A ``PositionExitStatus`` the risk layer could not price carries no floors;
+    every price stays ``None`` rather than being invented.
+    """
+    floors = status.floors
+    return PositionExitResponse(
+        managed=status.managed,
+        reason=status.reason,
+        hard_stop=floors.hard_stop if floors is not None else None,
+        volatility_floor=floors.volatility_floor if floors is not None else None,
+        trailing_floor=floors.trailing_floor if floors is not None else None,
+        roi_target_price=floors.roi_target_price if floors is not None else None,
+        horizon_ends_at=floors.horizon_ends_at if floors is not None else None,
+        nearest_floor=floors.nearest_floor if floors is not None else None,
+        nearest_rule=floors.nearest_rule if floors is not None else None,
+        peak_price=status.peak_price,
+        atr=status.atr,
+        horizon=status.horizon,
+    )
 
 
 @router.get("/portfolio", response_model=PortfolioResponse, summary="Broker account snapshot")
 async def portfolio(
     session: DbSession,
     settings: SettingsDep,
+    services: ServicesDep,
     limit: int = Query(default=100, ge=1, le=500),
 ) -> PortfolioResponse:
     snapshot = (
@@ -82,6 +115,12 @@ async def portfolio(
         ).scalar_one()
     )
 
+    # Read-only and best-effort: the floors are a convenience on a page that
+    # must still answer when the risk subsystem did not start.  ``status`` reads
+    # the stored mirror and the risk rules only; it never prices or transmits.
+    exits = services.exits if services is not None else None
+    statuses = await exits.status(session) if exits is not None else {}
+
     age_seconds = (utcnow() - snapshot.captured_at).total_seconds()
     return PortfolioResponse(
         available=True,
@@ -109,6 +148,11 @@ async def portfolio(
                 ppl=position.ppl,
                 currency=position.currency,
                 last_synced_at=position.last_synced_at,
+                exit=(
+                    _exit_response(statuses[position.broker_ticker])
+                    if position.broker_ticker in statuses
+                    else None
+                ),
             )
             for position, name in rows
         ],

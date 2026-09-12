@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -31,12 +32,36 @@ from stockbrain.proposals.lifecycle import thesis_is_superseded
 from stockbrain.proposals.service import ProposalService
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES
 from stockbrain.risk.config import RiskConfig
-from stockbrain.risk.exits import ExitObservation, evaluate_exit
+from stockbrain.risk.exits import ExitFloors, ExitObservation, evaluate_exit, exit_floors
 
-__all__ = ["ExitSweepService"]
+__all__ = ["ExitSweepService", "PositionExitStatus"]
 
 log = get_logger(__name__)
 ZERO = Decimal(0)
+
+#: The two ways an open position can yield no exit observation.  ``sweep`` and
+#: ``status`` share them so a reason an operator reads is the reason the tally
+#: counted.
+NO_ORIGIN_REASON = "no StockBrain buy behind it"
+UNPRICED_REASON = "unpriced"
+
+
+@dataclass(frozen=True, slots=True)
+class PositionExitStatus:
+    """One open position's exit posture, as the read-only surfaces consume it.
+
+    ``managed`` is false when StockBrain has no executed buy behind the
+    position; ``reason`` then says why, and every price is ``None``.  ``horizon``
+    is the thesis horizon's value, carried beside the numbers because the ROI
+    target and the horizon end mean nothing without it.
+    """
+
+    managed: bool
+    reason: str | None
+    floors: ExitFloors | None
+    peak_price: Decimal | None
+    atr: Decimal | None
+    horizon: str | None
 
 
 class ExitSweepService:
@@ -85,68 +110,26 @@ class ExitSweepService:
         )
 
         async with self._database.session() as session:
-            rows = (
-                await session.execute(
-                    sa.select(Position, PositionPeak)
-                    .outerjoin(
-                        PositionPeak,
-                        sa.and_(
-                            PositionPeak.broker == Position.broker,
-                            PositionPeak.account_id == Position.account_id,
-                            PositionPeak.broker_ticker == Position.broker_ticker,
-                        ),
-                    )
-                    .where(Position.broker == self._proposals.broker, Position.quantity > ZERO)
-                    .order_by(Position.broker_ticker)
-                )
-            ).all()
-
             observations: list[ExitObservation] = []
-            for position, peak in rows:
+            for position, observation, skip_reason in await self.observations(session):
                 counts["considered"] += 1
 
+                # The active-proposal skip is the sweep's alone: one live
+                # proposal per listing is a database invariant, and a second
+                # would be refused.  ``status`` deliberately omits it.
                 if await self._has_live_proposal(session, position.broker_ticker):
                     counts["skipped_active_proposal"] += 1
                     continue
 
-                origin = await self._proposals.origin_proposal(session, position.broker_ticker)
-                if origin is None or origin.executed_at is None or origin.thesis_id is None:
-                    counts["skipped_no_origin"] += 1
-                    continue
-                thesis = await session.get(Thesis, origin.thesis_id)
-                if thesis is None:
-                    counts["skipped_no_origin"] += 1
-                    continue
-
-                if position.average_price is None or position.current_price is None:
-                    counts["skipped_unpriced"] += 1
+                if observation is None:
+                    counts[
+                        "skipped_no_origin"
+                        if skip_reason == NO_ORIGIN_REASON
+                        else "skipped_unpriced"
+                    ] += 1
                     continue
 
-                # The stored ATR is fed to the rule only when it was computed for
-                # the configured period and in this position's own currency.  A
-                # RESTART_REQUIRED period change or a GBX/GBP flip must not
-                # silently apply an ATR measured on a different scale.
-                atr_matches = (
-                    peak is not None
-                    and peak.atr_period == self._config.exit_atr_period
-                    and peak.atr_currency == position.currency
-                )
-                observations.append(
-                    ExitObservation(
-                        broker_ticker=position.broker_ticker,
-                        quantity=position.quantity,
-                        quantity_available=position.quantity_available or ZERO,
-                        average_price=position.average_price,
-                        current_price=position.current_price,
-                        peak_price=peak.peak_price if peak is not None else None,
-                        peak_observations=peak.observations if peak is not None else 0,
-                        atr=peak.atr if atr_matches else None,
-                        atr_as_of=peak.atr_as_of if atr_matches else None,
-                        opened_at=origin.executed_at,
-                        horizon=thesis.time_horizon,
-                        thesis_superseded=await self._superseded(session, origin.thesis_id),
-                    )
-                )
+                observations.append(observation)
 
         attempted = 0
         for observation in observations:
@@ -178,6 +161,116 @@ class ExitSweepService:
 
         log.info("exit_sweep_complete", **dict(counts))
         return dict(counts)
+
+    async def observations(
+        self, session: AsyncSession
+    ) -> list[tuple[Position, ExitObservation | None, str | None]]:
+        """Every open position with its exit observation, or why it has none.
+
+        Shared by ``sweep`` and ``status`` so the floors an operator sees are
+        computed from the same observation the rules act on.  The active-proposal
+        skip is deliberately *not* one of the reasons here: it belongs to the
+        sweep, which must not propose twice for one listing, while an operator
+        still wants the floors of a position whose exit is already pending.
+
+        A position without an executed StockBrain buy has no thesis to exit
+        against, and one the broker has not priced cannot be evaluated; both are
+        returned with a reason rather than dropped, because "why is there no
+        floor here?" is a question the caller must be able to answer.
+        """
+        rows = (
+            await session.execute(
+                sa.select(Position, PositionPeak)
+                .outerjoin(
+                    PositionPeak,
+                    sa.and_(
+                        PositionPeak.broker == Position.broker,
+                        PositionPeak.account_id == Position.account_id,
+                        PositionPeak.broker_ticker == Position.broker_ticker,
+                    ),
+                )
+                .where(Position.broker == self._proposals.broker, Position.quantity > ZERO)
+                .order_by(Position.broker_ticker)
+            )
+        ).all()
+
+        built: list[tuple[Position, ExitObservation | None, str | None]] = []
+        for position, peak in rows:
+            origin = await self._proposals.origin_proposal(session, position.broker_ticker)
+            if origin is None or origin.executed_at is None or origin.thesis_id is None:
+                built.append((position, None, NO_ORIGIN_REASON))
+                continue
+            thesis = await session.get(Thesis, origin.thesis_id)
+            if thesis is None:
+                built.append((position, None, NO_ORIGIN_REASON))
+                continue
+
+            if position.average_price is None or position.current_price is None:
+                built.append((position, None, UNPRICED_REASON))
+                continue
+
+            # The stored ATR is fed to the rule only when it was computed for
+            # the configured period and in this position's own currency.  A
+            # RESTART_REQUIRED period change or a GBX/GBP flip must not
+            # silently apply an ATR measured on a different scale.
+            atr_matches = (
+                peak is not None
+                and peak.atr_period == self._config.exit_atr_period
+                and peak.atr_currency == position.currency
+            )
+            built.append(
+                (
+                    position,
+                    ExitObservation(
+                        broker_ticker=position.broker_ticker,
+                        quantity=position.quantity,
+                        quantity_available=position.quantity_available or ZERO,
+                        average_price=position.average_price,
+                        current_price=position.current_price,
+                        peak_price=peak.peak_price if peak is not None else None,
+                        peak_observations=peak.observations if peak is not None else 0,
+                        atr=peak.atr if atr_matches else None,
+                        atr_as_of=peak.atr_as_of if atr_matches else None,
+                        opened_at=origin.executed_at,
+                        horizon=thesis.time_horizon,
+                        thesis_superseded=await self._superseded(session, origin.thesis_id),
+                    ),
+                    None,
+                )
+            )
+        return built
+
+    async def status(self, session: AsyncSession) -> dict[str, PositionExitStatus]:
+        """Every open position's exit floors, keyed by ``broker_ticker``.
+
+        Unlike ``sweep`` this never applies the active-proposal skip, and it
+        reuses the same observation builder, so a floor shown here is the floor
+        the rule would act on.  A position StockBrain did not open, or one the
+        broker has not priced, still appears -- unmanaged, with the reason --
+        because a missing row is indistinguishable from a bug.
+        """
+        moment = utcnow()
+        statuses: dict[str, PositionExitStatus] = {}
+        for position, observation, skip_reason in await self.observations(session):
+            if observation is None:
+                statuses[position.broker_ticker] = PositionExitStatus(
+                    managed=False,
+                    reason=skip_reason,
+                    floors=None,
+                    peak_price=None,
+                    atr=None,
+                    horizon=None,
+                )
+                continue
+            statuses[position.broker_ticker] = PositionExitStatus(
+                managed=True,
+                reason=None,
+                floors=exit_floors(observation, self._config, now=moment),
+                peak_price=observation.peak_price,
+                atr=observation.atr,
+                horizon=observation.horizon.value,
+            )
+        return statuses
 
     async def _has_live_proposal(self, session: AsyncSession, broker_ticker: str) -> bool:
         count = await session.scalar(

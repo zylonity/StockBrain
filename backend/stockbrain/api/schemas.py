@@ -51,6 +51,7 @@ __all__ = [
     "NotificationPreferencesResponse",
     "PortfolioPositionResponse",
     "PortfolioResponse",
+    "PositionExitResponse",
     "PriceReactionResponse",
     "ProposalExecutionResponse",
     "ProviderHealthResponse",
@@ -1049,6 +1050,31 @@ class NotificationPreferencesRequest(ApiModel):
 # ---------------------------------------------------------------------------
 
 
+class PositionExitResponse(ApiModel):
+    """Where each exit rule would act for one open position.
+
+    Computed by the same predicates the rules fire on, so the floor shown and
+    the floor acted on cannot disagree.  ``managed`` is false when StockBrain has
+    no executed buy behind the position: ``reason`` then says why and every floor
+    is ``None`` -- a position never opened from a thesis has none to exit
+    against, and inventing a floor would put a rule's name on a decision it never
+    made.
+    """
+
+    managed: bool
+    reason: str | None = None
+    hard_stop: Decimal | None = None
+    volatility_floor: Decimal | None = None
+    trailing_floor: Decimal | None = None
+    roi_target_price: Decimal | None = None
+    horizon_ends_at: dt.datetime | None = None
+    nearest_floor: Decimal | None = None
+    nearest_rule: str | None = None
+    peak_price: Decimal | None = None
+    atr: Decimal | None = None
+    horizon: str | None = None
+
+
 class PortfolioPositionResponse(ApiModel):
     broker_ticker: str
     name: str | None = None
@@ -1059,6 +1085,7 @@ class PortfolioPositionResponse(ApiModel):
     ppl: Decimal | None = None
     currency: str | None = None
     last_synced_at: dt.datetime
+    exit: PositionExitResponse | None = None
 
 
 class PortfolioResponse(ApiModel):
