@@ -23,7 +23,7 @@ from stockbrain.errors import (
 )
 from stockbrain.llm.telemetry import LlmCallRecord
 
-PROMPT_VERSION = "research-v1"
+PROMPT_VERSION = "research-v2"
 UPSTREAM_COMMIT = "2448d0a12576f9b2ddcd5980a0630833423d1e1b"
 ROLES = ("market", "fundamentals", "sentiment", "bull", "bear", "manager", "trader")
 DEEP_ROLES = frozenset({"bull", "bear", "manager", "trader"})
@@ -59,7 +59,18 @@ Items = Annotated[
 
 class ResearchDecision(FrozenModel):
     action: ThesisAction
-    confidence: float = Field(ge=0, le=1, strict=True)
+    confidence: float = Field(
+        ge=0,
+        le=1,
+        strict=True,
+        description=(
+            "Strength of the evidential case for this action on this horizon. Not the"
+            " probability of a price move, not an expected return, and not a position size."
+            " Use the full range: the top for a decisive, corroborated case, the bottom for"
+            " a marginal one. A downstream risk engine both blocks and shrinks positions on"
+            " this number, so hedging it toward the middle quietly discards a call you hold."
+        ),
+    )
     horizon: TimeHorizon
     thesis: Text
     bull_case: Text

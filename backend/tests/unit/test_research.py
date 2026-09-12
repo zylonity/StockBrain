@@ -159,9 +159,18 @@ def test_source_instructions_cannot_expand_tool_capabilities(attack: str) -> Non
     value = packet()
     evidence = value.evidence[0].model_copy(update={"text": attack})
     value = value.model_copy(update={"evidence": (evidence,)})
+    # The packet is already fenced into every role call, so the tool answers with a
+    # fixed string and carries no document text at all -- the injected payload has
+    # no path through it, and the fencing property is asserted where the packet is
+    # actually rendered, below.
     rendered = execute_context_tool("read_research_context", {}, value)
-    assert rendered.count("</untrusted_document>") == 1
+    assert attack not in rendered
     assert "<system>" not in rendered
+    assert "untrusted_document" not in rendered
+
+    fenced = value.fenced()
+    assert fenced.count("</untrusted_document>") == 1
+    assert "<system>" not in fenced
     for name in ("shell", "write_file", "fetch_url", "place_order", "get_secrets"):
         with pytest.raises(ResearchToolError):
             execute_context_tool(name, {}, value)

@@ -37,7 +37,7 @@ from stockbrain.intelligence.research import (
 )
 from stockbrain.intelligence.tradingagents_runtime import upstream_module
 from stockbrain.llm.base import CompletionResult, TokenUsage
-from stockbrain.llm.openai_compat import parse_usage
+from stockbrain.llm.openai_compat import parse_usage, strict_json_schema
 from stockbrain.llm.pricing import PricingTable
 from stockbrain.llm.profiles import DEEPSEEK, ProviderProfile
 from stockbrain.llm.telemetry import LlmCallRecord, LlmTelemetry
@@ -129,7 +129,7 @@ class ResearchTransport:
         model: str,
         thinking: bool,
         tools: list[dict[str, Any]] | None,
-        json_object: bool,
+        json_schema: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Serialize messages and add only the fields this profile documents."""
         profile = self.profile
@@ -152,8 +152,19 @@ class ResearchTransport:
 
         if tools:
             body["tools"] = tools
-        if json_object and profile.structured_output == "json_object":
-            body["response_format"] = {"type": "json_object"}
+        if json_schema is not None:
+            # Without this branch a json_schema provider received no
+            # ``response_format`` at all and the final decision was free text that
+            # merely tended to be JSON -- which is what ``ResearchValidationError``
+            # was recording after all of a run's calls had already been paid for.
+            if profile.structured_output == "json_schema":
+                declared: dict[str, Any] = {"name": "research_decision", "schema": json_schema}
+                if profile.strict_structured_output:
+                    declared["schema"] = strict_json_schema(json_schema)
+                    declared["strict"] = True
+                body["response_format"] = {"type": "json_schema", "json_schema": declared}
+            elif profile.structured_output == "json_object":
+                body["response_format"] = {"type": "json_object"}
         return body
 
     async def complete(
@@ -166,13 +177,13 @@ class ResearchTransport:
         record_call: RecordCall,
         check_budget: CheckBudget,
         tools: list[dict[str, Any]] | None = None,
-        json_object: bool = False,
+        json_schema: dict[str, Any] | None = None,
     ) -> AIMessage:
         profile = self.profile
         name = profile.name
         serializer = self.serializer(model)
         body = self.build_body(
-            messages, model=model, thinking=thinking, tools=tools, json_object=json_object
+            messages, model=model, thinking=thinking, tools=tools, json_schema=json_schema
         )
         for attempt in range(1, 3):
             await check_budget()
