@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
+import pytest
 import sqlalchemy as sa
 
 from stockbrain.broker.account_state import AccountStateService
@@ -38,7 +39,7 @@ from stockbrain.enums import (
     TimeHorizon,
 )
 from stockbrain.proposals.exits import ExitSweepService
-from stockbrain.proposals.service import ProposalService
+from stockbrain.proposals.service import GenerationResult, ProposalService
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES
 from stockbrain.risk.config import risk_config_from_settings
 from stockbrain.risk.exits import ExitSignal
@@ -647,3 +648,62 @@ async def test_an_exit_under_automatic_policy_is_still_notified(
         and job.payload["event"] == NotificationEvent.PROPOSAL_MANUAL.value
         for job in jobs
     )
+
+
+async def test_the_sweep_isolates_one_positions_failure(
+    clean_tables: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One position whose exit generation raises must not abort the tick.
+
+    The sweep evaluates every open position; an unexpected exception from
+    ``evaluate_exit`` or ``generate_exit`` for one holding has to be counted and
+    logged, and the remaining holdings still proposed.
+    """
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    listing = await _seed_listing(
+        database,
+        broker_ticker="MSFT_US_EQ",
+        market_symbol="MSFT",
+        name="Microsoft",
+    )
+    await _seed_executed_buy(database, broker_ticker="MSFT_US_EQ", listing=listing)
+    for broker_ticker in ("AAPL_US_EQ", "MSFT_US_EQ"):
+        await _seed_position(
+            database,
+            broker_ticker=broker_ticker,
+            average_price=Decimal("100"),
+            current_price=Decimal("88"),
+        )
+
+    resolved = ph.settings()
+    config = risk_config_from_settings(resolved)
+    proposals = ph.service_with(database, resolved, config=config)
+    sweep = ExitSweepService(database, resolved, proposals=proposals, config=config)
+
+    original = proposals.generate_exit
+
+    async def flaky(
+        broker_ticker: str,
+        signal: ExitSignal,
+        *,
+        now: dt.datetime | None = None,
+    ) -> GenerationResult:
+        if broker_ticker == "AAPL_US_EQ":
+            raise RuntimeError("boom")
+        return await original(broker_ticker, signal, now=now)
+
+    monkeypatch.setattr(proposals, "generate_exit", flaky)
+
+    counts = await sweep.sweep()
+
+    assert counts["failed"] == 1
+    assert counts["proposed"] == 1
+    async with database.session() as session:
+        proposed = (
+            await session.execute(
+                sa.select(TradeProposal).where(TradeProposal.side == OrderSide.SELL)
+            )
+        ).scalar_one()
+    assert proposed.broker_ticker == "MSFT_US_EQ"

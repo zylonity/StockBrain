@@ -79,6 +79,7 @@ class ExitSweepService:
                 "signalled": 0,
                 "proposed": 0,
                 "blocked": 0,
+                "failed": 0,
                 "deferred": 0,
             }
         )
@@ -138,21 +139,31 @@ class ExitSweepService:
 
         attempted = 0
         for observation in observations:
-            signal = evaluate_exit(observation, self._config, now=moment)
-            if signal is None:
-                continue
-            counts["signalled"] += 1
-            if attempted >= limit:
-                # The budget bounds how many exit proposals one tick generates,
-                # never which positions are looked at; the rest are re-signalled
-                # and attempted on the next tick.
-                counts["deferred"] += 1
-                continue
-            attempted += 1
-            result = await self._proposals.generate_exit(
-                observation.broker_ticker, signal, now=moment
-            )
-            counts["proposed" if result.created else "blocked"] += 1
+            try:
+                signal = evaluate_exit(observation, self._config, now=moment)
+                if signal is None:
+                    continue
+                counts["signalled"] += 1
+                if attempted >= limit:
+                    # The budget bounds how many exit proposals one tick generates,
+                    # never which positions are looked at; the rest are re-signalled
+                    # and attempted on the next tick.
+                    counts["deferred"] += 1
+                    continue
+                attempted += 1
+                result = await self._proposals.generate_exit(
+                    observation.broker_ticker, signal, now=moment
+                )
+                counts["proposed" if result.created else "blocked"] += 1
+            except Exception as exc:
+                # One holding's unexpected failure must not abort the tick: every
+                # other position still gets its decision.
+                log.warning(
+                    "exit_sweep_position_failed",
+                    broker_ticker=observation.broker_ticker,
+                    error_type=type(exc).__name__,
+                )
+                counts["failed"] += 1
 
         log.info("exit_sweep_complete", **dict(counts))
         return dict(counts)
