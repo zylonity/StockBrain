@@ -461,3 +461,9 @@ def test_the_exit_sweep_is_not_scheduled_by_default() -> None:
     """Enabling it is an explicit operator act, not a default."""
     settings = _settings()
     assert settings.exit_sweep_enabled is False
+
+
+def test_the_volatility_refresh_is_not_scheduled_by_default() -> None:
+    """Fetching a daily bar per position is opt-in, exactly like the sweep."""
+    settings = _settings()
+    assert settings.volatility_refresh_enabled is False

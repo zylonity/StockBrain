@@ -101,6 +101,8 @@ from stockbrain.llm.telemetry import LlmTelemetry
 from stockbrain.logging import get_logger
 from stockbrain.market_data.alpaca import AlpacaMarketDataClient
 from stockbrain.market_data.base import ProviderCapability
+from stockbrain.market_data.volatility import VolatilityRefreshService
+from stockbrain.market_data.yahoo import YahooDailyBars
 from stockbrain.observability.alerts import OperationalAlerts
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
@@ -170,6 +172,7 @@ class ServiceContainer:
     instrument_sync: InstrumentSyncService | None = field(default=None, init=False)
     proposals: ProposalService | None = field(default=None, init=False)
     exits: ExitSweepService | None = field(default=None, init=False)
+    volatility: VolatilityRefreshService | None = field(default=None, init=False)
     risk_config: RiskConfig = field(init=False)
     resolution: ResolutionService | None = field(default=None, init=False)
     market_data: AlpacaMarketDataClient | None = field(default=None, init=False)
@@ -255,8 +258,16 @@ class ServiceContainer:
                 proposals=self.proposals,
                 config=self.risk_config,
             )
+            self.volatility = VolatilityRefreshService(
+                self.database,
+                self.settings,
+                bars=YahooDailyBars(),
+                config=self.risk_config,
+                health=self.health,
+            )
         else:
             self.exits = None
+            self.volatility = None
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
@@ -822,6 +833,16 @@ class ServiceContainer:
                     jitter_ratio=0.1,
                 )
             )
+        if self.volatility is not None and self.settings.volatility_refresh_enabled:
+            scheduler.add(
+                ScheduledTask(
+                    name="volatility_refresh",
+                    interval_seconds=self.settings.volatility_refresh_interval_seconds,
+                    run=self._volatility_refresh,
+                    initial_delay_seconds=120.0,
+                    jitter_ratio=0.1,
+                )
+            )
         if self.execution is not None:
             # The scheduler only ever *enqueues*; the handler transmits. That
             # separation is what keeps a slow broker from delaying the cadence,
@@ -1179,6 +1200,10 @@ class ServiceContainer:
     async def _exit_sweep(self) -> None:
         if self.exits is not None:
             await self.exits.sweep()
+
+    async def _volatility_refresh(self) -> None:
+        if self.volatility is not None:
+            await self.volatility.refresh()
 
     async def _enqueue_pending_resolutions(self) -> None:
         """Sweep impacts whose resolution never ran.

@@ -131,6 +131,8 @@ class ExitSweepService:
                         current_price=position.current_price,
                         peak_price=peak.peak_price if peak is not None else None,
                         peak_observations=peak.observations if peak is not None else 0,
+                        atr=peak.atr if peak is not None else None,
+                        atr_as_of=peak.atr_as_of if peak is not None else None,
                         opened_at=origin.executed_at,
                         horizon=thesis.time_horizon,
                         thesis_superseded=await self._superseded(session, origin.thesis_id),
