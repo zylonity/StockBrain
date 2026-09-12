@@ -46,6 +46,7 @@ class ProviderName(StrEnum):
     LLM = "llm"
     ALPACA_NEWS = "alpaca_news"
     ALPACA_MARKET_DATA = "alpaca_market_data"
+    YAHOO_BARS = "yahoo_bars"
     BRAVE = "brave"
     EXA = "exa"
     FIRECRAWL = "firecrawl"

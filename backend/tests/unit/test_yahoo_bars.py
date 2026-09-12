@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import datetime as dt
+import sys
+import types
+from collections.abc import Iterator
 from decimal import Decimal
 
 import pytest
 
+from stockbrain.errors import ProviderResponseError
 from stockbrain.market_data.base import Bar
-from stockbrain.market_data.yahoo import YAHOO_SUFFIX_BY_EXCHANGE, average_true_range, yahoo_symbol
+from stockbrain.market_data.yahoo import (
+    YAHOO_SUFFIX_BY_EXCHANGE,
+    YahooDailyBars,
+    average_true_range,
+    yahoo_symbol,
+)
 
 
 @pytest.mark.parametrize(
@@ -81,3 +90,74 @@ def test_atr_uses_the_most_recent_bars_and_returns_a_decimal() -> None:
     atr = average_true_range(bars, period=14)
     assert isinstance(atr, Decimal)
     assert atr > Decimal("2") and atr < Decimal("4")  # 13 days of TR=2 and one of 20 → ~3.29
+
+
+class _Frame:
+    """The four columns the adapter is allowed to read, shaped like a DataFrame."""
+
+    def __init__(self, rows: list[tuple[dt.datetime, float, float, float, float, int]]) -> None:
+        self._rows = rows
+        self.empty = not rows
+
+    def itertuples(self) -> Iterator[types.SimpleNamespace]:
+        for ts, o, h, lo, c, v in self._rows:
+            yield types.SimpleNamespace(Index=ts, Open=o, High=h, Low=lo, Close=c, Volume=v)
+
+
+def _install_fake_yfinance(
+    monkeypatch: pytest.MonkeyPatch, *, frame: _Frame, currency: str
+) -> None:
+    class _Ticker:
+        def __init__(self, symbol: str) -> None:
+            self.symbol = symbol
+            self.fast_info = {"currency": currency}
+
+        def history(self, **kwargs: object) -> _Frame:
+            assert kwargs.get("interval") == "1d"
+            assert kwargs.get("auto_adjust") is False
+            return frame
+
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=_Ticker))
+
+
+async def test_bars_are_decimal_oldest_first_and_pence_is_reported_as_gbx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    t0 = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    frame = _Frame([(t0 + dt.timedelta(days=i), 100.0, 101.5, 99.25, 100.75, 10) for i in range(3)])
+    _install_fake_yfinance(monkeypatch, frame=frame, currency="GBp")
+
+    bars, currency = await YahooDailyBars().daily_bars("VOD.L", days=5)
+
+    assert currency == "GBX"
+    assert [bar.timestamp for bar in bars] == sorted(bar.timestamp for bar in bars)
+    assert bars[0].high == Decimal("101.5") and isinstance(bars[0].high, Decimal)
+    assert bars[0].symbol == "VOD.L"
+
+
+async def test_an_empty_frame_is_a_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_yfinance(monkeypatch, frame=_Frame([]), currency="USD")
+    with pytest.raises(ProviderResponseError, match="no daily bars"):
+        await YahooDailyBars().daily_bars("NOPE", days=5)
+
+
+async def test_a_missing_currency_is_a_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    t0 = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    frame = _Frame(
+        [(t0, 1.0, 1.0, 1.0, 1.0, 1), (t0 + dt.timedelta(days=1), 1.0, 1.0, 1.0, 1.0, 1)]
+    )
+    _install_fake_yfinance(monkeypatch, frame=frame, currency="")
+    with pytest.raises(ProviderResponseError, match="currency"):
+        await YahooDailyBars().daily_bars("X", days=5)
+
+
+async def test_any_yfinance_exception_becomes_a_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Broken:
+        def __init__(self, symbol: str) -> None:
+            raise RuntimeError("Yahoo reshaped the payload again")
+
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=_Broken))
+    with pytest.raises(ProviderResponseError, match="yfinance"):
+        await YahooDailyBars().daily_bars("X", days=5)

@@ -16,15 +16,21 @@ string.  Trading 212 encodes the venue as one lowercase letter before ``_EQ``
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from itertools import pairwise
+from typing import Any, Protocol
 
+from stockbrain.errors import ProviderError, ProviderResponseError
 from stockbrain.logging import get_logger
 from stockbrain.market_data.base import Bar
 
 __all__ = [
     "YAHOO_SUFFIX_BY_EXCHANGE",
+    "DailyBars",
+    "YahooDailyBars",
     "average_true_range",
     "yahoo_symbol",
 ]
@@ -96,3 +102,74 @@ def average_true_range(bars: Sequence[Bar], period: int) -> Decimal | None:
         )
     window = ranges[-period:]
     return sum(window, Decimal(0)) / Decimal(period)
+
+
+class DailyBars(Protocol):
+    """A source of daily OHLC for one symbol, oldest first, with its currency."""
+
+    async def daily_bars(self, symbol: str, *, days: int) -> tuple[Sequence[Bar], str]: ...
+
+
+#: Yahoo's spelling of pence.  Trading 212 says ``GBX``; both mean 1/100 GBP.
+_PENCE = "GBp"
+
+
+class YahooDailyBars:
+    """Daily bars from Yahoo via ``yfinance``, on a worker thread, built to fail.
+
+    ``yfinance`` is synchronous and does blocking network I/O; it runs under
+    :func:`asyncio.to_thread` with a hard timeout so a hung Yahoo endpoint cannot
+    stall the scheduler.  Only ``Open/High/Low/Close/Volume`` are read.
+    """
+
+    def __init__(self, *, timeout_seconds: float = 20.0) -> None:
+        self._timeout = timeout_seconds
+
+    def _fetch(self, symbol: str, days: int) -> tuple[list[Bar], str]:
+        import yfinance  # imported here so a broken Yahoo dependency cannot stop startup
+
+        ticker = yfinance.Ticker(symbol)
+        frame = ticker.history(period=f"{days}d", interval="1d", auto_adjust=False)
+        if frame is None or getattr(frame, "empty", True):
+            raise ProviderResponseError(f"yfinance: no daily bars for {symbol}")
+        info: Any = getattr(ticker, "fast_info", None) or {}
+        raw_currency = (
+            info.get("currency") if hasattr(info, "get") else getattr(info, "currency", None)
+        )
+        if not isinstance(raw_currency, str) or not raw_currency:
+            raise ProviderResponseError(f"yfinance: no currency reported for {symbol}")
+        currency = "GBX" if raw_currency == _PENCE else raw_currency.upper()
+
+        bars: list[Bar] = []
+        for row in frame.itertuples():
+            stamp = row.Index
+            if getattr(stamp, "tzinfo", None) is None:
+                stamp = stamp.replace(tzinfo=dt.UTC)
+            bars.append(
+                Bar(
+                    symbol=symbol,
+                    timestamp=stamp,
+                    open=Decimal(str(row.Open)),
+                    high=Decimal(str(row.High)),
+                    low=Decimal(str(row.Low)),
+                    close=Decimal(str(row.Close)),
+                    volume=int(row.Volume or 0),
+                    feed="yahoo",
+                )
+            )
+        bars.sort(key=lambda bar: bar.timestamp)
+        return bars, currency
+
+    async def daily_bars(self, symbol: str, *, days: int) -> tuple[Sequence[Bar], str]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._fetch, symbol, days), timeout=self._timeout
+            )
+        except ProviderError:
+            raise
+        except TimeoutError as exc:
+            raise ProviderResponseError(
+                f"yfinance: timed out after {self._timeout}s for {symbol}"
+            ) from exc
+        except Exception as exc:  # yfinance raises whatever Yahoo's payload makes it raise
+            raise ProviderResponseError(f"yfinance: {type(exc).__name__}: {exc}") from exc
