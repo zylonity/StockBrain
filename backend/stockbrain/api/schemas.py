@@ -1053,12 +1053,15 @@ class NotificationPreferencesRequest(ApiModel):
 class PositionExitResponse(ApiModel):
     """Where each exit rule would act for one open position.
 
-    Computed by the same predicates the rules fire on, so the floor shown and
-    the floor acted on cannot disagree.  ``managed`` is false when StockBrain has
-    no executed buy behind the position: ``reason`` then says why and every floor
-    is ``None`` -- a position never opened from a thesis has none to exit
-    against, and inventing a floor would put a rule's name on a decision it never
-    made.
+    Computed by the same predicates the rules fire on.  ``nearest_floor`` and
+    ``nearest_rule`` name the highest floor -- the first level a falling price
+    reaches -- and the rule that owns it.  When several floors are breached
+    within one tick the engine acts in its declared precedence, so that label
+    names the level, not necessarily the rule that fires.  ``managed`` is false
+    when StockBrain has no executed buy behind the position: ``reason`` then says
+    why and every floor is ``None`` -- a position never opened from a thesis has
+    none to exit against, and inventing a floor would put a rule's name on a
+    decision it never made.
     """
 
     managed: bool

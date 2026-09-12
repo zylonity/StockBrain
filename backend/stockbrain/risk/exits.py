@@ -92,9 +92,12 @@ class ExitFloors:
     """Where each exit rule would act for one open position.
 
     ``nearest_floor`` and ``nearest_rule`` answer "which price matters first?":
-    the highest of the non-``None`` floors, so the operator sees the barrier the
-    position would meet soonest.  A time -- the horizon -- is not a price and
-    never competes here.
+    the highest of the non-``None`` floors, the first level a falling price
+    reaches, named by the rule that owns it.  If several floors are breached
+    within one tick the engine still acts in its declared precedence
+    (``EXIT_PRECEDENCE``), so the label names the level, not necessarily the
+    rule that fires.  A time -- the horizon -- is not a price and never competes
+    here.
     """
 
     hard_stop: Decimal
@@ -332,9 +335,12 @@ def exit_floors(
     """Every floor an exit rule would act on, computed from the same predicates.
 
     Read-only and deterministic: no broker, no database, no clock of its own.
-    ``nearest_floor`` is the highest of the price floors -- the one the position
-    would meet first -- and ``nearest_rule`` names the rule that owns it.  The
-    horizon is a time, so it is reported but never competes for nearest.
+    ``nearest_floor`` is the highest of the price floors -- the first level a
+    falling price reaches -- and ``nearest_rule`` names the rule that owns it.
+    When several floors are breached within one tick the engine acts in its
+    declared precedence (``EXIT_PRECEDENCE``), so the label names the level, not
+    necessarily the rule that fires.  The horizon is a time, so it is reported
+    but never competes for nearest.
 
     ``None`` when the observation is unusable in the same way ``evaluate_exit``
     refuses it: a non-positive cost basis or current price has no meaningful

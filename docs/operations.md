@@ -744,14 +744,16 @@ curl -s localhost:8080/api/v1/proposals/<proposal_id>/risk | python3 -m json.too
 ```
 
 **Reading the floors.** The same rules are visible before they fire, and from
-the same computation, so a displayed floor and a fired rule cannot disagree.
-`GET /api/v1/portfolio` carries an `exit` field on every open position — null
-only when the exit service is unavailable — and the Portfolio page renders it in
-two columns. **Nearest exit** is the highest floor —
-the one a fall would reach first — with the rule that owns it (`119.00 ·
-volatility`). **Floors** stacks every floor: `stop`, `vol`, `trail`, `target`
-and the horizon timestamp, with `-` for a rule that is not armed. Telegram's
-`/positions` prints the same set on one `exit:` line, ending `(nearest: …)`.
+the same computation. **Nearest exit** is the highest floor — the first level a
+falling price reaches — with the rule that owns it (`119.00 · volatility`). That
+label names the level, not necessarily the rule that fires: when several floors
+are breached within one tick the engine acts in its declared precedence, so a
+lower floor can be the one that triggers the exit. `GET /api/v1/portfolio`
+carries an `exit` field on every open position — null only when the exit service
+is unavailable — and the Portfolio page renders it in two columns. **Floors**
+stacks every floor: `stop`, `vol`, `trail`, `target` and the horizon timestamp,
+with `-` for a rule that is not armed. Telegram's `/positions` prints the same
+set on one `exit:` line, ending `(nearest: …)`.
 
 A position StockBrain never bought has no floors to read: both surfaces say
 `not managed` with the reason. One the risk layer could not price says

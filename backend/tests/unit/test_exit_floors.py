@@ -2,8 +2,11 @@
 
 ``exit_floors`` exists so an operator can see, for each open position, where the
 hard stop, the volatility floor, the trailing floor and the ROI target sit --
-computed from the very arming conditions ``evaluate_exit`` uses, so the floors
-shown and the rules that fire can never disagree.
+computed from the very arming conditions ``evaluate_exit`` uses.  The nearest
+floor is the first level a falling price reaches, named by the rule that owns
+it.  If several floors are breached within one tick the engine still acts in its
+declared precedence (``EXIT_PRECEDENCE``), so the label names the level, not
+necessarily the rule that fires.
 """
 
 from __future__ import annotations
@@ -72,17 +75,50 @@ def test_the_roi_target_price_follows_the_decay_table() -> None:
     assert late.roi_target_price is None  # past the terminal row
 
 
-def test_floors_agree_with_the_rule_that_would_fire() -> None:
+def test_the_nearest_floor_is_the_volatility_floor_when_it_sits_highest() -> None:
+    """With the price between the two armed floors, only the higher one is breached.
+
+    peak 125, ATR 1 gives a volatility floor at 122 and a trailing floor at
+    118.75; at 120 the engine fires ``volatility_stop`` and the nearest label
+    names the same level.
+    """
     obs = observe(
-        current_price=Decimal("118"),
+        current_price=Decimal("120"),
         peak_price=Decimal("125"),
-        atr=Decimal("2"),
+        atr=Decimal("1"),
         atr_as_of=NOW.date(),
     )
     f = exit_floors(obs, h.config(), now=NOW)
     signal = evaluate_exit(obs, h.config(), now=NOW)
     assert f is not None
-    assert signal is not None and signal.rule_id == f.nearest_rule
+    assert f.volatility_floor == Decimal("122")
+    assert f.trailing_floor == Decimal("118.75")
+    assert signal is not None
+    assert signal.rule_id == "volatility_stop" == f.nearest_rule
+
+
+def test_the_nearest_floor_is_the_trailing_floor_when_it_sits_highest() -> None:
+    """The nearest label names the level, not necessarily the rule that fires.
+
+    peak 125, ATR 4 gives a volatility floor at 113 and a trailing floor at
+    118.75; at 116 the volatility floor is untouched and the engine fires
+    ``trailing_stop``, the rule the nearest label names.  Had the price been
+    under both, ``EXIT_PRECEDENCE`` would fire ``volatility_stop`` while the
+    label still named the higher trailing level.
+    """
+    obs = observe(
+        current_price=Decimal("116"),
+        peak_price=Decimal("125"),
+        atr=Decimal("4"),
+        atr_as_of=NOW.date(),
+    )
+    f = exit_floors(obs, h.config(), now=NOW)
+    signal = evaluate_exit(obs, h.config(), now=NOW)
+    assert f is not None
+    assert f.volatility_floor == Decimal("113")
+    assert f.trailing_floor == Decimal("118.75")
+    assert f.nearest_rule == "trailing_stop"
+    assert signal is not None and signal.rule_id == "trailing_stop"
 
 
 @pytest.mark.parametrize(
