@@ -124,3 +124,38 @@ async def test_a_terminal_block_announces_blocked_and_not_deferred(
             ).scalars()
         )
     assert [job.payload["pipeline_event"] for job in jobs] == ["PROPOSAL_BLOCKED"]
+
+
+SATURDAY = dt.datetime(2026, 9, 12, 12, 0, tzinfo=dt.UTC)  # CLOSED
+MONDAY_OPEN = dt.datetime(2026, 9, 14, 15, 0, tzinfo=dt.UTC)  # 11:00 ET, REGULAR
+
+
+async def test_a_session_blocked_deferral_waits_for_the_open(clean_tables: Database) -> None:
+    """Blocked by the market session: no retry while the market is closed."""
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.9)
+    await ph.fund(clean_tables)
+    service = ph.service(
+        clean_tables,
+        market_data=ph.StubMarketData(),
+        risk_allowed_sessions="REGULAR",
+        risk_require_known_session=True,
+    )
+    await service.generate(ph.THESIS_ID, now=SATURDAY)
+    async with clean_tables.transaction() as session:
+        await session.execute(
+            sa.update(RiskEvaluation).values(created_at=SATURDAY - dt.timedelta(minutes=31))
+        )
+    assert await service.enqueue_pending(now=SATURDAY) == 0
+    assert await service.enqueue_pending(now=MONDAY_OPEN) == 1
+
+
+async def test_a_quote_blocked_deferral_keeps_the_ttl_cadence(clean_tables: Database) -> None:
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.9)
+    await ph.fund(clean_tables)
+    service = ph.service(clean_tables, market_data=ph.StubMarketData(age_ms=60_000))  # stale only
+    await service.generate(ph.THESIS_ID)
+    async with clean_tables.transaction() as session:
+        await session.execute(
+            sa.update(RiskEvaluation).values(created_at=SATURDAY - dt.timedelta(minutes=31))
+        )
+    assert await service.enqueue_pending(now=SATURDAY) == 1

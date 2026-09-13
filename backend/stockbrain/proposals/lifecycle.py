@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from stockbrain.db.base import utcnow
+from stockbrain.db.base import JSONDict, utcnow
 from stockbrain.db.models.companies import BrokerInstrument
 from stockbrain.db.models.proposals import ApprovalAction, RiskEvaluation, TradeProposal
 from stockbrain.db.models.research import ResearchRun, Thesis
@@ -24,6 +24,7 @@ from stockbrain.enums import (
     ActorType,
     AuthorizationSource,
     JobType,
+    MarketSession,
     NotificationEvent,
     OrderSide,
     ProposalStatus,
@@ -33,6 +34,7 @@ from stockbrain.errors import ProposalAlreadyConsumed
 from stockbrain.fx.base import normalize_currency
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
+from stockbrain.market_data.sessions import session_from_us_clock
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES, assert_transition, can_transition
 from stockbrain.risk.models import ZERO, FxSnapshot
 
@@ -67,6 +69,19 @@ async def thesis_is_superseded(session: AsyncSession, thesis_id: uuid.UUID) -> b
         )
     )
     return bool(count)
+
+
+def _blocked_by_market_session(rules: Sequence[JSONDict]) -> bool:
+    """Whether the market session was one of the rules that refused a run.
+
+    A deferral caused by the session is special: the answer cannot change until
+    the market reopens, so re-asking on every TTL tick is a free quote and a
+    risk_evaluations row for the same refusal, over and over.  The rules JSON is
+    the durable record of *why* -- no extra column is needed to find it.
+    """
+    return any(
+        rule.get("rule_id") == "market_session" and rule.get("outcome") == "BLOCK" for rule in rules
+    )
 
 
 class ProposalLifecycle:
@@ -395,7 +410,7 @@ class ProposalLifecycle:
     # ------------------------------------------------------------------
     # Enqueueing
     # ------------------------------------------------------------------
-    async def enqueue_pending(self, limit: int = 25) -> int:
+    async def enqueue_pending(self, limit: int = 25, *, now: dt.datetime | None = None) -> int:
         """Queue proposal generation for every published thesis without one.
 
         Restart-safe by construction: the backlog is derived from the database,
@@ -405,14 +420,19 @@ class ProposalLifecycle:
         A *deferred* generation refusal is not a terminal answer, so it is
         retried -- but at most once per ``proposal_ttl_minutes``, so a shut market
         produces one attempt per tick-window rather than one per scheduler tick.
-        A *terminal* refusal is never retried; asking the same rules the same
-        question forever is how a backlog becomes a loop.
+        The exception is a deferral caused by the market session itself: the
+        answer cannot change while the market is closed, so it waits for the next
+        regular open instead of re-asking every TTL.  A *terminal* refusal is
+        never retried; asking the same rules the same question forever is how a
+        backlog becomes a loop.
         """
         if blockers := await self._service.control_blockers():
             log.debug("proposal_backlog_skipped", blockers=blockers)
             return 0
-        now = utcnow()
+        moment = now or utcnow()
+        regular_session = session_from_us_clock(moment).session is MarketSession.REGULAR
         enqueued = 0
+        waiting = 0
         async with self._service.database.transaction() as session:
             thesis_ids = list(
                 (
@@ -441,7 +461,7 @@ class ProposalLifecycle:
                                     RiskEvaluation.policy_version == self._service.config.version,
                                     RiskEvaluation.deferred.is_(True),
                                     RiskEvaluation.created_at
-                                    > now
+                                    > moment
                                     - dt.timedelta(
                                         minutes=self._service.config.proposal_ttl_minutes
                                     ),
@@ -454,6 +474,26 @@ class ProposalLifecycle:
                 ).scalars()
             )
             for thesis_id in thesis_ids:
+                latest_rules = (
+                    await session.execute(
+                        sa.select(RiskEvaluation.rules)
+                        .where(
+                            RiskEvaluation.thesis_id == thesis_id,
+                            RiskEvaluation.stage == STAGE_GENERATION,
+                            RiskEvaluation.policy_version == self._service.config.version,
+                            RiskEvaluation.deferred.is_(True),
+                        )
+                        .order_by(RiskEvaluation.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if (
+                    latest_rules is not None
+                    and _blocked_by_market_session(latest_rules)
+                    and not regular_session
+                ):
+                    waiting += 1
+                    continue
                 job_id = await self._queue.enqueue(
                     session,
                     JobType.GENERATE_PROPOSAL,
@@ -463,6 +503,8 @@ class ProposalLifecycle:
                 )
                 if job_id is not None:
                     enqueued += 1
+        if waiting:
+            log.info("proposal_deferrals_waiting_for_open", count=waiting)
         if enqueued:
             log.info("proposal_generation_enqueued", count=enqueued)
         return enqueued

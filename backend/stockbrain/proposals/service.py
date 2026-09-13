@@ -1067,8 +1067,8 @@ class ProposalService:
     async def sweep(self, *, now: dt.datetime | None = None) -> dict[str, int]:
         return await self.lifecycle.sweep(now=now)
 
-    async def enqueue_pending(self, limit: int = 25) -> int:
-        return await self.lifecycle.enqueue_pending(limit)
+    async def enqueue_pending(self, limit: int = 25, *, now: dt.datetime | None = None) -> int:
+        return await self.lifecycle.enqueue_pending(limit, now=now)
 
     async def enqueue_for_run(self, run_id: uuid.UUID) -> int:
         return await self.lifecycle.enqueue_for_run(run_id)
