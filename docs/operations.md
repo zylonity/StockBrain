@@ -1139,3 +1139,32 @@ another. If score distributions differ materially between backends, that is a
 finding to investigate — not a reason to retune
 `CLASSIFIER_MIN_IMPORTANCE`, `CLASSIFIER_MIN_CONFIDENCE` or
 `CLASSIFIER_MIN_MATERIALITY`, which are unchanged by provider choice.
+
+## Development outside Docker
+
+The compose stack is the supported way to run StockBrain. For iterating on the
+backend or frontend directly, run the API against the compose database with the
+frontend dev server proxying to it. The dev overlay (`compose.dev.yaml`)
+publishes PostgreSQL on `127.0.0.1:5432` so local tooling can reach it; do not
+use that overlay on TrueNAS.
+
+```bash
+# one-time backend environment
+cd backend
+uv venv --python 3.12
+uv pip sync requirements-dev.txt
+uv pip install --no-deps -e .
+
+# terminal 1 — the API
+cd backend
+DATABASE_URL='postgresql+asyncpg://stockbrain:<password>@127.0.0.1:5432/stockbrain' \
+  LOG_FORMAT=console .venv/bin/python -m stockbrain.main
+
+# terminal 2 — the web app, proxying /api to :8080
+cd frontend && npm run dev     # http://localhost:5173
+```
+
+Migrations: `make revision m="describe the change"` autogenerates one against
+the test database; review it before committing — autogenerate does not know
+which of its guesses are intended. `make migrate` applies the head to the
+running container's database.
