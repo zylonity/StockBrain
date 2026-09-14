@@ -536,7 +536,7 @@ class ExecutionService:
             # number it publishes nowhere.  Learn it on the instrument, release
             # the failed proposal's dedupe key and let the thesis generate a
             # *new* proposal -- never a re-send of the rejected attempt.
-            precision = _quantity_precision_from(exc)
+            precision = _quantity_precision_from(exc, ticker=proposal.broker_ticker)
             retry_run_id: uuid.UUID | None = None
             if precision is not None and proposal.broker_instrument_id is not None:
                 stored = await session.scalar(
@@ -1202,22 +1202,39 @@ def _safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _quantity_precision_from(exc: BrokerRejection) -> int | None:
+#: The largest quantity precision the sizer can quantize to: the ``0..8`` bound
+#: ``RISK_DEFAULT_QUANTITY_PRECISION`` enforces.  Anything larger makes
+#: ``Decimal.quantize`` raise, so it must never be stored on an instrument.
+_MAX_LEARNABLE_QUANTITY_PRECISION = 8
+
+
+def _quantity_precision_from(exc: BrokerRejection, *, ticker: str | None) -> int | None:
     """The decimal places a ``quantity-precision-mismatch`` refusal demands.
 
     Trading 212 publishes no precision and its metadata carries none, so the
     broker's own sentence is the only source.  ``None`` for every other refusal,
-    so an unrelated 400 is never read as a precision to learn.
+    so an unrelated 400 is never read as a precision to learn, and ``None`` for
+    a sentence the sizer could not use: ``quantize`` to more places than the
+    decimal context holds raises, which would crash the regeneration the
+    rejection queues.  The bounded range matches the ``RISK_DEFAULT_QUANTITY_PRECISION``
+    setting (0..8); an out-of-range or unparsable N is logged and not learned.
     """
     payload_type = exc.payload.get("type") if exc.payload else None
     if not isinstance(payload_type, str) or not payload_type.endswith(
         "quantity-precision-mismatch"
     ):
         return None
-    if not exc.detail:
+    detail = exc.detail
+    match = re.search(r"precision (\d+)", detail) if detail else None
+    precision = int(match.group(1)) if match else None
+    if precision is None or not 0 <= precision <= _MAX_LEARNABLE_QUANTITY_PRECISION:
+        log.warning(
+            "quantity_precision_unparsed",
+            ticker=ticker,
+            detail=detail,
+        )
         return None
-    match = re.search(r"precision (\d+)", exc.detail)
-    return int(match.group(1)) if match else None
+    return precision
 
 
 def _ambiguous_category(exc: AmbiguousTransportFailure) -> ExecutionFailure:

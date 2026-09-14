@@ -838,6 +838,90 @@ async def test_a_precision_rejection_teaches_the_instrument_and_retries_once(
     assert job_count == 0
 
 
+async def test_an_out_of_range_precision_is_not_learned(
+    clean_tables: Database,
+) -> None:
+    """A ``precision 30`` refusal must not be stored: the sizer cannot use it.
+
+    ``Decimal.quantize`` to more places than the decimal context holds raises,
+    which would crash the very regeneration the rejection queues.  The refusal
+    is still recorded, but nothing is learned, the dedupe key is kept and
+    nothing is re-queued.
+    """
+    settings = execution_settings()
+    provider = FakeProvider(_environment="demo", error=_precision_rejection(30))
+    _, execution, _, proposal_id = await authorized(clean_tables, settings, provider=provider)
+
+    result = await execution.execute(proposal_id)
+
+    assert result.outcome is ExecutionOutcome.REJECTED_BY_BROKER
+    async with clean_tables.session() as session:
+        instrument = await session.get(BrokerInstrument, helpers.INSTRUMENT_ID)
+        proposal = await session.get(TradeProposal, proposal_id)
+        job_count = await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(Job)
+            .where(Job.job_type == JobType.GENERATE_PROPOSAL.value)
+        )
+    assert instrument is not None
+    assert instrument.quantity_precision is None
+    assert proposal is not None
+    assert proposal.status is ProposalStatus.FAILED
+    assert proposal.dedupe_key is not None
+    assert proposal.status_reason == "the broker refused the order (HTTP 400)"
+    assert job_count == 0
+
+
+async def test_a_zero_precision_is_learned_and_sizes_whole_shares(
+    clean_tables: Database,
+) -> None:
+    """``precision 0`` is a real, usable answer: whole shares, no crash.
+
+    Fractional sizing is enabled, so the learned precision is what makes the
+    regenerated proposal whole.  The stored value is 0, and ``scaleb(0)`` makes
+    the retry's quantity a whole number of shares.
+    """
+    settings = execution_settings(risk_allow_fractional_quantity=True)
+    provider = FakeProvider(_environment="demo", error=_precision_rejection(0))
+    proposals, execution, _, proposal_id = await authorized(
+        clean_tables, settings, provider=provider
+    )
+
+    result = await execution.execute(proposal_id)
+
+    assert result.outcome is ExecutionOutcome.REJECTED_BY_BROKER
+    async with clean_tables.session() as session:
+        instrument = await session.get(BrokerInstrument, helpers.INSTRUMENT_ID)
+        proposal = await session.get(TradeProposal, proposal_id)
+        jobs = list(
+            (
+                await session.execute(
+                    sa.select(Job).where(Job.job_type == JobType.GENERATE_PROPOSAL.value)
+                )
+            ).scalars()
+        )
+    assert instrument is not None
+    assert instrument.quantity_precision == 0
+    assert proposal is not None
+    assert proposal.dedupe_key is None
+    assert proposal.status_reason == "the broker requires 0 decimal places on quantity; re-sizing"
+    assert len(jobs) == 1
+
+    # Let the queued retry be claimed and run: the fresh proposal is sized to
+    # the learned 0, so its quantity is a whole number of shares.
+    async with clean_tables.transaction() as session:
+        for job in jobs:
+            await session.delete(job)
+
+    regenerated = await proposals.generate(helpers.THESIS_ID)
+    assert regenerated.proposal_id is not None, regenerated.reason
+    async with clean_tables.session() as session:
+        retry_proposal = await session.get(TradeProposal, regenerated.proposal_id)
+    assert retry_proposal is not None
+    # The column stores a fixed scale, so "whole" is value, not exponent.
+    assert retry_proposal.proposed_quantity == retry_proposal.proposed_quantity.to_integral_value()
+
+
 async def test_a_proven_pre_send_failure_retracts_the_flag_and_re_arms(
     clean_tables: Database,
 ) -> None:
