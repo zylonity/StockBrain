@@ -59,7 +59,10 @@ ACTION_SIDES: dict[ThesisAction, OrderSide | None] = {
     ThesisAction.NO_ACTION: None,
 }
 
-_QUANTITY_EXPONENT = Decimal("0.00000001")
+#: Trading 212 accepts at most 4 decimal places on a quantity; anything finer is
+#: refused with ``api-errors/quantity-precision-mismatch``.  Quantities round
+#: *down* to this step.
+_QUANTITY_EXPONENT = Decimal("0.0001")
 
 
 def size_trade(

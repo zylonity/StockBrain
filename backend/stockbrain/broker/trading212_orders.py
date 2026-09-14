@@ -325,10 +325,24 @@ class Trading212OrderClient:
         status = response.status_code
 
         if status in _DEFINITE_REJECTION_STATUSES:
+            # The refusal's own account of itself.  A provider-controlled body,
+            # so it is parsed defensively and never carries a request header.
+            try:
+                payload: Any = response.json()
+            except ValueError:
+                payload = None
+            detail: str | None = None
+            if isinstance(payload, dict):
+                detail = payload.get("detail") or payload.get("title")
+            else:
+                payload = None
+            detail = detail or (response.text[:200] or None)
             raise BrokerRejection(
                 f"trading212: the broker refused the order (HTTP {status})",
                 status=status,
                 category=_DEFINITE_REJECTION_STATUSES[status].value,
+                detail=detail,
+                payload=payload,
             )
         if not response.is_success:
             category = _AMBIGUOUS_STATUSES.get(status, ExecutionFailure.UNEXPECTED_STATUS)

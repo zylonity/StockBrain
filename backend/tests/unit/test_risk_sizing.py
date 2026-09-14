@@ -100,6 +100,19 @@ def test_fractional_sizing_is_available_but_off_by_default() -> None:
     assert fractional.quantity * Decimal("200.05") <= Decimal("1000")
 
 
+def test_fractional_quantities_are_rounded_down_to_four_decimals() -> None:
+    """Trading 212 rejects finer quantities: api-errors/quantity-precision-mismatch."""
+    result = size(
+        config=h.config(allow_fractional_quantity=True), max_notional=Decimal("278.71404")
+    )
+    # The helper quote is bid 199.95 / ask 200.05 and a BUY lifts the ask, so the
+    # true quantity is 278.71404 / 200.05 = 1.3932218... -> 1.3932 rounded down.
+    assert result.quantity == Decimal("1.3932")
+    exponent = result.quantity.as_tuple().exponent
+    assert isinstance(exponent, int)
+    assert exponent >= -4
+
+
 def test_a_target_smaller_than_one_share_is_not_a_trade() -> None:
     result = size(max_notional=Decimal("150"))
     assert result.quantity == 0

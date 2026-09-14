@@ -7,6 +7,8 @@ decides whether an order may be retried.  See
 
 from __future__ import annotations
 
+from typing import Any
+
 __all__ = [
     "AccountStateUnavailable",
     "AmbiguousTransportFailure",
@@ -217,12 +219,25 @@ class BrokerRejection(BrokerError):
     from :class:`AmbiguousTransportFailure` (nobody knows).  A complete HTTP
     response is proof that the broker decided, which is what makes this the one
     failure the system may act on without reconciling first.
+
+    ``detail`` and ``payload`` carry the broker's own account of the refusal --
+    the sentence a human needs to fix it -- and never any request header.
     """
 
-    def __init__(self, message: str, *, status: int, category: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        category: str,
+        detail: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.category = category
+        self.detail = detail
+        self.payload = payload
 
 
 class DefinitePreSendFailure(BrokerError):

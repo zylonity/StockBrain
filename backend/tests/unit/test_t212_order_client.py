@@ -199,6 +199,45 @@ async def test_a_documented_refusal_is_definite(status: int, category: Execution
     assert excinfo.value.category == category.value
 
 
+#: The demo API's refusal for a quantity with more than 4 decimal places,
+#: captured verbatim today.  The reason has to survive the client.
+QUANTITY_PRECISION_BODY = {
+    "type": "/api-errors/quantity-precision-mismatch",
+    "title": "Error while placing the order",
+    "status": 400,
+    "detail": "invalid quantity precision 4",
+    "traceId": "0af7651916cd43dd8448eb211c80319c",
+}
+
+
+async def test_a_rejection_carries_the_brokers_reason() -> None:
+    """HTTP 400 was already definitive; now it also says *why*."""
+    client = client_for(lambda request: httpx.Response(400, json=QUANTITY_PRECISION_BODY))
+    with pytest.raises(BrokerRejection) as excinfo:
+        await submit(client)
+    await client.aclose()
+    assert excinfo.value.status == 400
+    assert excinfo.value.detail == "invalid quantity precision 4"
+    assert excinfo.value.payload is not None
+    assert excinfo.value.payload["type"].endswith("quantity-precision-mismatch")
+
+
+async def test_a_rejection_falls_back_to_the_title_then_the_raw_text() -> None:
+    """A body that is not the documented shape must still yield something useful."""
+    titled = client_for(lambda request: httpx.Response(400, json={"title": "Error while placing"}))
+    with pytest.raises(BrokerRejection) as excinfo:
+        await submit(titled)
+    await titled.aclose()
+    assert excinfo.value.detail == "Error while placing"
+
+    raw = client_for(lambda request: httpx.Response(400, text="<html>bad request</html>"))
+    with pytest.raises(BrokerRejection) as excinfo:
+        await submit(raw)
+    await raw.aclose()
+    assert excinfo.value.detail == "<html>bad request</html>"
+    assert excinfo.value.payload is None
+
+
 # ---------------------------------------------------------------------------
 # Ambiguity: a response that says nothing about the order
 # ---------------------------------------------------------------------------

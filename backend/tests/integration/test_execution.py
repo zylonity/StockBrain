@@ -20,7 +20,7 @@ from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.portfolio import BrokerOrder
 from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
-from stockbrain.db.models.system import AuditLog
+from stockbrain.db.models.system import AuditLog, Job
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     AuthorizationSource,
@@ -28,6 +28,7 @@ from stockbrain.enums import (
     ExecutionOutcome,
     ExecutionPolicy,
     JobType,
+    NotificationEvent,
     OrderSide,
     ProposalStatus,
     ThesisAction,
@@ -692,6 +693,65 @@ async def test_a_broker_rejection_fails_the_proposal_definitively(
     assert attempt.error_category == "BROKER_REJECTED"
     assert attempt.ambiguous is False
     assert attempt.sent_to_broker is True
+
+
+async def test_a_recorded_rejection_keeps_the_brokers_reason(
+    clean_tables: Database,
+) -> None:
+    """The broker's sentence survives into the attempt, the audit log and the alert.
+
+    Two demo BUY orders were refused with ``api-errors/quantity-precision-mismatch``
+    and the record said only "the broker refused the order".  The reason is the
+    difference between a silent failure and a fixable one.
+    """
+    settings = execution_settings()
+    payload = {
+        "type": "/api-errors/quantity-precision-mismatch",
+        "title": "Error while placing the order",
+        "status": 400,
+        "detail": "invalid quantity precision 4",
+        "traceId": "0af7651916cd43dd8448eb211c80319c",
+        "apiKey": "must-never-be-stored",
+    }
+    provider = FakeProvider(
+        _environment="demo",
+        error=BrokerRejection(
+            "trading212: the broker refused the order (HTTP 400)",
+            status=400,
+            category="BROKER_REJECTED",
+            detail="invalid quantity precision 4",
+            payload=payload,
+        ),
+    )
+    _, execution, _, proposal_id = await authorized(clean_tables, settings, provider=provider)
+
+    result = await execution.execute(proposal_id)
+
+    assert result.outcome is ExecutionOutcome.REJECTED_BY_BROKER
+    attempt = (await attempts_of(clean_tables, proposal_id))[0]
+    assert attempt.error is not None
+    assert "invalid quantity precision 4" in attempt.error
+    assert attempt.response_payload is not None
+    assert attempt.response_payload["type"].endswith("quantity-precision-mismatch")
+    # A provider-controlled body is still redacted before it is stored.
+    assert "apiKey" not in attempt.response_payload
+
+    async with clean_tables.session() as session:
+        entry = (
+            await session.execute(
+                sa.select(AuditLog).where(AuditLog.action == "execution.rejected")
+            )
+        ).scalar_one()
+        job = (
+            await session.execute(
+                sa.select(Job).where(
+                    Job.dedupe_key
+                    == f"notify:{proposal_id}:{NotificationEvent.EXECUTION_REJECTED.value}"
+                )
+            )
+        ).scalar_one()
+    assert entry.details["detail"] == "invalid quantity precision 4"
+    assert "invalid quantity precision 4" in job.payload["detail"]
 
 
 async def test_a_proven_pre_send_failure_retracts_the_flag_and_re_arms(

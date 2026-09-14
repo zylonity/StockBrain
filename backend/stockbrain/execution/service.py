@@ -491,14 +491,25 @@ class ExecutionService:
             attempt.outcome = ExecutionOutcome.REJECTED_BY_BROKER
             attempt.ambiguous = False
             attempt.http_status = exc.status
-            attempt.error = str(exc)[:1000]
+            error = str(exc)
+            if exc.detail:
+                error = f"{error} — {exc.detail}"
+            attempt.error = error[:1000]
             attempt.error_category = exc.category
+            if exc.payload is not None:
+                attempt.response_payload = _safe_payload(exc.payload)
             attempt.completed_at = now
 
             assert_transition(proposal.status, ProposalStatus.FAILED)
             proposal.status = ProposalStatus.FAILED
             proposal.status_reason = f"the broker refused the order (HTTP {exc.status})"
             proposal.updated_at = now
+            audit_details: dict[str, Any] = {
+                "http_status": exc.status,
+                "category": exc.category,
+            }
+            if exc.detail:
+                audit_details["detail"] = exc.detail
             session.add(
                 AuditLog(
                     actor_type=ActorType.BROKER,
@@ -506,14 +517,17 @@ class ExecutionService:
                     action="execution.rejected",
                     entity_type="trade_proposal",
                     entity_id=proposal_id,
-                    details={"http_status": exc.status, "category": exc.category},
+                    details=audit_details,
                 )
             )
+            notification_detail = f"HTTP {exc.status} ({exc.category})"
+            if exc.detail:
+                notification_detail = f"{notification_detail} — {exc.detail}"
             await self.proposals.enqueue_notification(
                 session,
                 proposal_id,
                 NotificationEvent.EXECUTION_REJECTED,
-                detail=f"HTTP {exc.status} ({exc.category})",
+                detail=notification_detail,
             )
 
         METRICS.inc("stockbrain_execution_attempts_total", labels={"outcome": "REJECTED_BY_BROKER"})
