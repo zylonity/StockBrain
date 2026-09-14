@@ -18,6 +18,7 @@ import sqlalchemy as sa
 
 from stockbrain.control.state import ControlStateService
 from stockbrain.db.base import utcnow
+from stockbrain.db.models.companies import BrokerInstrument
 from stockbrain.db.models.portfolio import BrokerOrder
 from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
 from stockbrain.db.models.system import AuditLog, Job
@@ -752,6 +753,89 @@ async def test_a_recorded_rejection_keeps_the_brokers_reason(
         ).scalar_one()
     assert entry.details["detail"] == "invalid quantity precision 4"
     assert "invalid quantity precision 4" in job.payload["detail"]
+
+
+def _precision_rejection(precision: int) -> BrokerRejection:
+    detail = f"invalid quantity precision {precision}"
+    return BrokerRejection(
+        "trading212: the broker refused the order (HTTP 400)",
+        status=400,
+        category="BROKER_REJECTED",
+        detail=detail,
+        payload={
+            "type": "/api-errors/quantity-precision-mismatch",
+            "detail": detail,
+            "status": 400,
+        },
+    )
+
+
+async def test_a_precision_rejection_teaches_the_instrument_and_retries_once(
+    clean_tables: Database,
+) -> None:
+    """A per-instrument precision is learned from the broker's own refusal.
+
+    The broker publishes no precision anywhere; a GSK order rejected with
+    "invalid quantity precision 3" is the only place the number exists.  The
+    rejection stores it on the instrument, releases the failed proposal's dedupe
+    key and queues one fresh generation -- a brand-new proposal that re-prices
+    and re-validates, never a re-send of the rejected attempt.
+    """
+    settings = execution_settings()
+    provider = FakeProvider(_environment="demo", error=_precision_rejection(3))
+    proposals, execution, _, proposal_id = await authorized(
+        clean_tables, settings, provider=provider
+    )
+
+    result = await execution.execute(proposal_id)
+
+    assert result.outcome is ExecutionOutcome.REJECTED_BY_BROKER
+    async with clean_tables.session() as session:
+        instrument = await session.get(BrokerInstrument, helpers.INSTRUMENT_ID)
+        proposal = await session.get(TradeProposal, proposal_id)
+        jobs = list(
+            (
+                await session.execute(
+                    sa.select(Job).where(Job.job_type == JobType.GENERATE_PROPOSAL.value)
+                )
+            ).scalars()
+        )
+    assert instrument is not None
+    assert instrument.quantity_precision == 3
+    assert proposal is not None
+    assert proposal.status is ProposalStatus.FAILED
+    assert proposal.dedupe_key is None
+    assert proposal.status_reason == "the broker requires 3 decimal places on quantity; re-sizing"
+    assert len(jobs) == 1
+    assert jobs[0].payload["thesis_id"] == str(helpers.THESIS_ID)
+
+    # Let the queued retry be claimed and run, then reject the regenerated
+    # proposal with the same N: there is nothing left to learn, so nothing is
+    # re-queued and the stored precision is untouched.
+    async with clean_tables.transaction() as session:
+        for job in jobs:
+            await session.delete(job)
+
+    regenerated = await proposals.generate(helpers.THESIS_ID)
+    assert regenerated.proposal_id is not None, regenerated.reason
+    await proposals.authorize(
+        regenerated.proposal_id,
+        source=AuthorizationSource.HUMAN_WEB,
+        actor=WEB_ACTOR,
+    )
+    second = await execution.execute(regenerated.proposal_id)
+
+    assert second.outcome is ExecutionOutcome.REJECTED_BY_BROKER
+    async with clean_tables.session() as session:
+        instrument = await session.get(BrokerInstrument, helpers.INSTRUMENT_ID)
+        job_count = await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(Job)
+            .where(Job.job_type == JobType.GENERATE_PROPOSAL.value)
+        )
+    assert instrument is not None
+    assert instrument.quantity_precision == 3
+    assert job_count == 0
 
 
 async def test_a_proven_pre_send_failure_retracts_the_flag_and_re_arms(

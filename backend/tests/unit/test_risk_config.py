@@ -91,11 +91,13 @@ def test_environment_overrides_reach_the_config() -> None:
             risk_max_spread_bps=Decimal("20"),
             risk_allowed_instrument_types="STOCK",
             risk_allowed_sessions="REGULAR,PRE_MARKET",
+            risk_default_quantity_precision=3,
         )
     )
     assert config.max_spread_bps == Decimal("20")
     assert config.allowed_instrument_types == ("STOCK",)
     assert config.allowed_sessions == (MarketSession.REGULAR, MarketSession.PRE_MARKET)
+    assert config.default_quantity_precision == 3
 
 
 @pytest.mark.parametrize(
@@ -109,6 +111,7 @@ def test_environment_overrides_reach_the_config() -> None:
         ("risk_max_active_proposals", 0),
         ("risk_reduce_fraction", Decimal("0")),
         ("risk_max_notional_per_trade", Decimal("-1")),
+        ("risk_default_quantity_precision", 9),
     ],
 )
 def test_a_meaningless_limit_refuses_to_start(field: str, value: object) -> None:

@@ -30,6 +30,7 @@ anything other than the persisted proposal row.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -42,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from stockbrain.config import Settings
 from stockbrain.control.state import ControlSnapshot, ControlStateService
 from stockbrain.db.base import utcnow
+from stockbrain.db.models.companies import BrokerInstrument
 from stockbrain.db.models.portfolio import BrokerOrder
 from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
 from stockbrain.db.models.system import AuditLog
@@ -529,6 +531,40 @@ class ExecutionService:
                 NotificationEvent.EXECUTION_REJECTED,
                 detail=notification_detail,
             )
+
+            # A quantity-precision refusal is the broker teaching us the one
+            # number it publishes nowhere.  Learn it on the instrument, release
+            # the failed proposal's dedupe key and let the thesis generate a
+            # *new* proposal -- never a re-send of the rejected attempt.
+            precision = _quantity_precision_from(exc)
+            retry_run_id: uuid.UUID | None = None
+            if precision is not None and proposal.broker_instrument_id is not None:
+                stored = await session.scalar(
+                    sa.select(BrokerInstrument.quantity_precision).where(
+                        BrokerInstrument.id == proposal.broker_instrument_id
+                    )
+                )
+                if stored != precision:
+                    await session.execute(
+                        sa.update(BrokerInstrument)
+                        .where(BrokerInstrument.id == proposal.broker_instrument_id)
+                        .values(quantity_precision=precision)
+                    )
+                    proposal.dedupe_key = None
+                    proposal.status_reason = (
+                        f"the broker requires {precision} decimal places on quantity; re-sizing"
+                    )
+                    retry_run_id = proposal.research_run_id
+                    log.info(
+                        "quantity_precision_learned",
+                        ticker=proposal.broker_ticker,
+                        precision=precision,
+                    )
+
+        if retry_run_id is not None:
+            # Outside the transaction: the learned precision and the freed
+            # dedupe key are durable before any worker can act on the retry.
+            await self.proposals.enqueue_for_run(retry_run_id)
 
         METRICS.inc("stockbrain_execution_attempts_total", labels={"outcome": "REJECTED_BY_BROKER"})
         log.warning(
@@ -1164,6 +1200,24 @@ def _safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for key, value in payload.items()
         if not any(fragment in key.lower() for fragment in forbidden)
     }
+
+
+def _quantity_precision_from(exc: BrokerRejection) -> int | None:
+    """The decimal places a ``quantity-precision-mismatch`` refusal demands.
+
+    Trading 212 publishes no precision and its metadata carries none, so the
+    broker's own sentence is the only source.  ``None`` for every other refusal,
+    so an unrelated 400 is never read as a precision to learn.
+    """
+    payload_type = exc.payload.get("type") if exc.payload else None
+    if not isinstance(payload_type, str) or not payload_type.endswith(
+        "quantity-precision-mismatch"
+    ):
+        return None
+    if not exc.detail:
+        return None
+    match = re.search(r"precision (\d+)", exc.detail)
+    return int(match.group(1)) if match else None
 
 
 def _ambiguous_category(exc: AmbiguousTransportFailure) -> ExecutionFailure:

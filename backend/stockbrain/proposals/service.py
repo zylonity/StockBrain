@@ -1431,6 +1431,7 @@ def _identity(
         company_id=instrument.company_id,
         max_open_quantity=instrument.max_open_quantity,
         extended_hours=instrument.extended_hours,
+        quantity_precision=instrument.quantity_precision,
     )
 
 

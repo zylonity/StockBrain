@@ -107,6 +107,13 @@ class RiskConfig:
     quantity and no step, so nothing here may invent one.  Whole shares rounded
     *down* are valid for every instrument and can never exceed a cap."""
 
+    default_quantity_precision: int = 2
+    """Decimal places a fractional quantity is rounded down to until the broker
+    has told us the instrument's real precision.  The broker publishes no
+    precision anywhere and refuses a finer quantity with
+    ``api-errors/quantity-precision-mismatch``; that refusal is learned and
+    stored per instrument, and this default only covers the time before it."""
+
     # -- Proposal population ---------------------------------------------
     max_active_proposals: int = 5
     max_active_proposal_exposure_pct: Decimal = Decimal("0.10")
@@ -245,6 +252,7 @@ def risk_config_from_settings(settings: Settings) -> RiskConfig:
         min_cash_reserve_pct=settings.risk_min_cash_reserve_pct,
         min_trade_notional=settings.risk_min_trade_notional,
         allow_fractional_quantity=settings.risk_allow_fractional_quantity,
+        default_quantity_precision=settings.risk_default_quantity_precision,
         max_active_proposals=settings.risk_max_active_proposals,
         max_active_proposal_exposure_pct=settings.risk_max_active_proposal_exposure_pct,
         proposal_ttl_minutes=settings.risk_proposal_ttl_minutes,

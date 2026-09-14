@@ -147,6 +147,11 @@ class InstrumentIdentity:
     company_id: Any = None
     max_open_quantity: Decimal | None = None
     extended_hours: bool = False
+    quantity_precision: int | None = None
+    """Decimal places the broker accepts on an order quantity, learned from a
+    ``quantity-precision-mismatch`` refusal.  ``None`` means unknown, and the
+    risk config's default stands in until the broker says otherwise.  Appended
+    last so positional construction everywhere keeps working."""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +168,7 @@ class InstrumentIdentity:
             "company_id": str(self.company_id) if self.company_id else None,
             "max_open_quantity": _opt_str(self.max_open_quantity),
             "extended_hours": self.extended_hours,
+            "quantity_precision": self.quantity_precision,
         }
 
 

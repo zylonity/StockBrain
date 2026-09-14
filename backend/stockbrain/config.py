@@ -809,6 +809,11 @@ class Settings(BaseSettings):
     risk_min_cash_reserve_pct: Decimal = Decimal("0.10")
     risk_min_trade_notional: Decimal = Decimal("20")
     risk_allow_fractional_quantity: bool = False
+    risk_default_quantity_precision: int = 2
+    """Decimal places a fractional quantity is rounded down to until the broker
+    has refused a finer one for that instrument (it publishes no precision).
+    Zero means whole shares; the learned per-instrument value, once stored,
+    overrides this."""
 
     risk_max_active_proposals: int = 5
     risk_max_active_proposal_exposure_pct: Decimal = Decimal("0.10")
@@ -1150,6 +1155,11 @@ class Settings(BaseSettings):
             )
         if self.risk_max_active_proposals <= 0:
             problems.append("RISK_MAX_ACTIVE_PROPOSALS must be greater than 0")
+        if not 0 <= self.risk_default_quantity_precision <= 8:
+            problems.append(
+                "RISK_DEFAULT_QUANTITY_PRECISION must be between 0 and 8 "
+                f"(got {self.risk_default_quantity_precision})"
+            )
         if self.risk_max_account_state_age_seconds <= 0:
             problems.append("RISK_MAX_ACCOUNT_STATE_AGE_SECONDS must be greater than 0")
         if problems:

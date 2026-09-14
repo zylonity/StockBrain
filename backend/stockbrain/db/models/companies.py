@@ -222,6 +222,12 @@ class BrokerInstrument(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     min_trade_quantity: Mapped[Decimal | None] = mapped_column(sa.Numeric(28, 10))
     max_open_quantity: Mapped[Decimal | None] = mapped_column(sa.Numeric(28, 10))
+    quantity_precision: Mapped[int | None] = mapped_column(sa.Integer)
+    """Decimal places the broker accepts on an order quantity, learned from an
+    ``api-errors/quantity-precision-mismatch`` refusal.  Trading 212 publishes
+    no precision in its instrument metadata and it is per instrument (CRM: 4,
+    GSK: 3); NULL means unknown, so sizing uses the configured default until the
+    broker tells us otherwise."""
     working_schedule_id: Mapped[int | None] = mapped_column(sa.BigInteger)
     added_on: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     raw_metadata: Mapped[JSONDict] = mapped_column(

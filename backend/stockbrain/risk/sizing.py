@@ -59,11 +59,6 @@ ACTION_SIDES: dict[ThesisAction, OrderSide | None] = {
     ThesisAction.NO_ACTION: None,
 }
 
-#: Trading 212 accepts at most 4 decimal places on a quantity; anything finer is
-#: refused with ``api-errors/quantity-precision-mismatch``.  Quantities round
-#: *down* to this step.
-_QUANTITY_EXPONENT = Decimal("0.0001")
-
 
 def size_trade(
     *,
@@ -237,7 +232,7 @@ def _size_buy(
     # The cap, moved into the currency the price is quoted in. Every quantity
     # below is derived from this number, so the conversion happens exactly once.
     max_notional_instrument = fx.to_instrument_currency(max_notional)
-    max_quantity = _round_quantity(max_notional_instrument / reference_price, config)
+    max_quantity = _round_quantity(max_notional_instrument / reference_price, config, identity)
 
     target_notional_instrument = max_notional_instrument * size_factor
     if size_factor < Decimal(1):
@@ -246,7 +241,7 @@ def _size_buy(
             f"{target_notional_instrument} {currency or ''}".rstrip()
         )
 
-    quantity = _round_quantity(target_notional_instrument / reference_price, config)
+    quantity = _round_quantity(target_notional_instrument / reference_price, config, identity)
     if quantity > max_quantity:  # pragma: no cover - defensive; factor is <= 1
         quantity = max_quantity
     actual_notional = quantity * reference_price
@@ -358,10 +353,10 @@ def _size_sell(
         )
 
     if action is ThesisAction.SELL:
-        quantity = _round_quantity(available, config)
+        quantity = _round_quantity(available, config, identity)
         reasons.append(f"SELL closes the whole available position of {available} share(s)")
     else:
-        quantity = _round_quantity(available * config.reduce_fraction, config)
+        quantity = _round_quantity(available * config.reduce_fraction, config, identity)
         reasons.append(
             f"REDUCE trims {config.reduce_fraction} of the {available} available share(s) -- "
             "a deterministic partial exit, not a liquidation"
@@ -376,7 +371,7 @@ def _size_sell(
                 "a full exit requires a SELL thesis"
             )
 
-    max_quantity = _round_quantity(available, config)
+    max_quantity = _round_quantity(available, config, identity)
     max_notional_instrument = max_quantity * reference_price
     max_notional_account = fx.to_account_currency(max_notional_instrument)
     if quantity <= ZERO:
@@ -412,14 +407,22 @@ def _size_sell(
     )
 
 
-def _round_quantity(raw: Decimal, config: RiskConfig) -> Decimal:
+def _round_quantity(raw: Decimal, config: RiskConfig, identity: InstrumentIdentity) -> Decimal:
     """Round a raw quantity **down** to a quantity the broker will accept.
 
     Always down.  Rounding up can breach a cap by up to one share, and a cap
     that is breached "only a little" is not a cap.
+
+    The broker's precision is per instrument and published nowhere, so the
+    identity's learned value is used when known and the configured default only
+    until then.  ``Decimal(1).scaleb(-N)`` builds ``10 ** -N`` for every N
+    including zero, where the step is a whole share.
     """
     if raw <= ZERO:
         return ZERO
-    if config.allow_fractional_quantity:
-        return raw.quantize(_QUANTITY_EXPONENT, rounding=ROUND_DOWN)
-    return raw.quantize(Decimal(1), rounding=ROUND_DOWN)
+    if not config.allow_fractional_quantity:
+        return raw.quantize(Decimal(1), rounding=ROUND_DOWN)
+    precision = identity.quantity_precision
+    if precision is None:
+        precision = config.default_quantity_precision
+    return raw.quantize(Decimal(1).scaleb(-precision), rounding=ROUND_DOWN)

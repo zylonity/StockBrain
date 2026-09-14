@@ -866,6 +866,14 @@ CATALOGUE: tuple[_Group, ...] = (
                 "Whether a fractional share may be ordered.",
             ),
             _s(
+                "risk_default_quantity_precision",
+                "Default quantity precision",
+                RESTART,
+                "Decimal places a fractional quantity is rounded down to until the "
+                "broker's own precision for an instrument has been learned.",
+                unit="decimal places",
+            ),
+            _s(
                 "risk_max_active_proposals",
                 "Maximum active proposals",
                 RESTART,
