@@ -71,6 +71,15 @@ and HOLD when it genuinely cuts both ways. HOLD and NO_ACTION are positive findi
 about the evidence, never a default for residual uncertainty.
 Set confidence to the strength of the evidence actually supplied, using the whole 0
 to 1 range; do not compress it toward the middle to hedge a defensible answer.
+The packet's memory section is this system's own prior state, not evidence, and
+must never be cited as a source. When a standing thesis is present you must do one
+of three things and say which: reaffirm it, supersede it with a stated reason
+grounded in the triggering event, or return NO_ACTION because the event is already
+priced into it -- a story the standing thesis was itself a reaction to is already
+priced in. A position's unrealised move is the tape, not the event. Calibration
+records describe how this system's past calls in the same situation performed; a
+poor record is a reason for lower confidence, never a reason to invert a direction
+the evidence supports.
 """
 
 CONTEXT_TOOL: dict[str, Any] = {

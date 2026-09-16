@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
 
 import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
@@ -34,10 +35,17 @@ from stockbrain.enums import (
     OutcomeCheckpoint,
     OutcomeStatus,
     ProposalStatus,
+    ResearchStatus,
     ThesisAction,
     TimeHorizon,
 )
 from stockbrain.errors import ProviderError
+from stockbrain.intelligence.research import (
+    CalibrationRecord,
+    PositionMemory,
+    ResearchMemory,
+    StandingThesis,
+)
 from stockbrain.logging import get_logger
 from stockbrain.market_data.base import Bar
 from stockbrain.market_data.yahoo import DailyBars, yahoo_symbol
@@ -543,6 +551,195 @@ class MemoryService:
                     updated_at=moment,
                 )
             )
+
+    # ------------------------------------------------------------------
+    # Read side (spec §6, §7.1)
+    # ------------------------------------------------------------------
+    async def effective_grades(
+        self,
+        session: AsyncSession,
+        *,
+        as_of: dt.datetime,
+        event_type: str | None = None,
+        company_id: uuid.UUID | None = None,
+        action: ThesisAction | None = None,
+        exits: bool = False,
+    ) -> list[EffectiveGrade]:
+        """One grade per outcome: CLOSE if graded by ``as_of``, else the latest."""
+        stmt = (
+            sa.select(
+                ThesisOutcomeGrade.outcome_id,
+                ThesisOutcomeGrade.checkpoint,
+                ThesisOutcomeGrade.correct,
+                ThesisOutcomeGrade.alpha,
+                ThesisOutcomeGrade.graded_at,
+            )
+            .join(ThesisOutcome, ThesisOutcome.id == ThesisOutcomeGrade.outcome_id)
+            .where(
+                ThesisOutcomeGrade.graded_at <= as_of,
+                ThesisOutcome.broker == self._broker,
+                ThesisOutcome.is_exit.is_(exits),
+            )
+        )
+        if event_type is not None:
+            stmt = stmt.where(ThesisOutcome.event_type == event_type)
+        if company_id is not None:
+            stmt = stmt.where(ThesisOutcome.company_id == company_id)
+        if action is not None:
+            stmt = stmt.where(ThesisOutcome.action == action)
+        chosen: dict[uuid.UUID, tuple[bool, EffectiveGrade]] = {}
+        for outcome_id, checkpoint, correct, alpha, graded_at in await session.execute(stmt):
+            grade = EffectiveGrade(
+                outcome_id=outcome_id, correct=correct, alpha=alpha, graded_at=graded_at
+            )
+            is_close = checkpoint == OutcomeCheckpoint.CLOSE.value
+            current = chosen.get(outcome_id)
+            if (
+                current is None
+                or (is_close and not current[0])
+                or (is_close == current[0] and graded_at > current[1].graded_at)
+            ):
+                chosen[outcome_id] = (is_close, grade)
+        return [grade for _, grade in chosen.values()]
+
+    async def calibration(
+        self,
+        session: AsyncSession,
+        *,
+        event_type: str | None,
+        action: ThesisAction,
+        as_of: dt.datetime,
+    ) -> CalibrationBucket | None:
+        if event_type is None:
+            return None
+        grades = await self.effective_grades(
+            session, as_of=as_of, event_type=event_type, action=action
+        )
+        return calibrate(f"{event_type}×{action.value}", grades)  # noqa: RUF001
+
+    async def company_calibration(
+        self,
+        session: AsyncSession,
+        *,
+        company_id: uuid.UUID,
+        action: ThesisAction,
+        as_of: dt.datetime,
+    ) -> CalibrationBucket | None:
+        grades = await self.effective_grades(
+            session, as_of=as_of, company_id=company_id, action=action
+        )
+        return calibrate(f"company:{company_id}×{action.value}", grades)  # noqa: RUF001
+
+    async def research_memory(
+        self,
+        session: AsyncSession,
+        *,
+        company_id: uuid.UUID,
+        broker_instrument_id: uuid.UUID,
+        broker_ticker: str,
+        event_type: str | None,
+        as_of: dt.datetime,
+    ) -> ResearchMemory:
+        standing = await self._standing_thesis(session, company_id, broker_instrument_id, as_of)
+        position = await self._position_memory(session, broker_ticker, as_of)
+        company = await self.company_calibration(
+            session, company_id=company_id, action=ThesisAction.BUY, as_of=as_of
+        )
+        by_type: list[CalibrationRecord] = []
+        for action in (ThesisAction.BUY, ThesisAction.REDUCE, ThesisAction.SELL):
+            bucket = await self.calibration(
+                session, event_type=event_type, action=action, as_of=as_of
+            )
+            if bucket is not None:
+                by_type.append(_record(bucket))
+        return ResearchMemory(
+            standing_thesis=standing,
+            position=position,
+            company_record=_record(company) if company else None,
+            event_type_record=tuple(by_type),
+        )
+
+    async def _standing_thesis(
+        self,
+        session: AsyncSession,
+        company_id: uuid.UUID,
+        broker_instrument_id: uuid.UUID,
+        as_of: dt.datetime,
+    ) -> StandingThesis | None:
+        floor = as_of - dt.timedelta(days=self._settings.memory_standing_thesis_max_age_days)
+        row = (
+            await session.execute(
+                sa.select(Thesis, ResearchRun.completed_at)
+                .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
+                .where(
+                    ResearchRun.company_id == company_id,
+                    ResearchRun.broker_instrument_id == broker_instrument_id,
+                    ResearchRun.status == ResearchStatus.SUCCEEDED,
+                    ResearchRun.completed_at <= as_of,
+                    ResearchRun.completed_at >= floor,
+                )
+                .order_by(ResearchRun.completed_at.desc(), Thesis.id)
+                .limit(1)
+            )
+        ).first()
+        if row is None:
+            return None
+        thesis, completed_at = row
+        assert completed_at is not None
+        conditions = thesis.invalidation_conditions.get("items", [])
+        return StandingThesis(
+            thesis_id=thesis.id,
+            published_at=completed_at,
+            action=thesis.action,
+            confidence=thesis.confidence,
+            horizon=thesis.time_horizon,
+            thesis=(thesis.summary or "")[:600],
+            invalidation_conditions=tuple(str(item) for item in conditions),
+            age_hours=(as_of - completed_at).total_seconds() / 3600,
+        )
+
+    async def _position_memory(
+        self, session: AsyncSession, broker_ticker: str, as_of: dt.datetime
+    ) -> PositionMemory | None:
+        position = (
+            await session.execute(
+                sa.select(Position)
+                .where(
+                    Position.broker == self._broker,
+                    Position.broker_ticker == broker_ticker,
+                    Position.quantity > 0,
+                    Position.last_synced_at <= as_of,
+                )
+                .order_by(Position.last_synced_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if position is None:
+            return None
+        unrealised: Decimal | None = None
+        if position.average_price and position.current_price:
+            unrealised = (
+                (position.current_price - position.average_price) / position.average_price
+            ).quantize(_SIX_PLACES, ROUND_HALF_EVEN)
+        return PositionMemory(
+            quantity=position.quantity,
+            average_price=position.average_price,
+            current_price=position.current_price,
+            unrealised_pct=unrealised,
+            opened_at=position.initial_fill_date,
+            synced_at=position.last_synced_at,
+        )
+
+
+def _record(bucket: CalibrationBucket) -> CalibrationRecord:
+    return CalibrationRecord(
+        key=bucket.key,
+        samples=bucket.samples,
+        correct=bucket.correct,
+        hit_rate=bucket.hit_rate,
+        mean_alpha=bucket.mean_alpha,
+        latest_graded_at=bucket.latest_graded_at,
+    )
 
 
 def _exit_rule_of(rules: object) -> str | None:

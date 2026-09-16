@@ -7,6 +7,7 @@ import html
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from decimal import Decimal
 from typing import Annotated, Literal, Protocol
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -23,7 +24,7 @@ from stockbrain.errors import (
 )
 from stockbrain.llm.telemetry import LlmCallRecord
 
-PROMPT_VERSION = "research-v2"
+PROMPT_VERSION = "research-v3"
 UPSTREAM_COMMIT = "2448d0a12576f9b2ddcd5980a0630833423d1e1b"
 ROLES = ("market", "fundamentals", "sentiment", "bull", "bear", "manager", "trader")
 DEEP_ROLES = frozenset({"bull", "bear", "manager", "trader"})
@@ -135,6 +136,56 @@ class ProviderDegradation(FrozenModel):
     detail: str
 
 
+class CalibrationRecord(BaseModel):
+    """Pydantic mirror of ``stockbrain.risk.models.CalibrationBucket`` (spec §6)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    samples: int
+    correct: int
+    hit_rate: Decimal
+    mean_alpha: Decimal
+    latest_graded_at: AwareDatetime
+
+
+class StandingThesis(BaseModel):
+    """The company's latest published thesis, shown to research, never linked."""
+
+    model_config = ConfigDict(frozen=True)
+
+    thesis_id: uuid.UUID
+    published_at: AwareDatetime
+    action: ThesisAction
+    confidence: float
+    horizon: TimeHorizon
+    thesis: str = Field(max_length=600)
+    invalidation_conditions: tuple[str, ...] = ()
+    age_hours: float
+
+
+class PositionMemory(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    quantity: Decimal
+    average_price: Decimal | None
+    current_price: Decimal | None
+    unrealised_pct: Decimal | None
+    opened_at: AwareDatetime | None
+    synced_at: AwareDatetime
+
+
+class ResearchMemory(BaseModel):
+    """This system's own prior state.  Context, never evidence (spec §7.1)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    standing_thesis: StandingThesis | None = None
+    position: PositionMemory | None = None
+    company_record: CalibrationRecord | None = None
+    event_type_record: tuple[CalibrationRecord, ...] = ()
+
+
 class ResearchPacket(FrozenModel):
     event_id: uuid.UUID
     impact_id: uuid.UUID
@@ -151,6 +202,7 @@ class ResearchPacket(FrozenModel):
     degradation: tuple[ProviderDegradation, ...] = ()
     previous_thesis_id: uuid.UUID | None = None
     previous_thesis: ResearchDecision | None = None
+    memory: ResearchMemory | None = None
 
     @model_validator(mode="after")
     def temporal_boundary(self) -> ResearchPacket:

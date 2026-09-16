@@ -28,6 +28,7 @@ from stockbrain.db.models.sources import Event, EventSourceLink, Source
 from stockbrain.db.session import Database
 from stockbrain.enums import EventStatus, JobType, ProviderStatus, ResearchStatus, ResolutionStatus
 from stockbrain.errors import InstrumentResolutionError, ProviderError
+from stockbrain.intelligence.memory import MemoryService
 from stockbrain.intelligence.research import (
     PROMPT_VERSION,
     UPSTREAM_COMMIT,
@@ -37,6 +38,7 @@ from stockbrain.intelligence.research import (
     ResearchBudgetBlockedError,
     ResearchDecision,
     ResearchEngine,
+    ResearchMemory,
     ResearchPacket,
     ResearchValidationError,
     ResolvedCompany,
@@ -69,6 +71,8 @@ class ResearchService:
         expectations: SupplementalResearchProvider | None = None,
         targets: SupplementalResearchProvider | None = None,
         macro_markets: MacroDataProvider | None = None,
+        memory: MemoryService | None = None,
+        memory_packet_enabled: bool = False,
     ) -> None:
         self.database = database
         self.engine = engine
@@ -88,6 +92,8 @@ class ResearchService:
         self.expectations = expectations
         self.targets = targets
         self.macro_markets = macro_markets
+        self.memory = memory
+        self.memory_packet_enabled = memory_packet_enabled
         self.queue = JobQueue()
         self.telemetry = LlmTelemetry()
         self.config = {
@@ -109,6 +115,9 @@ class ResearchService:
             ],
             "tools": ["read_research_context"],
             "debate_rounds": getattr(engine, "debate_rounds", 1),
+            # A packet with memory is a different analysis from one without, so
+            # the flag forks the config version.
+            "memory": memory_packet_enabled,
         }
         self.config_version = hashlib.sha256(
             json.dumps(self.config, sort_keys=True).encode()
@@ -173,6 +182,16 @@ class ResearchService:
             ):
                 raise ResearchValidationError("previous thesis is not valid for this listing/time")
             previous = ResearchDecision.model_validate(old.structured_decision)
+        memory: ResearchMemory | None = None
+        if self.memory_packet_enabled and self.memory is not None:
+            memory = await self.memory.research_memory(
+                session,
+                company_id=company.id,
+                broker_instrument_id=instrument.id,
+                broker_ticker=instrument.broker_ticker,
+                event_type=event.event_type,
+                as_of=as_of,
+            )
         try:
             return ResearchPacket(
                 event_id=event.id,
@@ -212,6 +231,7 @@ class ResearchService:
                 classifier_rationale=impact.explanation,
                 previous_thesis_id=previous_thesis_id,
                 previous_thesis=previous,
+                memory=memory,
             )
         except ValueError:
             raise ResearchValidationError(
