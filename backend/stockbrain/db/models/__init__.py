@@ -13,6 +13,7 @@ from stockbrain.db.models.companies import (
     CompanyAlias,
     EventCompanyImpact,
 )
+from stockbrain.db.models.memory import ThesisOutcome, ThesisOutcomeGrade
 from stockbrain.db.models.portfolio import BrokerOrder, PortfolioSnapshot, Position
 from stockbrain.db.models.proposals import (
     ACTIVE_PROPOSAL_STATUSES,
@@ -64,6 +65,8 @@ __all__ = [
     "RiskEvaluation",
     "Source",
     "Thesis",
+    "ThesisOutcome",
+    "ThesisOutcomeGrade",
     "TradeProposal",
     "User",
 ]

@@ -41,6 +41,8 @@ __all__ = [
     "NotificationStatus",
     "OrderSide",
     "OrderType",
+    "OutcomeCheckpoint",
+    "OutcomeStatus",
     "PriceSource",
     "ProposalStatus",
     "ProviderCallKind",
@@ -147,6 +149,29 @@ class TimeHorizon(StrEnum):
     DAYS = "days"
     WEEKS = "weeks"
     MONTHS = "months"
+
+
+class OutcomeStatus(StrEnum):
+    """Lifecycle of a graded thesis outcome (spec §4.1)."""
+
+    PENDING = "PENDING"
+    CLOSED = "CLOSED"
+    ABANDONED = "ABANDONED"
+
+
+class OutcomeCheckpoint(StrEnum):
+    """When an outcome is graded: N trading days after entry, or on close."""
+
+    D1 = "D1"
+    D5 = "D5"
+    D20 = "D20"
+    D60 = "D60"
+    CLOSE = "CLOSE"
+
+    @property
+    def trading_days(self) -> int | None:
+        """The day count a checkpoint waits for; ``None`` for CLOSE."""
+        return None if self is OutcomeCheckpoint.CLOSE else int(self.value[1:])
 
 
 class Broker(StrEnum):

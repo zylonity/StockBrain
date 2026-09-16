@@ -211,6 +211,8 @@ async def database(migrated_database: str) -> AsyncIterator[Database]:
 async def clean_tables(database: Database) -> AsyncIterator[Database]:
     """Truncate mutable tables between tests, keeping the schema in place."""
     tables = (
+        "thesis_outcome_grades",
+        "thesis_outcomes",
         "execution_attempts",
         "approval_actions",
         "broker_orders",
