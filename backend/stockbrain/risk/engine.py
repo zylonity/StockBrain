@@ -34,6 +34,7 @@ from stockbrain.db.base import utcnow
 from stockbrain.enums import RiskOutcome, RuleOutcome
 from stockbrain.risk.models import ZERO, RiskDecision, RiskInputs, RuleResult, SizingResult
 from stockbrain.risk.rules import (
+    calibration_size_factor,
     cap_rule_results,
     confidence_size_factor,
     gate_results,
@@ -58,6 +59,10 @@ class RiskEngine:
         confidence_rule = confidence_size_factor(inputs)
         if confidence_rule is not None:
             rules.append(confidence_rule)
+
+        calibration_rule = calibration_size_factor(inputs)
+        if calibration_rule is not None:
+            rules.append(calibration_rule)
 
         blocked = any(rule.outcome is RuleOutcome.BLOCK for rule in rules)
 

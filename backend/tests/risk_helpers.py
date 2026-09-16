@@ -24,6 +24,7 @@ from stockbrain.fx.base import FxRateGrade
 from stockbrain.risk.config import RiskConfig
 from stockbrain.risk.models import (
     AccountState,
+    CalibrationBucket,
     FxSnapshot,
     InstrumentIdentity,
     PositionState,
@@ -197,6 +198,7 @@ def inputs(
     now: dt.datetime = NOW,
     fx: FxSnapshot | None = UNSET,
     authorized_fx_rate: Decimal | None = None,
+    calibration: CalibrationBucket | None = None,
     account_state_missing_reason: str | None = None,
     quote_missing_reason: str | None = None,
 ) -> RiskInputs:
@@ -225,6 +227,7 @@ def inputs(
         now=now,
         fx=fx,
         authorized_fx_rate=authorized_fx_rate,
+        calibration=calibration,
         account_state_missing_reason=account_state_missing_reason,
         quote_missing_reason=quote_missing_reason,
     )

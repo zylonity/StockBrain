@@ -130,6 +130,13 @@ class RiskConfig:
     only ever *shrink* a position inside the hard caps, and can never lift a
     BLOCK: it is a ranking feature, not a calibrated probability."""
 
+    calibration_modulates_size: bool = True
+    """Whether a poor calibration record for the proposal's bucket shrinks the size."""
+    calibration_min_samples: int = 10
+    """Graded outcomes a bucket needs before its record is acted on at all."""
+    min_calibration_size_factor: Decimal = Decimal("0.5")
+    """The floor the calibration factor is clamped to. It can only ever reduce."""
+
     # -- Action semantics --------------------------------------------------
     reduce_fraction: Decimal = Decimal("0.5")
     """REDUCE is a deterministic partial exit, not a liquidation."""
@@ -260,6 +267,9 @@ def risk_config_from_settings(settings: Settings) -> RiskConfig:
         min_research_confidence=settings.risk_min_research_confidence,
         confidence_modulates_size=settings.risk_confidence_modulates_size,
         min_confidence_size_factor=settings.risk_min_confidence_size_factor,
+        calibration_modulates_size=settings.risk_calibration_modulates_size,
+        calibration_min_samples=settings.risk_calibration_min_samples,
+        min_calibration_size_factor=settings.risk_min_calibration_size_factor,
         reduce_fraction=settings.risk_reduce_fraction,
         exit_hard_stop_pct=settings.risk_exit_hard_stop_pct,
         exit_trailing_pct=settings.risk_exit_trailing_pct,

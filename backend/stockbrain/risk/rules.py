@@ -44,6 +44,7 @@ __all__ = [
     "TRANSIENT_RULE_IDS",
     "NotionalCap",
     "action_is_executable",
+    "calibration_size_factor",
     "cap_rule_results",
     "confidence_size_factor",
     "fx_rate_drift",
@@ -1004,6 +1005,44 @@ def confidence_size_factor(inputs: RiskInputs) -> RuleResult | None:
         ),
         observed=str(inputs.confidence),
         threshold=f"[{factor_floor}, 1]",
+        size_factor=factor,
+    )
+
+
+def calibration_size_factor(inputs: RiskInputs) -> RuleResult | None:
+    """Shrink the size when this system's record in the same situation is poor.
+
+    ``None`` when modulation is off or nothing is known.  Below the sample floor
+    the rule is reported as not evaluated rather than silently neutral, so a
+    reviewer can see the record was too thin to act on.  The factor is
+    ``0.5 + hit_rate`` clamped to ``[floor, 1]``: a coin-flip record is neutral,
+    a perfect record earns nothing, and no record can lift a cap or a block.
+    """
+    config = inputs.config
+    bucket = inputs.calibration
+    if not config.calibration_modulates_size or bucket is None:
+        return None
+    if bucket.samples < config.calibration_min_samples:
+        return _skipped(
+            "calibration_size_modulation",
+            1,
+            f"{bucket.key} has {bucket.samples} of {config.calibration_min_samples} "
+            "graded outcomes needed",
+            threshold=str(config.calibration_min_samples),
+        )
+    floor = config.min_calibration_size_factor
+    factor = min(Decimal(1), max(floor, Decimal("0.5") + bucket.hit_rate))
+    return RuleResult(
+        rule_id="calibration_size_modulation",
+        rule_version=1,
+        outcome=RuleOutcome.REDUCE if factor < Decimal(1) else RuleOutcome.PASS,
+        reason=(
+            f"{bucket.key}: {bucket.correct}/{bucket.samples} correct, mean alpha "
+            f"{bucket.mean_alpha:+.2%}, scales the size to {factor} of the deterministic "
+            "maximum (it can only reduce, never authorise)"
+        ),
+        observed=str(bucket.hit_rate),
+        threshold=f"[{floor}, 1]",
         size_factor=factor,
     )
 

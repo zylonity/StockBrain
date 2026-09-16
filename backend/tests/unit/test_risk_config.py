@@ -44,6 +44,9 @@ def test_the_version_is_stable_for_identical_configuration() -> None:
         ("allow_fractional_quantity", True),
         ("spread_policy", SpreadPolicy.REDUCE),
         ("allowed_sessions", (MarketSession.REGULAR, MarketSession.PRE_MARKET)),
+        ("calibration_modulates_size", False),
+        ("calibration_min_samples", 11),
+        ("min_calibration_size_factor", Decimal("0.6")),
     ],
 )
 def test_changing_any_threshold_changes_the_version(field: str, value: object) -> None:

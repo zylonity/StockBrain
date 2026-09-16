@@ -933,6 +933,26 @@ CATALOGUE: tuple[_Group, ...] = (
                 "Whether a weaker thesis produces a smaller position.",
             ),
             _s(
+                "risk_calibration_modulates_size",
+                "Calibration modulates size",
+                RESTART,
+                "Whether a poor graded record for the proposal's event-type and action "
+                "bucket shrinks the size. Only ever reduces; never blocks.",
+            ),
+            _s(
+                "risk_calibration_min_samples",
+                "Calibration sample floor",
+                RESTART,
+                "Graded outcomes a bucket needs before its record is acted on.",
+            ),
+            _s(
+                "risk_min_calibration_size_factor",
+                "Calibration size floor",
+                RESTART,
+                "The smallest fraction of the deterministic maximum a poor record can "
+                "scale a trade to.",
+            ),
+            _s(
                 "risk_require_same_currency",
                 "Require matching currency",
                 RESTART,

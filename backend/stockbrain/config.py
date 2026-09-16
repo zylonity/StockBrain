@@ -823,6 +823,9 @@ class Settings(BaseSettings):
     risk_min_research_confidence: Decimal = Decimal("0.70")
     risk_confidence_modulates_size: bool = True
     risk_min_confidence_size_factor: Decimal = Decimal("0.5")
+    risk_calibration_modulates_size: bool = True
+    risk_calibration_min_samples: int = 10
+    risk_min_calibration_size_factor: Decimal = Decimal("0.5")
     risk_reduce_fraction: Decimal = Decimal("0.5")
 
     risk_exit_hard_stop_pct: Decimal = Decimal("0.08")
@@ -1171,6 +1174,16 @@ class Settings(BaseSettings):
             problems.append(
                 "RISK_DEFAULT_QUANTITY_PRECISION must be between 0 and 8 "
                 f"(got {self.risk_default_quantity_precision})"
+            )
+        if self.risk_calibration_min_samples < 3:
+            problems.append(
+                "RISK_CALIBRATION_MIN_SAMPLES must be at least 3 "
+                f"(got {self.risk_calibration_min_samples})"
+            )
+        if not Decimal(0) < self.risk_min_calibration_size_factor <= Decimal(1):
+            problems.append(
+                "RISK_MIN_CALIBRATION_SIZE_FACTOR must be in (0, 1] "
+                f"(got {self.risk_min_calibration_size_factor})"
             )
         if self.risk_max_account_state_age_seconds <= 0:
             problems.append("RISK_MAX_ACCOUNT_STATE_AGE_SECONDS must be greater than 0")
