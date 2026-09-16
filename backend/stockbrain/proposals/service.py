@@ -56,6 +56,7 @@ from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, EventCompanyImpact
 from stockbrain.db.models.proposals import RiskEvaluation, TradeProposal
 from stockbrain.db.models.research import ResearchRun, Thesis
+from stockbrain.db.models.sources import Event
 from stockbrain.db.models.system import AuditLog
 from stockbrain.db.session import Database
 from stockbrain.enums import (
@@ -80,6 +81,7 @@ from stockbrain.errors import (
     RiskBlocked,
 )
 from stockbrain.fx.service import FxService
+from stockbrain.intelligence.memory import MemoryService
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
 from stockbrain.market_data.base import MarketDataProvider
@@ -188,6 +190,7 @@ class ProposalService:
         engine: RiskEngine | None = None,
         control: ControlStateService | None = None,
         preferences: NotificationPreferences | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -210,6 +213,9 @@ class ProposalService:
         # preference store; ``enqueue_pipeline_notification`` is a no-op without
         # one, which is exactly the shipped quiet behaviour.
         self._preferences = preferences
+        # Optional so a deployment (or a unit test) that does not feed the
+        # engine this system's own record simply has no calibration bucket.
+        self.memory = memory
 
     def _evaluator(self) -> ProposalEvaluator:
         return ProposalEvaluator(
@@ -221,6 +227,7 @@ class ProposalService:
             fx=self.fx,
             broker=self.broker,
             engine=self.engine,
+            memory=self.memory,
         )
 
     # ------------------------------------------------------------------
@@ -342,7 +349,11 @@ class ProposalService:
             verdict = await evaluator.evaluate(
                 session,
                 EvaluationContext(
-                    candidate.action, candidate.confidence, fresh_identity, account_id
+                    candidate.action,
+                    candidate.confidence,
+                    fresh_identity,
+                    account_id,
+                    event_type=await self._event_type_for(session, candidate.run.event_id),
                 ),
                 facts,
                 now=moment,
@@ -863,9 +874,20 @@ class ProposalService:
             self._assert_authorizable(locked, source, moment)
 
             identity = await self._identity_from_proposal(session, locked)
+            event_type = (
+                await session.scalar(
+                    sa.select(Event.event_type)
+                    .join(ResearchRun, ResearchRun.event_id == Event.id)
+                    .where(ResearchRun.id == locked.research_run_id)
+                )
+                if locked.research_run_id
+                else None
+            )
             verdict = await evaluator.evaluate(
                 session,
-                EvaluationContext(action, confidence, identity, locked.account_id, locked),
+                EvaluationContext(
+                    action, confidence, identity, locked.account_id, locked, event_type=event_type
+                ),
                 facts,
                 now=moment,
             )
@@ -1044,9 +1066,20 @@ class ProposalService:
             if fresh is None:  # pragma: no cover - selected a moment ago
                 return None
             identity = await self._identity_from_proposal(session, fresh)
+            event_type = (
+                await session.scalar(
+                    sa.select(Event.event_type)
+                    .join(ResearchRun, ResearchRun.event_id == Event.id)
+                    .where(ResearchRun.id == fresh.research_run_id)
+                )
+                if fresh.research_run_id
+                else None
+            )
             return await evaluator.evaluate(
                 session,
-                EvaluationContext(action, confidence, identity, account_id, fresh),
+                EvaluationContext(
+                    action, confidence, identity, account_id, fresh, event_type=event_type
+                ),
                 facts,
                 now=moment,
             )
@@ -1156,6 +1189,12 @@ class ProposalService:
             event_id=run.event_id,
             company_id=run.company_id,
         )
+
+    @staticmethod
+    async def _event_type_for(session: AsyncSession, event_id: uuid.UUID | None) -> str | None:
+        if event_id is None:
+            return None
+        return await session.scalar(sa.select(Event.event_type).where(Event.id == event_id))
 
     async def _reload_identity(
         self, session: AsyncSession, candidate: _Candidate

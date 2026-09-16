@@ -24,6 +24,7 @@ from stockbrain.enums import (
 )
 from stockbrain.fx.base import normalize_currency
 from stockbrain.fx.service import FxService
+from stockbrain.intelligence.memory import MemoryService
 from stockbrain.logging import get_logger
 from stockbrain.proposals.quotes import QuoteFetcher
 from stockbrain.proposals.state_machine import (
@@ -125,6 +126,7 @@ class EvaluationContext:
     identity: InstrumentIdentity
     account_id: str
     proposal: TradeProposal | None = None
+    event_type: str | None = None
 
 
 class ProposalEvaluator:
@@ -148,6 +150,7 @@ class ProposalEvaluator:
         fx: FxService,
         broker: Broker,
         engine: RiskEngine,
+        memory: MemoryService | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -157,6 +160,7 @@ class ProposalEvaluator:
         self.fx = fx
         self.broker = broker
         self.engine = engine
+        self.memory = memory
 
     async def load(
         self,
@@ -221,6 +225,11 @@ class ProposalEvaluator:
             account_currency=facts.account.currency if facts.account else None,
             exclude_proposal_id=proposal.id if proposal is not None else None,
         )
+        calibration = None
+        if self.memory is not None and context.event_type is not None:
+            calibration = await self.memory.calibration(
+                session, event_type=context.event_type, action=context.action, as_of=now
+            )
         decision = self.engine.evaluate(
             RiskInputs(
                 config=self.config,
@@ -235,6 +244,7 @@ class ProposalEvaluator:
                 authorized_fx_rate=proposal.fx_rate if proposal is not None else None,
                 account_state_missing_reason=facts.account_reason,
                 quote_missing_reason=facts.quote_reason,
+                calibration=calibration,
             ),
             now=now,
         )
