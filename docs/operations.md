@@ -787,6 +787,27 @@ Exit proposals are not otherwise special: they are approved, rejected, expired
 and executed on the same lifecycle as a research proposal, and the sweep only
 ever creates them. Nothing about it authorizes or transmits an order.
 
+### Thesis memory
+
+`MEMORY_GRADE_ENABLED` (default on) runs a daily sweep that records every
+executed thesis-backed trade and grades it against `MEMORY_BENCHMARK_SYMBOL`
+from Yahoo daily closes at horizon-relative checkpoints (5/20/60 trading days)
+and on close. It writes only `thesis_outcomes` and `thesis_outcome_grades` and
+makes no LLM calls. `GET /api/v1/memory/calibration` shows the hit rate and
+mean alpha per event type × action, per company, and per exit rule.
+
+`MEMORY_PACKET_ENABLED` (default off) adds the standing thesis, the live
+position and the calibration record to every research packet. This is the
+switch that changes what research sees; turn it on once the grades have data,
+and compare outcomes by `research_runs.prompt_version` (v2 before, v3 after).
+Turning it on or off changes the research `config_version`, which cancels
+pending runs at restart by design.
+
+`RISK_CALIBRATION_MODULATES_SIZE` (default on) lets a bucket with at least
+`RISK_CALIBRATION_MIN_SAMPLES` graded outcomes and a hit rate under 50% scale
+the size by `0.5 + hit_rate`, never below `RISK_MIN_CALIBRATION_SIZE_FACTOR`.
+It never blocks and never applies to exit-sweep sells.
+
 ## Job queue
 
 The queue *is* the audit trail, which is only a virtue if somebody can read it.

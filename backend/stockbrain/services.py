@@ -70,6 +70,7 @@ from stockbrain.ingestion.topics import seed_default_topics, seed_semantic_topic
 from stockbrain.ingestion.web_search import WebDiscoveryProvider
 from stockbrain.instruments.service import ResolutionService
 from stockbrain.intelligence.classifier import EventClassifier
+from stockbrain.intelligence.memory import MemoryService
 from stockbrain.intelligence.research_data import (
     AlpacaResearchProvider,
     FredMacroProvider,
@@ -174,6 +175,7 @@ class ServiceContainer:
     proposals: ProposalService | None = field(default=None, init=False)
     exits: ExitSweepService | None = field(default=None, init=False)
     volatility: VolatilityRefreshService | None = field(default=None, init=False)
+    memory: MemoryService | None = field(default=None, init=False)
     risk_config: RiskConfig = field(init=False)
     resolution: ResolutionService | None = field(default=None, init=False)
     market_data: AlpacaMarketDataClient | None = field(default=None, init=False)
@@ -203,6 +205,9 @@ class ServiceContainer:
         self.queue = JobQueue()
         self.registry = JobRegistry()
         self.risk_config = risk_config_from_settings(self.settings)
+        # Constructed unconditionally: the read side (packet memory, calibration)
+        # is a query and costs nothing; only the grading sweep is gated.
+        self.memory = MemoryService(self.database, self.settings, bars=YahooDailyBars())
         # The durable pause / kill switch. Constructed unconditionally: an
         # execution control that only exists when some optional provider is
         # configured is not an execution control.
@@ -233,6 +238,7 @@ class ServiceContainer:
                 broker=Broker.TRADING212,
                 control=self.control,
                 preferences=self.notification_preferences,
+                memory=self.memory,
             )
             log.info(
                 "proposal_service_ready",
@@ -589,6 +595,8 @@ class ServiceContainer:
                     timeout_seconds=settings.research_timeout_seconds,
                     max_tokens=settings.research_max_output_tokens,
                     evidence_chars=settings.research_evidence_chars,
+                    memory=self.memory,
+                    memory_packet_enabled=settings.memory_packet_enabled,
                 )
                 self.health.record(
                     ProviderName.TRADINGAGENTS,
@@ -856,6 +864,16 @@ class ServiceContainer:
                     interval_seconds=self.settings.volatility_refresh_interval_seconds,
                     run=self._volatility_refresh,
                     initial_delay_seconds=120.0,
+                    jitter_ratio=0.1,
+                )
+            )
+        if self.memory is not None and self.settings.memory_grade_enabled:
+            scheduler.add(
+                ScheduledTask(
+                    name="thesis_memory_grade",
+                    interval_seconds=self.settings.memory_grade_interval_seconds,
+                    run=self._memory_tick,
+                    initial_delay_seconds=180.0,
                     jitter_ratio=0.1,
                 )
             )
@@ -1257,6 +1275,10 @@ class ServiceContainer:
     async def _volatility_refresh(self) -> None:
         if self.volatility is not None:
             await self.volatility.refresh()
+
+    async def _memory_tick(self) -> None:
+        if self.memory is not None:
+            await self.memory.tick()
 
     async def _enqueue_pending_resolutions(self) -> None:
         """Sweep impacts whose resolution never ran.

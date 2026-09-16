@@ -40,6 +40,7 @@ from stockbrain.api.routes import execution as execution_routes
 from stockbrain.api.routes import health as health_routes
 from stockbrain.api.routes import instruments as instrument_routes
 from stockbrain.api.routes import logs as log_routes
+from stockbrain.api.routes import memory as memory_routes
 from stockbrain.api.routes import portfolio as portfolio_routes
 from stockbrain.api.routes import proposals as proposal_routes
 from stockbrain.api.routes import research as research_routes
@@ -409,6 +410,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(discovery_routes.router)
     app.include_router(instrument_routes.router)
     app.include_router(research_routes.router)
+    app.include_router(memory_routes.router)
     app.include_router(proposal_routes.router)
     app.include_router(execution_routes.router)
     app.include_router(portfolio_routes.router)
