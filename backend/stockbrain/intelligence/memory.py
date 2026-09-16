@@ -47,7 +47,9 @@ from stockbrain.risk.models import CalibrationBucket
 __all__ = [
     "BARS_DAYS",
     "CHECKPOINTS",
+    "ENTRY_BAR_TOLERANCE_DAYS",
     "EXIT_RULE_IDS",
+    "MAX_BARS_DAYS",
     "EffectiveGrade",
     "MemoryService",
     "bar_on_or_before",
@@ -62,6 +64,14 @@ __all__ = [
 #: Enough daily bars to cover the longest checkpoint (D60) with a margin for
 #: holidays, fetched once per symbol per tick.
 BARS_DAYS = 120
+
+#: The widest window one tick will ask Yahoo for, so an old outcome cannot make
+#: the sweep request an unbounded amount of history.
+MAX_BARS_DAYS = 400
+
+#: An entry bar further than this many days after ``entry_date`` is not the
+#: entry: the series starts after the fill rather than around it.
+ENTRY_BAR_TOLERANCE_DAYS = 7
 
 #: Horizon-relative checkpoints (spec §5.2).  Not a setting: a checkpoint
 #: schedule that changed under stored grades would make them incomparable.
@@ -291,11 +301,17 @@ class MemoryService:
         symbols = {item.symbol for item in pending if item.symbol} | {
             self._settings.memory_benchmark_symbol
         }
+        # Size one window to the oldest entry still pending, so a BUY held for
+        # months is still graded against the close on its own entry date.  The
+        # cap keeps a very old outcome from asking for unbounded history.
+        oldest = min(item.outcome.entry_date for item in pending)
+        age = (moment.date() - oldest).days
+        window = min(MAX_BARS_DAYS, max(BARS_DAYS, age + 10))
         series: dict[str, tuple[Sequence[Bar], str]] = {}
         failed_symbols: set[str] = set()
         for symbol in sorted(symbols):
             try:
-                series[symbol] = await self._bars.daily_bars(symbol, days=BARS_DAYS)
+                series[symbol] = await self._bars.daily_bars(symbol, days=window)
             except ProviderError as exc:
                 failed_symbols.add(symbol)
                 log.warning("thesis_memory_bars_failed", symbol=symbol, error=str(exc)[:200])
@@ -304,6 +320,10 @@ class MemoryService:
         for item in pending:
             outcome = item.outcome
             try:
+                if (moment.date() - outcome.entry_date).days > MAX_BARS_DAYS:
+                    await self._abandon(outcome.id, "entry_outside_window", moment)
+                    counts["abandoned"] += 1
+                    continue
                 if item.symbol is None:
                     await self._abandon(outcome.id, "no_yahoo_symbol", moment)
                     counts["abandoned"] += 1
@@ -317,7 +337,12 @@ class MemoryService:
                     await self._abandon(outcome.id, f"currency_mismatch:{currency}", moment)
                     counts["abandoned"] += 1
                     continue
-                graded, closed = await self._grade_one(outcome, item, bars, benchmark[0], moment)
+                graded, closed, ok = await self._grade_one(
+                    outcome, item, bars, benchmark[0], moment
+                )
+                if not ok:
+                    counts["failed"] += 1
+                    continue
                 counts["graded"] += graded
                 counts["closed"] += closed
                 if not graded and not closed:
@@ -406,13 +431,28 @@ class MemoryService:
         bars: Sequence[Bar],
         benchmark: Sequence[Bar],
         moment: dt.datetime,
-    ) -> tuple[int, int]:
-        """Grade every due checkpoint (and CLOSE) for one outcome. Returns (graded, closed)."""
+    ) -> tuple[int, int, bool]:
+        """Grade every due checkpoint (and CLOSE) for one outcome.
+
+        Returns ``(graded, closed, ok)``; ``ok`` is false when the entry bar
+        could not be located, in which case nothing is graded.
+        """
         entry = entry_bar(bars, outcome.entry_date)
         bench_entry = entry_bar(benchmark, outcome.entry_date)
-        if entry is None or bench_entry is None:
+        if (
+            entry is None
+            or bench_entry is None
+            or (entry.timestamp.date() - outcome.entry_date).days > ENTRY_BAR_TOLERANCE_DAYS
+            or (bench_entry.timestamp.date() - outcome.entry_date).days > ENTRY_BAR_TOLERANCE_DAYS
+        ):
+            log.warning(
+                "thesis_memory_entry_bar_missing",
+                outcome_id=str(outcome.id),
+                entry_date=outcome.entry_date.isoformat(),
+                first_bar=bars[0].timestamp.date().isoformat() if bars else None,
+            )
             await self._stamp_attempt(outcome.id, moment)
-            return 0, 0
+            return 0, 0, False
         days = trading_days_after(bars, outcome.entry_date)
         async with self._database.transaction() as session:
             row = await session.get(ThesisOutcome, outcome.id, with_for_update=True)
@@ -428,7 +468,7 @@ class MemoryService:
             closed = 0
             # Checkpoints are graded against the latest close.
             latest = bars[-1]
-            bench_latest = bench_entry if len(benchmark) == 0 else benchmark[-1]
+            bench_latest = benchmark[-1]
             schedule = checkpoints_for(row.horizon)
             for checkpoint in schedule:
                 needed = checkpoint.trading_days
@@ -480,7 +520,7 @@ class MemoryService:
                     closed = 1
             row.last_attempt_at = moment
             row.updated_at = moment
-        return graded, closed
+        return graded, closed, True
 
     async def _stamp_attempt(self, outcome_id: uuid.UUID, moment: dt.datetime) -> None:
         async with self._database.transaction() as session:

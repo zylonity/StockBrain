@@ -62,9 +62,11 @@ class FakeBars:
     def __init__(self, series: dict[str, tuple[list[Bar], str]]) -> None:
         self.series = series
         self.calls: list[str] = []
+        self.days: list[int] = []
 
     async def daily_bars(self, symbol: str, *, days: int) -> tuple[Sequence[Bar], str]:
         self.calls.append(symbol)
+        self.days.append(days)
         if symbol not in self.series:
             raise ProviderResponseError(f"no bars for {symbol}")
         return self.series[symbol]
@@ -360,3 +362,78 @@ async def test_a_symbol_is_not_refetched_within_twenty_hours(clean_tables: Datab
     calls = len(bars.calls)
     await service.grade(now=first + dt.timedelta(hours=2))
     assert len(bars.calls) == calls
+
+
+async def test_an_entry_older_than_the_fetch_window_is_not_graded_against_the_wrong_bar(
+    clean_tables: Database,
+) -> None:
+    """A series that starts after the entry date must not donate its oldest bar."""
+    await _executed(clean_tables)
+    await _hold(clean_tables)
+    # 2026-09-09 is the first session more than ENTRY_BAR_TOLERANCE_DAYS (7)
+    # calendar days after the 2026-09-01 entry, so the entry bar is rejected.
+    start = dt.date(2026, 9, 9)
+    bars = FakeBars(
+        {
+            "AAPL": (_series("AAPL", start, ["100"] * 8), "USD"),
+            "SPY": (_series("SPY", start, ["500"] * 8), "USD"),
+        }
+    )
+    service = MemoryService(clean_tables, _settings(), bars=bars)
+    await service.record()
+    tally = await service.grade(now=dt.datetime(2026, 9, 18, 22, tzinfo=dt.UTC))
+    assert tally["failed"] == 1
+    assert await _grades(clean_tables) == []
+    (outcome,) = await _outcomes(clean_tables)
+    assert outcome.status is OutcomeStatus.PENDING
+    assert outcome.last_attempt_at is not None
+
+
+async def test_the_fetch_window_grows_to_cover_the_oldest_pending_entry(
+    clean_tables: Database,
+) -> None:
+    old = ENTRY - dt.timedelta(days=200)
+    await _executed(clean_tables, executed_at=old)
+    bars = FakeBars(
+        {
+            "AAPL": (_series("AAPL", old.date(), ["100"]), "USD"),
+            "SPY": (_series("SPY", old.date(), ["500"]), "USD"),
+        }
+    )
+    service = MemoryService(clean_tables, _settings(), bars=bars)
+    await service.record()
+    await service.grade(now=ENTRY)
+    assert bars.days == [210, 210]
+    assert all(days == 210 for days in bars.days)
+
+
+async def test_an_entry_older_than_the_maximum_window_is_abandoned(
+    clean_tables: Database,
+) -> None:
+    await _executed(clean_tables, executed_at=ENTRY - dt.timedelta(days=401))
+    service = MemoryService(clean_tables, _settings(), bars=FakeBars({}))
+    await service.record()
+    tally = await service.grade(now=ENTRY)
+    assert tally["abandoned"] == 1
+    (outcome,) = await _outcomes(clean_tables)
+    assert outcome.close_reason == "entry_outside_window"
+
+
+async def test_a_trim_retires_after_its_last_checkpoint(clean_tables: Database) -> None:
+    await _executed(clean_tables, action=ThesisAction.REDUCE, horizon=TimeHorizon.DAYS)
+    await _hold(clean_tables)
+    # DAYS checkpoints are D1 and D5; eight sessions from 31 Aug clear both.
+    bars = _world(
+        instrument=["99", "100", "101", "102", "103", "104", "110", "111"],
+        benchmark=["500", "500", "501", "502", "503", "504", "510", "511"],
+    )
+    service = MemoryService(clean_tables, _settings(), bars=bars)
+    await service.record()
+    moment = dt.datetime(2026, 9, 9, 22, tzinfo=dt.UTC)
+    await service.grade(now=moment)
+    grades = await _grades(clean_tables)
+    assert {grade.checkpoint for grade in grades} == {"D1", "D5"}
+    (outcome,) = await _outcomes(clean_tables)
+    assert outcome.status is OutcomeStatus.CLOSED
+    assert outcome.close_reason == "checkpoints_complete"
+    assert outcome.closed_at == moment
