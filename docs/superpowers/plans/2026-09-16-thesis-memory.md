@@ -1533,9 +1533,11 @@ class MemoryService:
                     .join(Thesis, Thesis.id == TradeProposal.thesis_id)
                     .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
                     .join(Event, Event.id == ResearchRun.event_id, isouter=True)
+                    # The run's resolved listing, always set; the proposal's own
+                    # ``broker_instrument_id`` is nullable and the test seeds omit it.
                     .join(
                         BrokerInstrument,
-                        BrokerInstrument.id == TradeProposal.broker_instrument_id,
+                        BrokerInstrument.id == ResearchRun.broker_instrument_id,
                     )
                     .where(
                         TradeProposal.status == ProposalStatus.EXECUTED,
@@ -2453,12 +2455,15 @@ Append to the `MemoryService` class in `backend/stockbrain/intelligence/memory.p
     ) -> PositionMemory | None:
         position = (
             await session.execute(
-                sa.select(Position).where(
+                sa.select(Position)
+                .where(
                     Position.broker == self._broker,
                     Position.broker_ticker == broker_ticker,
                     Position.quantity > 0,
                     Position.last_synced_at <= as_of,
                 )
+                .order_by(Position.last_synced_at.desc())
+                .limit(1)
             )
         ).scalar_one_or_none()
         if position is None:
@@ -3057,7 +3062,7 @@ In `backend/stockbrain/proposals/service.py`:
                     candidate.confidence,
                     fresh_identity,
                     account_id,
-                    event_type=await self._event_type_for(session, candidate.event_id),
+                    event_type=await self._event_type_for(session, candidate.run.event_id),
                 ),
 ```
 
@@ -3253,6 +3258,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from dataclasses import asdict
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -3343,7 +3349,7 @@ async def calibration(session: DbSession, services: ServicesDep) -> CalibrationV
     for event_type, action in keys:
         bucket = await memory.calibration(session, event_type=event_type, action=action, as_of=now)
         if bucket is not None:
-            buckets.append(BucketView(**bucket.__dict__))
+            buckets.append(BucketView(**asdict(bucket)))
     companies = (
         await session.execute(
             sa.select(ThesisOutcome.company_id)
@@ -3356,7 +3362,7 @@ async def calibration(session: DbSession, services: ServicesDep) -> CalibrationV
             session, company_id=company_id, action=ThesisAction.BUY, as_of=now
         )
         if bucket is not None:
-            buckets.append(BucketView(**bucket.__dict__))
+            buckets.append(BucketView(**asdict(bucket)))
     exit_rules = (
         await session.scalars(
             sa.select(ThesisOutcome.exit_rule_id)
@@ -3378,7 +3384,7 @@ async def calibration(session: DbSession, services: ServicesDep) -> CalibrationV
         ]
         bucket = calibrate(f"exits×{rule_id}", rows)
         if bucket is not None:
-            buckets.append(BucketView(**bucket.__dict__))
+            buckets.append(BucketView(**asdict(bucket)))
     return CalibrationView(
         as_of=now,
         pending_outcomes=pending or 0,
