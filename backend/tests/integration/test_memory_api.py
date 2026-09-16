@@ -31,7 +31,8 @@ async def client(
         database_url=migrated_database,
         stockbrain_secret_key="test-key",
         telegram_bot_token="1234:super-secret-bot-token",
-        memory_grade_enabled=True,
+        # The endpoints read the tables directly; keep the Yahoo-backed sweep unarmed in tests.
+        memory_grade_enabled=False,
     )
     app = create_app(settings)
     async with LifespanManager(app):
