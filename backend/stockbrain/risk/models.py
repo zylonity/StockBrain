@@ -42,6 +42,7 @@ from stockbrain.risk.spread import SpreadAssessment
 __all__ = [
     "ZERO",
     "AccountState",
+    "CalibrationBucket",
     "FxSnapshot",
     "InstrumentIdentity",
     "PositionState",
@@ -418,6 +419,24 @@ class ReservedExposure:
 
 
 @dataclass(frozen=True, slots=True)
+class CalibrationBucket:
+    """How this system's past calls in one situation performed.
+
+    Lives in ``risk`` rather than ``intelligence`` so the engine's inputs never
+    import from the research layer.  ``hit_rate`` is ``correct / samples``;
+    ``mean_alpha`` is the mean benchmark-relative return of the effective grade
+    of each outcome (spec §6).  Both are exact ``Decimal``s.
+    """
+
+    key: str
+    samples: int
+    correct: int
+    hit_rate: Decimal
+    mean_alpha: Decimal
+    latest_graded_at: dt.datetime
+
+
+@dataclass(frozen=True, slots=True)
 class RiskInputs:
     """Everything the engine is allowed to read.
 
@@ -449,6 +468,10 @@ class RiskInputs:
     one.  Present only on the revalidation path; its absence is why
     ``fx_rate_drift`` reports ``WARN`` rather than ``PASS`` at generation time --
     there is nothing to have drifted from yet."""
+
+    calibration: CalibrationBucket | None = None
+    """This system's record for the proposal's (event_type, action) bucket.
+    ``None`` when memory is off, nothing is graded yet, or the path is an exit."""
 
 
 @dataclass(frozen=True, slots=True)
