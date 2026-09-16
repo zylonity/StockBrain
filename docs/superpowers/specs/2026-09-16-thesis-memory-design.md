@@ -34,7 +34,8 @@ feeds both the research prompt and the deterministic risk engine.
    benchmark at horizon-relative checkpoints and on close, with zero LLM spend.
 3. Grades aggregate into a calibration record per `(event_type, action)` and
    per `(company, action)`.
-4. The research packet carries the relevant calibration numbers; the risk
+4. The research packet carries the relevant calibration numbers (behind its
+   own flag, off by default); the risk
    engine shrinks size for buckets with a demonstrated negative record once a
    sample-size floor is met.
 5. Reruns with a historical `as_of` never see memory from after `as_of`.
@@ -278,19 +279,22 @@ class PositionMemory(BaseModel):
 `ResearchService.packet()` populates it:
 
 - **Standing thesis**: latest `Thesis` whose `ResearchRun` has
-  `company_id` and `broker_instrument_id` matching, `status = COMPLETED`,
+  `company_id` and `broker_instrument_id` matching, `status = SUCCEEDED`,
   `completed_at <= as_of`, and `completed_at >= as_of − memory_standing_thesis_max_age_days`.
-  When found and the caller passed no `previous_thesis_id`, the packet's
-  `previous_thesis_id` is set to it, so the existing supersession chain in
-  `research_service.py:405-428` now runs on the automatic path. The existing
-  validity check for an explicitly passed `previous_thesis_id` is unchanged.
+  **It is shown to the model only.** The packet's `previous_thesis_id` is
+  *not* set from it: `proposals/lifecycle.py:thesis_is_superseded` treats any
+  newer thesis naming an older one as superseding it, and the exit sweep
+  (`risk/exits.py`, rule `thesis_superseded`) sells the position on that
+  signal. Auto-linking would turn every reaffirming run on a held company into
+  a full exit. The supersession chain stays explicit-rerun-only, exactly as
+  today.
 - **Position**: the `positions` row for `(broker, broker_ticker)` with
   `last_synced_at <= as_of` and `quantity > 0`. A historical rerun therefore
   sees no position unless the mirror predates `as_of` — correct, because the
   historical position is unknown.
 - **Calibration**: from §6 with `as_of`.
 
-`memory` is `None` only when `memory_enabled` is false. An empty
+`memory` is `None` only when `memory_packet_enabled` is false. An empty
 `ResearchMemory` (all fields `None`/empty) is still sent so the model learns
 the section exists.
 
@@ -362,7 +366,8 @@ volatility block, documented in `.env.example`:
 
 | setting | default | notes |
 |---|---|---|
-| `MEMORY_ENABLED` | `false` | packet memory + grading task; off by default like `VOLATILITY_REFRESH_ENABLED` |
+| `MEMORY_GRADE_ENABLED` | `true` | the recording + grading task and the endpoint. Additive: writes only the two new tables |
+| `MEMORY_PACKET_ENABLED` | `false` | the memory section in every research packet. This is the behavioural change; off until the operator turns it on |
 | `MEMORY_GRADE_INTERVAL_SECONDS` | `21600` | validated 3600–86400 like the volatility interval |
 | `MEMORY_BENCHMARK_SYMBOL` | `SPY` | Yahoo symbol |
 | `MEMORY_STANDING_THESIS_MAX_AGE_DAYS` | `14` | 1–90 |
@@ -370,8 +375,11 @@ volatility block, documented in `.env.example`:
 | `RISK_CALIBRATION_MIN_SAMPLES` | `10` | ≥ 3 |
 | `RISK_MIN_CALIBRATION_SIZE_FACTOR` | `0.5` | (0, 1] |
 
-The live `.env` sets `MEMORY_ENABLED=true` after deploy; that is an operator
-step, not part of this work.
+Rollout is staged by design: deploy with grading on and the packet off, let
+the tables fill, then flip `MEMORY_PACKET_ENABLED` when the operator chooses.
+`research_runs.prompt_version` distinguishes v2 from v3 outcomes so the
+endpoint can report both. Flipping the flags is an operator step, not part of
+this work.
 
 ## 9. Known limitations (accepted)
 
@@ -402,7 +410,8 @@ Integration (`tests/integration/`, existing DB fixture):
   detection via a missing position row and via a SELL proposal with an exit
   rule; `ABANDONED` on unknown symbol; provider failure degrades one symbol.
 - `test_research_packet_memory.py`: standing thesis chosen by recency and
-  age; `previous_thesis_id` set on the automatic path; position included only
+  age; `previous_thesis_id` stays `None` on the automatic path and the new
+  thesis's `supersedes_thesis_id` is `None`; position included only
   when synced ≤ `as_of`; calibration rows present; `memory` present-but-empty
   when nothing is known; absent when disabled.
 - `test_proposal_calibration_input.py`: evaluator loads the bucket and the rule
@@ -420,4 +429,6 @@ suite as of `cf69e87` passes; the plan records the count.
 - No broker mutation. Nothing here authorizes or sizes upward.
 - No in-memory state across ticks; every read is a query.
 - No change under `execution/` — recording is a sweep over proposal state.
-- `previous_thesis` explicit-argument validation stays as strict as today.
+- `previous_thesis` explicit-argument validation stays as strict as today,
+  and the automatic path never sets `previous_thesis_id` or
+  `supersedes_thesis_id` (see §7.1).
