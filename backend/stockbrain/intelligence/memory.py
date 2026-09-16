@@ -12,12 +12,35 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
 
-from stockbrain.enums import OutcomeCheckpoint, ThesisAction, TimeHorizon
+import sqlalchemy as sa
+
+from stockbrain.config import Settings
+from stockbrain.db.base import utcnow
+from stockbrain.db.models.companies import BrokerInstrument
+from stockbrain.db.models.memory import ThesisOutcome, ThesisOutcomeGrade
+from stockbrain.db.models.portfolio import Position
+from stockbrain.db.models.proposals import TradeProposal
+from stockbrain.db.models.research import ResearchRun, Thesis
+from stockbrain.db.models.sources import Event
+from stockbrain.db.session import Database
+from stockbrain.enums import (
+    Broker,
+    OrderSide,
+    OutcomeCheckpoint,
+    OutcomeStatus,
+    ProposalStatus,
+    ThesisAction,
+    TimeHorizon,
+)
+from stockbrain.errors import ProviderError
+from stockbrain.logging import get_logger
 from stockbrain.market_data.base import Bar
+from stockbrain.market_data.yahoo import DailyBars, yahoo_symbol
 from stockbrain.risk.exits import EXIT_PRECEDENCE
 from stockbrain.risk.models import CalibrationBucket
 
@@ -26,6 +49,7 @@ __all__ = [
     "CHECKPOINTS",
     "EXIT_RULE_IDS",
     "EffectiveGrade",
+    "MemoryService",
     "bar_on_or_before",
     "calibrate",
     "checkpoints_for",
@@ -137,4 +161,384 @@ def calibrate(key: str, grades: Iterable[EffectiveGrade]) -> CalibrationBucket |
         hit_rate=hit_rate.normalize() if hit_rate == hit_rate.to_integral() else hit_rate,
         mean_alpha=mean_alpha.normalize() if mean_alpha == mean_alpha.to_integral() else mean_alpha,
         latest_graded_at=max(row.graded_at for row in rows),
+    )
+
+
+log = get_logger(__name__)
+
+#: A symbol fetched more recently than this is not fetched again (spec §5.5).
+_MIN_REFRESH_INTERVAL = dt.timedelta(hours=20)
+
+_TALLY_KEYS = (
+    "considered",
+    "graded",
+    "closed",
+    "abandoned",
+    "skipped_fresh",
+    "skipped_not_due",
+    "failed",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _Pending:
+    outcome: ThesisOutcome
+    symbol: str | None
+    exchange: str | None
+    held: bool
+    sold_at: dt.datetime | None
+    sold_rule: str | None
+
+
+class MemoryService:
+    """Records thesis outcomes and grades them; the scheduler's entry point is ``tick``."""
+
+    def __init__(
+        self,
+        database: Database,
+        settings: Settings,
+        *,
+        bars: DailyBars,
+        broker: Broker = Broker.TRADING212,
+    ) -> None:
+        self._database = database
+        self._settings = settings
+        self._bars = bars
+        self._broker = broker
+
+    # ------------------------------------------------------------------
+    # Record (spec §5.1)
+    # ------------------------------------------------------------------
+    async def record(self, *, now: dt.datetime | None = None) -> int:
+        """One outcome per EXECUTED thesis-backed proposal; idempotent."""
+        moment = now or utcnow()
+        async with self._database.transaction() as session:
+            rows = (
+                await session.execute(
+                    sa.select(
+                        TradeProposal, Thesis, ResearchRun, Event.event_type, BrokerInstrument
+                    )
+                    .join(Thesis, Thesis.id == TradeProposal.thesis_id)
+                    .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
+                    .join(Event, Event.id == ResearchRun.event_id, isouter=True)
+                    # The run's resolved listing, always set; the proposal's own
+                    # ``broker_instrument_id`` is nullable and the test seeds omit it.
+                    .join(
+                        BrokerInstrument,
+                        BrokerInstrument.id == ResearchRun.broker_instrument_id,
+                    )
+                    .where(
+                        TradeProposal.status == ProposalStatus.EXECUTED,
+                        TradeProposal.thesis_id.is_not(None),
+                        TradeProposal.executed_at.is_not(None),
+                        TradeProposal.broker == self._broker,
+                        ~sa.exists(
+                            sa.select(ThesisOutcome.id).where(
+                                ThesisOutcome.proposal_id == TradeProposal.id
+                            )
+                        ),
+                    )
+                    .order_by(TradeProposal.executed_at)
+                    .limit(200)
+                )
+            ).all()
+            created = 0
+            for proposal, thesis, run, event_type, instrument in rows:
+                action = ThesisAction(proposal.research_action or proposal.side.value)
+                if action not in {ThesisAction.BUY, ThesisAction.REDUCE, ThesisAction.SELL}:
+                    continue
+                exit_rule = _exit_rule_of(proposal.risk_rules)
+                assert proposal.executed_at is not None
+                session.add(
+                    ThesisOutcome(
+                        proposal_id=proposal.id,
+                        thesis_id=thesis.id,
+                        research_run_id=run.id,
+                        company_id=run.company_id,
+                        broker_instrument_id=instrument.id,
+                        broker=proposal.broker,
+                        broker_ticker=proposal.broker_ticker,
+                        event_type=event_type,
+                        action=action,
+                        horizon=thesis.time_horizon,
+                        confidence=Decimal(str(proposal.research_confidence or 0)),
+                        is_exit=exit_rule is not None,
+                        exit_rule_id=exit_rule,
+                        entry_at=proposal.executed_at,
+                        entry_date=proposal.executed_at.astimezone(dt.UTC).date(),
+                        reference_price=proposal.reference_price,
+                        currency=instrument.currency,
+                        benchmark_symbol=self._settings.memory_benchmark_symbol,
+                        created_at=moment,
+                        updated_at=moment,
+                    )
+                )
+                created += 1
+        if created:
+            log.info("thesis_memory_recorded", outcomes=created)
+        return created
+
+    # ------------------------------------------------------------------
+    # Grade (spec §5.2-§5.5)
+    # ------------------------------------------------------------------
+    async def grade(self, *, now: dt.datetime | None = None) -> dict[str, int]:
+        moment = now or utcnow()
+        counts: Counter[str] = Counter(dict.fromkeys(_TALLY_KEYS, 0))
+        pending = await self._load_pending(moment, counts)
+        if not pending:
+            return dict(counts)
+
+        symbols = {item.symbol for item in pending if item.symbol} | {
+            self._settings.memory_benchmark_symbol
+        }
+        series: dict[str, tuple[Sequence[Bar], str]] = {}
+        failed_symbols: set[str] = set()
+        for symbol in sorted(symbols):
+            try:
+                series[symbol] = await self._bars.daily_bars(symbol, days=BARS_DAYS)
+            except ProviderError as exc:
+                failed_symbols.add(symbol)
+                log.warning("thesis_memory_bars_failed", symbol=symbol, error=str(exc)[:200])
+
+        benchmark = series.get(self._settings.memory_benchmark_symbol)
+        for item in pending:
+            outcome = item.outcome
+            try:
+                if item.symbol is None:
+                    await self._abandon(outcome.id, "no_yahoo_symbol", moment)
+                    counts["abandoned"] += 1
+                    continue
+                if item.symbol in failed_symbols or benchmark is None:
+                    await self._stamp_attempt(outcome.id, moment)
+                    counts["failed"] += 1
+                    continue
+                bars, currency = series[item.symbol]
+                if outcome.currency and currency != outcome.currency:
+                    await self._abandon(outcome.id, f"currency_mismatch:{currency}", moment)
+                    counts["abandoned"] += 1
+                    continue
+                graded, closed = await self._grade_one(outcome, item, bars, benchmark[0], moment)
+                counts["graded"] += graded
+                counts["closed"] += closed
+                if not graded and not closed:
+                    counts["skipped_not_due"] += 1
+            except Exception as exc:  # one outcome never sinks the tick
+                counts["failed"] += 1
+                log.exception(
+                    "thesis_memory_grade_failed", outcome_id=str(outcome.id), error=str(exc)[:200]
+                )
+                await self._stamp_attempt(outcome.id, moment)
+        log.info("thesis_memory_grade_completed", **counts)
+        return dict(counts)
+
+    async def tick(self) -> None:
+        await self.record()
+        await self.grade()
+
+    # ------------------------------------------------------------------
+    async def _load_pending(self, moment: dt.datetime, counts: Counter[str]) -> list[_Pending]:
+        async with self._database.session() as session:
+            rows = (
+                await session.execute(
+                    sa.select(ThesisOutcome, BrokerInstrument.exchange)
+                    .join(
+                        BrokerInstrument, BrokerInstrument.id == ThesisOutcome.broker_instrument_id
+                    )
+                    .where(
+                        ThesisOutcome.status == OutcomeStatus.PENDING,
+                        ThesisOutcome.broker == self._broker,
+                    )
+                    .order_by(ThesisOutcome.entry_at)
+                    .limit(500)
+                )
+            ).all()
+            pending: list[_Pending] = []
+            for outcome, exchange in rows:
+                counts["considered"] += 1
+                if (
+                    outcome.last_attempt_at is not None
+                    and moment - outcome.last_attempt_at < _MIN_REFRESH_INTERVAL
+                ):
+                    counts["skipped_fresh"] += 1
+                    continue
+                held = (
+                    await session.scalar(
+                        sa.select(sa.func.count())
+                        .select_from(Position)
+                        .where(
+                            Position.broker == self._broker,
+                            Position.broker_ticker == outcome.broker_ticker,
+                            Position.quantity > 0,
+                        )
+                    )
+                    or 0
+                ) > 0
+                sold = (
+                    await session.execute(
+                        sa.select(TradeProposal.executed_at, TradeProposal.risk_rules)
+                        .where(
+                            TradeProposal.broker == self._broker,
+                            TradeProposal.broker_ticker == outcome.broker_ticker,
+                            TradeProposal.status == ProposalStatus.EXECUTED,
+                            TradeProposal.side == OrderSide.SELL,
+                            TradeProposal.executed_at > outcome.entry_at,
+                        )
+                        .order_by(TradeProposal.executed_at.desc())
+                        .limit(1)
+                    )
+                ).first()
+                pending.append(
+                    _Pending(
+                        outcome=outcome,
+                        symbol=yahoo_symbol(outcome.broker_ticker, exchange),
+                        exchange=exchange,
+                        held=held,
+                        sold_at=sold[0] if sold else None,
+                        sold_rule=_exit_rule_of(sold[1]) if sold else None,
+                    )
+                )
+            return pending
+
+    async def _grade_one(
+        self,
+        outcome: ThesisOutcome,
+        item: _Pending,
+        bars: Sequence[Bar],
+        benchmark: Sequence[Bar],
+        moment: dt.datetime,
+    ) -> tuple[int, int]:
+        """Grade every due checkpoint (and CLOSE) for one outcome. Returns (graded, closed)."""
+        entry = entry_bar(bars, outcome.entry_date)
+        bench_entry = entry_bar(benchmark, outcome.entry_date)
+        if entry is None or bench_entry is None:
+            await self._stamp_attempt(outcome.id, moment)
+            return 0, 0
+        days = trading_days_after(bars, outcome.entry_date)
+        async with self._database.transaction() as session:
+            row = await session.get(ThesisOutcome, outcome.id, with_for_update=True)
+            assert row is not None
+            existing = set(
+                await session.scalars(
+                    sa.select(ThesisOutcomeGrade.checkpoint).where(
+                        ThesisOutcomeGrade.outcome_id == row.id
+                    )
+                )
+            )
+            graded = 0
+            closed = 0
+            # Checkpoints are graded against the latest close.
+            latest = bars[-1]
+            bench_latest = bench_entry if len(benchmark) == 0 else benchmark[-1]
+            schedule = checkpoints_for(row.horizon)
+            for checkpoint in schedule:
+                needed = checkpoint.trading_days
+                assert needed is not None
+                if checkpoint.value in existing or days < needed:
+                    continue
+                session.add(
+                    _grade_row(
+                        row, checkpoint, days, entry, latest, bench_entry, bench_latest, moment
+                    )
+                )
+                existing.add(checkpoint.value)
+                graded += 1
+
+            # Close (spec §5.4).
+            if row.action is ThesisAction.BUY and not row.is_exit and not item.held:
+                closed_at = item.sold_at or moment
+                close_day = closed_at.astimezone(dt.UTC).date()
+                at_close = bar_on_or_before(bars, close_day)
+                bench_close = bar_on_or_before(benchmark, close_day)
+                if at_close is not None and bench_close is not None:
+                    if OutcomeCheckpoint.CLOSE.value not in existing:
+                        session.add(
+                            _grade_row(
+                                row,
+                                OutcomeCheckpoint.CLOSE,
+                                trading_days_after(bars, row.entry_date)
+                                - trading_days_after(bars, close_day),
+                                entry,
+                                at_close,
+                                bench_entry,
+                                bench_close,
+                                moment,
+                            )
+                        )
+                        graded += 1
+                    row.status = OutcomeStatus.CLOSED
+                    row.closed_at = closed_at
+                    row.close_reason = item.sold_rule or (
+                        "sell_executed" if item.sold_at else "position_gone"
+                    )
+                    closed = 1
+            elif row.action is not ThesisAction.BUY or row.is_exit:
+                # Trims, sells and exits never close; they retire after their last checkpoint.
+                if all(checkpoint.value in existing for checkpoint in schedule):
+                    row.status = OutcomeStatus.CLOSED
+                    row.closed_at = moment
+                    row.close_reason = "checkpoints_complete"
+                    closed = 1
+            row.last_attempt_at = moment
+            row.updated_at = moment
+        return graded, closed
+
+    async def _stamp_attempt(self, outcome_id: uuid.UUID, moment: dt.datetime) -> None:
+        async with self._database.transaction() as session:
+            await session.execute(
+                sa.update(ThesisOutcome)
+                .where(ThesisOutcome.id == outcome_id)
+                .values(last_attempt_at=moment, updated_at=moment)
+            )
+
+    async def _abandon(self, outcome_id: uuid.UUID, reason: str, moment: dt.datetime) -> None:
+        async with self._database.transaction() as session:
+            await session.execute(
+                sa.update(ThesisOutcome)
+                .where(ThesisOutcome.id == outcome_id)
+                .values(
+                    status=OutcomeStatus.ABANDONED,
+                    closed_at=moment,
+                    close_reason=reason,
+                    last_attempt_at=moment,
+                    updated_at=moment,
+                )
+            )
+
+
+def _exit_rule_of(rules: object) -> str | None:
+    """The exit rule id recorded on a proposal's ``risk_rules``, if any."""
+    if not isinstance(rules, list):
+        return None
+    for rule in rules:
+        if isinstance(rule, dict) and rule.get("rule_id") in EXIT_RULE_IDS:
+            return str(rule["rule_id"])
+    return None
+
+
+def _grade_row(
+    outcome: ThesisOutcome,
+    checkpoint: OutcomeCheckpoint,
+    trading_days: int,
+    entry: Bar,
+    current: Bar,
+    bench_entry: Bar,
+    bench_current: Bar,
+    moment: dt.datetime,
+) -> ThesisOutcomeGrade:
+    instrument, benchmark, alpha = returns(
+        entry.close, current.close, bench_entry.close, bench_current.close
+    )
+    return ThesisOutcomeGrade(
+        outcome_id=outcome.id,
+        checkpoint=checkpoint.value,
+        trading_days=trading_days,
+        entry_close=entry.close,
+        current_close=current.close,
+        benchmark_entry_close=bench_entry.close,
+        benchmark_current_close=bench_current.close,
+        instrument_return=instrument.quantize(_SIX_PLACES, ROUND_HALF_EVEN),
+        benchmark_return=benchmark.quantize(_SIX_PLACES, ROUND_HALF_EVEN),
+        alpha=alpha.quantize(_SIX_PLACES, ROUND_HALF_EVEN),
+        correct=is_correct(outcome.action, alpha),
+        graded_at=moment,
     )

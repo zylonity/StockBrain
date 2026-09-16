@@ -839,6 +839,18 @@ class Settings(BaseSettings):
     volatility_refresh_interval_seconds: float = 21600.0
     volatility_bars_days: int = 90
 
+    memory_grade_enabled: bool = True
+    """The thesis-memory sweep: record executed thesis trades and grade them
+    against the benchmark from daily bars.  Additive -- it writes only the two
+    memory tables and never touches a proposal."""
+    memory_packet_enabled: bool = False
+    """Whether research packets carry the memory section (standing thesis,
+    position, calibration).  This is the behavioural change; off until the
+    operator turns it on."""
+    memory_grade_interval_seconds: float = 21600.0
+    memory_benchmark_symbol: str = "SPY"
+    memory_standing_thesis_max_age_days: int = 14
+
     proposal_revalidation_batch: int = 5
     """How many active proposals the invalidation sweep re-prices per tick.
     Bounded so the sweep cannot turn into an unmetered market-data spend."""
@@ -1246,6 +1258,18 @@ class Settings(BaseSettings):
             problems.append(
                 f"VOLATILITY_BARS_DAYS must be between 30 and 365 (got {self.volatility_bars_days})"
             )
+        if not 3600.0 <= self.memory_grade_interval_seconds <= 86400.0:
+            problems.append(
+                "MEMORY_GRADE_INTERVAL_SECONDS must be between 3600 and 86400 "
+                f"(got {self.memory_grade_interval_seconds})"
+            )
+        if not 1 <= self.memory_standing_thesis_max_age_days <= 90:
+            problems.append(
+                "MEMORY_STANDING_THESIS_MAX_AGE_DAYS must be between 1 and 90 "
+                f"(got {self.memory_standing_thesis_max_age_days})"
+            )
+        if not self.memory_benchmark_symbol.strip():
+            problems.append("MEMORY_BENCHMARK_SYMBOL must not be empty")
         if problems:
             raise ValueError("Invalid risk configuration: " + "; ".join(problems))
         if self.volatility_bars_days < 2 * self.risk_exit_atr_period + 7:

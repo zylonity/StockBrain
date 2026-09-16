@@ -1037,6 +1037,42 @@ CATALOGUE: tuple[_Group, ...] = (
                 "cover the ATR period, which is measured in trading days.",
                 unit="days",
             ),
+            _s(
+                "memory_grade_enabled",
+                "Thesis memory grading",
+                RESTART,
+                "Whether the sweep that records executed thesis trades and grades them "
+                "against the benchmark runs. Additive: it writes only the memory tables.",
+            ),
+            _s(
+                "memory_packet_enabled",
+                "Memory in research packets",
+                RESTART,
+                "Whether every research packet carries the standing thesis, the live "
+                "position and the calibration record. Changes what research sees; off "
+                "until turned on deliberately.",
+            ),
+            _s(
+                "memory_grade_interval_seconds",
+                "Memory grading interval",
+                RESTART,
+                "How often the grading sweep runs. Daily bars change once a day.",
+                unit="seconds",
+            ),
+            _s(
+                "memory_benchmark_symbol",
+                "Memory benchmark",
+                RESTART,
+                "Yahoo symbol every outcome's return is measured against.",
+            ),
+            _s(
+                "memory_standing_thesis_max_age_days",
+                "Standing thesis maximum age",
+                RESTART,
+                "A published thesis older than this is no longer shown to research as "
+                "the company's standing view.",
+                unit="days",
+            ),
         ),
     ),
     _Group(
