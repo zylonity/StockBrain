@@ -202,12 +202,16 @@ class FeedHttpClient(ProviderHttpClient):
         """GET one feed URL with no retry and the request's language preference."""
         headers = dict(self._default_headers)
         headers["Accept-Language"] = language
-        return await self.request_json(
+        # ``request_json`` is typed ``Any`` (it decodes JSON); this subclass
+        # decodes text, so the result is narrowed through a typed local rather
+        # than leaked out of a ``-> str`` method as ``Any``.
+        text: str = await self.request_json(
             "GET",
             url,
             headers=headers,
             retry_safe=False,
         )
+        return text
 
     def _decode(self, response: httpx.Response) -> str:
         return response.text

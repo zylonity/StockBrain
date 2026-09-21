@@ -152,6 +152,13 @@ disallow_untyped_defs = true
 module = ["pandas", "pandas.*", "stockstats", "stockstats.*", "yfinance", "yfinance.*"]
 ignore_missing_imports = true
 
+# lxml ships no type information either. It is used by the disclosure-feed
+# adapters only, where the parsed tree is immediately reduced to plain text, so
+# nothing untyped escapes into the rest of the package.
+[[tool.mypy.overrides]]
+module = ["lxml", "lxml.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------

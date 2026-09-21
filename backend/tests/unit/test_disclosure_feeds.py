@@ -63,6 +63,7 @@ def test_to_document_maps_provider_identity_and_language() -> None:
     document = to_document(_item())
     assert document.provider is SourceProvider.INVESTEGATE
     assert document.provider_item_id == "9782378"
+    assert document.url is not None
     assert document.url.endswith("/9782378")
     assert document.source_name == "Investegate"
     assert document.symbols == ["BARC"]

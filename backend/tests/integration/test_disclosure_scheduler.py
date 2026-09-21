@@ -36,7 +36,7 @@ def _settings(database: Database, **overrides: Any) -> Settings:
         "memory_grade_enabled": False,
     }
     base.update(overrides)
-    return Settings(**base)  # type: ignore[arg-type]
+    return Settings(**base)
 
 
 def _container(database: Database, **overrides: Any) -> ServiceContainer:
