@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -46,6 +47,7 @@ from stockbrain.enums import (
     NotificationStatus,
     ProviderStatus,
     ResolutionStatus,
+    SourceProvider,
     WebDiscoveryKind,
     WebDiscoveryProviderName,
 )
@@ -59,10 +61,16 @@ from stockbrain.extraction.local import LocalContentExtractor
 from stockbrain.fx.base import FxRateProvider
 from stockbrain.fx.service import FxService, build_fx_provider
 from stockbrain.httpclient import ProviderHttpClient, TokenBucket
+from stockbrain.ingestion.actusnews import ActusNewsFeed
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
 from stockbrain.ingestion.brave import BraveSearchClient
+from stockbrain.ingestion.cnmv import CNMVFeed
+from stockbrain.ingestion.disclosure_feeds import DisclosureFeed
+from stockbrain.ingestion.eqs import EQSFeed
 from stockbrain.ingestion.exa import ExaSearchClient
 from stockbrain.ingestion.firecrawl import FirecrawlClient
+from stockbrain.ingestion.globenewswire import GlobeNewswireFeed
+from stockbrain.ingestion.investegate import InvestegateFeed
 from stockbrain.ingestion.provider_budget import ProviderCallBudget
 from stockbrain.ingestion.sec_edgar import SecEdgarClient
 from stockbrain.ingestion.service import IngestionOutcome, IngestionService
@@ -86,6 +94,7 @@ from stockbrain.intelligence.research_transport import ResearchTransport
 from stockbrain.intelligence.semantic_dedupe import SemanticDeduplicator
 from stockbrain.intelligence.service import ClassificationService
 from stockbrain.intelligence.tradingagents_adapter import TradingAgentsResearchEngine
+from stockbrain.jobs.disclosure import handle_disclosure_feed_poll
 from stockbrain.jobs.handlers import (
     effective_query_interval_minutes,
     register_ingestion_handlers,
@@ -147,6 +156,7 @@ class ServiceContainer:
 
     alpaca_news: AlpacaNewsClient | None = field(default=None, init=False)
     sec: SecEdgarClient | None = field(default=None, init=False)
+    disclosure_feeds: dict[str, DisclosureFeed] = field(default_factory=dict, init=False)
 
     brave: BraveSearchClient | None = field(default=None, init=False)
     exa: ExaSearchClient | None = field(default=None, init=False)
@@ -453,6 +463,7 @@ class ServiceContainer:
             )
 
         self._build_web_discovery()
+        self._build_disclosure_feeds()
 
         # data.sec.gov needs no key, but it does need a contact in the
         # User-Agent or it answers 403.
@@ -628,6 +639,9 @@ class ServiceContainer:
             account_sync_available=self.t212_account is not None,
             execution_available=self.execution is not None,
         )
+        self.registry.register(
+            JobType.DISCLOSURE_FEED_POLL.value, handle_disclosure_feed_poll
+        )
 
         # Before a worker or the scheduler can act, say out loud whether this
         # process is coming back up halted. A crash while paused or killed must
@@ -708,10 +722,71 @@ class ServiceContainer:
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.aclose()
+        for feed in self.disclosure_feeds.values():
+            with contextlib.suppress(Exception):
+                await feed.aclose()
 
     # ------------------------------------------------------------------
     # Schedules
     # ------------------------------------------------------------------
+    def _build_disclosure_feeds(self) -> None:
+        """Construct one adapter per enabled feed; nothing if the master is off."""
+        settings = self.settings
+        if not settings.disclosure_feeds_enabled:
+            return
+        feeds: dict[str, DisclosureFeed] = {}
+        feed: DisclosureFeed
+        if settings.investegate_enabled:
+            feed = InvestegateFeed(settings)
+            feeds[feed.name] = feed
+        if settings.eqs_enabled:
+            feed = EQSFeed(settings)
+            feeds[feed.name] = feed
+        if settings.cnmv_enabled:
+            for kind in ("ip", "oir"):
+                feed = CNMVFeed(settings, kind=kind)
+                feeds[feed.name] = feed
+        if settings.globenewswire_enabled:
+            for country in settings.globenewswire_countries:
+                feed = GlobeNewswireFeed(settings, country=country)
+                feeds[feed.name] = feed
+        if settings.actusnews_enabled:
+            feed = ActusNewsFeed(settings)
+            feeds[feed.name] = feed
+        self.disclosure_feeds = feeds
+
+    def _disclosure_interval(self, provider: SourceProvider) -> float:
+        return {
+            SourceProvider.INVESTEGATE: self.settings.investegate_interval_seconds,
+            SourceProvider.EQS: self.settings.eqs_interval_seconds,
+            SourceProvider.CNMV: self.settings.cnmv_interval_seconds,
+            SourceProvider.GLOBENEWSWIRE: self.settings.globenewswire_interval_seconds,
+            SourceProvider.ACTUSNEWS: self.settings.actusnews_interval_seconds,
+        }[provider]
+
+    def _disclosure_enqueue_callback(self, name: str) -> Callable[[], Awaitable[None]]:
+        async def _run() -> None:
+            await self._enqueue_disclosure_feed(name)
+
+        return _run
+
+    async def _enqueue_disclosure_feed(self, name: str) -> None:
+        """Enqueue one feed poll.  The master flag and the pause gate it first."""
+        if not self.settings.disclosure_feeds_enabled:
+            return
+        if not self.settings.discovery_enabled or await self._discovery_paused():
+            return
+        async with self.database.transaction() as session:
+            await self.queue.enqueue(
+                session,
+                JobType.DISCLOSURE_FEED_POLL,
+                payload={"feed": name},
+                # One outstanding poll per feed: a slow feed must not accumulate
+                # a backlog of identical polls.
+                dedupe_key=f"feed:{name}",
+                priority=50,
+            )
+
     def _register_schedules(self, scheduler: Scheduler) -> None:
         if self.research is not None:
             scheduler.add(
@@ -764,6 +839,15 @@ class ServiceContainer:
                     interval_seconds=300.0,
                     run=self._enqueue_sec_refresh,
                     initial_delay_seconds=30.0,
+                )
+            )
+        for name, feed in self.disclosure_feeds.items():
+            scheduler.add(
+                ScheduledTask(
+                    name=f"disclosure_feed:{name}",
+                    interval_seconds=self._disclosure_interval(feed.provider),
+                    run=self._disclosure_enqueue_callback(name),
+                    initial_delay_seconds=45.0,
                 )
             )
         if self.classification is not None:
