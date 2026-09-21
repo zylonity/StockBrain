@@ -1,0 +1,317 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<?xml-stylesheet type="text/xsl" href="/rss/rss.xsl?v=1550502984" ?>
+<rss version="2.0"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/">
+	<channel>
+		<title><![CDATA[Actusnews Wire : Primary information provider]]></title>
+		<link>https://www.actusnews.com/</link>
+		<description><![CDATA[English releases of the past 15 days on Actusnews.com.]]></description>
+		<language>en-EN</language>
+		<copyright><![CDATA[© 2004-2026 Actusnews.com]]></copyright>
+		<managingEditor>contact@actusnews.com (Commercial team)</managingEditor>
+		<webMaster>webmaster@actusnews.com (Webmaster team)</webMaster>
+		<pubDate>Mon, 21 Sep 2026 00:00:01 +0200</pubDate>
+		<lastBuildDate>Mon, 21 Sep 2026 12:54:01 +0200</lastBuildDate>
+		<sy:updatePeriod>hourly</sy:updatePeriod>
+		<sy:updateFrequency>1</sy:updateFrequency>
+		<sy:updateBase>2026-09-21T12:54:01+02:00</sy:updateBase>
+		<generator>Generateur RSS Actusnews Version 1.2, par Jean-Philippe Higelin</generator>
+		<atom:link href="https://www.actusnews.com/en/rss" rel="self" type="application/rss+xml" />
+		<docs>https://cyber.harvard.edu/rss/</docs>
+		<cloud domain="www.actusnews.com" port="80" path="/RPC2" registerProcedure="pingMe" protocol="soap" />
+		<ttl>20</ttl>
+		<image>
+			<url>https://www.actusnews.com/actualites/actusnews_small.gif</url>
+			<title><![CDATA[Actusnews Wire : Primary information provider]]></title>
+			<link>https://www.actusnews.com/</link>
+			<description><![CDATA[broadcast press releases]]></description>
+			<height>48</height>
+			<width>100</width>
+		</image>
+
+		<item>
+			<title><![CDATA[ARTMARKET.COM : ARTPRICE NEWS: A WORLD-BOOK BECOMES A MIRROR FOR ARTIFICIAL INTELLIGENCE]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/artmarket/pr/2026/09/18/artprice-news-a-world-book-becomes-a-mirror-for-artificial-intelligence" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/ART">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/artmarket/pr/2026/09/18/artprice-news-a-world-book-becomes-a-mirror-for-artificial-intelligence</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100301-pr-en-artprice-news-a-world-book-becomes-a-mirror-for-artifical-intelligence.pdf</guid>
+			<pubDate>Fri, 18 Sep 2026 18:45:00 +0200</pubDate>
+			<dc:creator><![CDATA[ARTMARKET.COM]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[ODIOT SA : ODIOT S.A. announces a capital increase of EUR 1,200,000]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/odiot-sa/pr/2026/09/18/odiot-s_a_-announces-a-capital-increase-of-eur-1-200-000" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/ODIOTSA">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/odiot-sa/pr/2026/09/18/odiot-s_a_-announces-a-capital-increase-of-eur-1-200-000</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100299-20260918_pr-odiotsa-ak4en.pdf</guid>
+			<pubDate>Fri, 18 Sep 2026 18:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[ODIOT SA]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[MACOMPTA.FR - Number of outstanding shares and voting rights]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/macomptafr/pr/2026/09/17/macompta_fr-number-of-outstanding-shares-and-voting-rights" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/MACOMPTA">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/macomptafr/pr/2026/09/17/macompta_fr-number-of-outstanding-shares-and-voting-rights</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100278-droits-votes-et-actions-au-310826-va.pdf</guid>
+			<pubDate>Thu, 17 Sep 2026 18:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[MACOMPTA.FR]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[AKWEL : Net income of EUR 10.5m in the first-half of 2026]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/akwel/pr/2026/09/17/akwel-net-income-of-eur-10_5m-in-the-first-half-of-2026" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/AKWEL">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/akwel/pr/2026/09/17/akwel-net-income-of-eur-10_5m-in-the-first-half-of-2026</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100284-2026-09-17_akwel_res-s12026_en.pdf</guid>
+			<pubDate>Thu, 17 Sep 2026 17:45:00 +0200</pubDate>
+			<dc:creator><![CDATA[AKWEL]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[ALTAMIR : Altamir's NAV up 5.0% over the half-year. Very strong portfolio performance]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/altamir/pr/2026/09/17/altamir_s-nav-up-5_0-per-cent-over-the-half-year_-very-strong-portfolio-performance" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/ALTAMIRAMB">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/altamir/pr/2026/09/17/altamir_s-nav-up-5_0-per-cent-over-the-half-year_-very-strong-portfolio-performance</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100280-cp-anr-30-juin-2026-va.pdf</guid>
+			<pubDate>Thu, 17 Sep 2026 17:45:00 +0200</pubDate>
+			<dc:creator><![CDATA[ALTAMIR]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[ATARI : Atari finalizes refinancing and converts EUR 12.6 million of loans into equity]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/atari/pr/2026/09/17/atari-finalizes-refinancing-and-converts-eur-12_6-million-of-loans-into-equity" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/ATARI">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/atari/pr/2026/09/17/atari-finalizes-refinancing-and-converts-eur-12_6-million-of-loans-into-equity</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100276-atari-capital-increase-september-2026-def.pdf</guid>
+			<pubDate>Thu, 17 Sep 2026 08:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[ATARI]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[DRONE VOLT announces its results for the first half of 2026]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/dronevolt/pr/2026/09/16/drone-volt-announces-its-results-for-the-first-half-of-2026" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/DRONEVOLT">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/dronevolt/pr/2026/09/16/drone-volt-announces-its-results-for-the-first-half-of-2026</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100274-aldrv-rs-2026-vdef-en.pdf</guid>
+			<pubDate>Wed, 16 Sep 2026 18:10:00 +0200</pubDate>
+			<dc:creator><![CDATA[DRONE VOLT]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[AUBAY : 2026 Half-Yearly Results: Growth of 30.8% (11.4% on an organic basis) - Improvement in operating margins - Raised 2026 objectives confirmed]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/aubay/pr/2026/09/16/2026-half-yearly-results-growth-of-30_8-per-cent-11_4-per-cent-on-an-organic-basis-improvement-in-operating-margins-raised-2026" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/AUBAY">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/aubay/pr/2026/09/16/2026-half-yearly-results-growth-of-30_8-per-cent-11_4-per-cent-on-an-organic-basis-improvement-in-operating-margins-raised-2026</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100272-communique-financial-information-s1-2026.pdf</guid>
+			<pubDate>Wed, 16 Sep 2026 18:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[AUBAY]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[LHYFE : H2APEX and Lhyfe expand partnership to support Germany's growing hydrogen market]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/lhyfe/pr/2026/09/16/h2apex-and-lhyfe-expand-partnership-to-support-germany_s-growing-hydrogen-market" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/LHYFE">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/lhyfe/pr/2026/09/16/h2apex-and-lhyfe-expand-partnership-to-support-germany_s-growing-hydrogen-market</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100261-260916_cp-lhyfe-x-h2apex-2026_en.pdf</guid>
+			<pubDate>Wed, 16 Sep 2026 07:30:00 +0200</pubDate>
+			<dc:creator><![CDATA[LHYFE]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[ARTMARKET.COM : ARTPRICE NEWS: THE 18TH LYON BIENNALE OF CONTEMPORARY ART IS NOW OPEN!]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/artmarket/pr/2026/09/15/artprice-news-the-18th-lyon-biennale-of-contemporary-art-is-now-open" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/ART">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/artmarket/pr/2026/09/15/artprice-news-the-18th-lyon-biennale-of-contemporary-art-is-now-open</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100252-artprice-news-the-18th-lyon-biennale-of-contemporary-art-is-now-open.pdf</guid>
+			<pubDate>Tue, 15 Sep 2026 15:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[ARTMARKET.COM]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[WAVESTONE : Share buy-back program: Declaration of transactions conducted by Wavestone on its own shares from September 07 to 11, 2026]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/wavestone/pr/2026/09/14/share-buy-back-program-declaration-of-transactions-conducted-by-wavestone-on-its-own-shares-from-september-07-to-11-2026" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/7486">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/wavestone/pr/2026/09/14/share-buy-back-program-declaration-of-transactions-conducted-by-wavestone-on-its-own-shares-from-september-07-to-11-2026</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100228-share-buy-back-program-07-to-11-september-2026.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 18:15:00 +0200</pubDate>
+			<dc:creator><![CDATA[WAVESTONE]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[EXAIL TECHNOLOGIES (ex GROUPE GORGE) : Financial calendar update: publication of 2026 half-year results on September 24, 2026]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/exail-technologies/pr/2026/09/14/financial-calendar-update-publication-of-2026-half-year-results-on-september-24-2026" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/6267">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/exail-technologies/pr/2026/09/14/financial-calendar-update-publication-of-2026-half-year-results-on-september-24-2026</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100241-cp_exail-technologies_date-de-publication-h1-2026_en.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 18:05:00 +0200</pubDate>
+			<dc:creator><![CDATA[EXAIL TECHNOLOGIES (ex GROUPE GORGE)]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[DELFINGEN : 2026 Half-Year Results: Current Operating Margin of 9% and Net Income Up 42%]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/delfingen-industry/pr/2026/09/14/2026-half-year-results-current-operating-margin-of-9-per-cent-and-net-income-up-42-per-cent" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/DELFINGEN">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/delfingen-industry/pr/2026/09/14/2026-half-year-results-current-operating-margin-of-9-per-cent-and-net-income-up-42-per-cent</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100237-cp_delfingen_rs_2026_en_vdef.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 18:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[DELFINGEN]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[OXURION : Oxurion Receives Transparency Notification from Atlas Special Opportunities II LLC]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/oxurion/pr/2026/09/14/oxurion-receives-transparency-notification-from-atlas-special-opportunities-ii-llc" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/OXURION">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/oxurion/pr/2026/09/14/oxurion-receives-transparency-notification-from-atlas-special-opportunities-ii-llc</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100229-oxur-transparency-notification-en-20260914.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 18:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[OXURION]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[VENTE-UNIQUE.COM : Disclosure of trading in own shares]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/venteuniquecom/pr/2026/09/14/disclosure-of-trading-in-own-shares" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/VUCOM">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/venteuniquecom/pr/2026/09/14/disclosure-of-trading-in-own-shares</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100223-vu_cp_rachat-actions-7-11_09-eng.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 18:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[VENTE-UNIQUE.COM]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[ZCCM-IH - FINAL DIVIDEND NOTICE- SENS_11 September 2026]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/zccm/pr/2026/09/14/zccm-ih-final-dividend-notice-sens_11-september-2026" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/ZCCM">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/zccm/pr/2026/09/14/zccm-ih-final-dividend-notice-sens_11-september-2026</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100215-zccm-ih-final-dividend-notice-sens_14-september-2026.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 17:55:00 +0200</pubDate>
+			<dc:creator><![CDATA[ZCCM]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[Vusion - Expiry of the Share Buyback Mandate Entrusted to an Investment Services Provider]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/vusiongroup/pr/2026/09/14/vusion-expiry-of-the-share-buyback-mandate-entrusted-to-an-investment-services-provider" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/SES">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/vusiongroup/pr/2026/09/14/vusion-expiry-of-the-share-buyback-mandate-entrusted-to-an-investment-services-provider</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100221-expiry-sbb-press-release-eng.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 17:40:00 +0200</pubDate>
+			<dc:creator><![CDATA[Vusion]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[CAPITAL B : Capital B confirms the acquisition of 4 BTC for EUR 0.27 million, the holding of a total of 3,525 BTC, and a BTC Yield of 2.19% YTD]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/capital-b/pr/2026/09/14/capital-b-confirms-the-acquisition-of-4-btc-for-eur-0_27-million-the-holding-of-a-total-of-3-525-btc-and-a-btc-yield-of-2_19-per" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/TBG">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/capital-b/pr/2026/09/14/capital-b-confirms-the-acquisition-of-4-btc-for-eur-0_27-million-the-holding-of-a-total-of-3-525-btc-and-a-btc-yield-of-2_19-per</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100208-20260914-capital-b-cp-14-septembre-2026-en-final.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 08:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[CAPITAL B]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[AGROGENERATION : CURRENT PERFORMANCE UPDATE]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/agrogeneration/pr/2026/09/14/current-performance-update" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/AGROGENERA">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/agrogeneration/pr/2026/09/14/current-performance-update</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100198-pr_agg_current-performance-update_vfinal.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 08:00:00 +0200</pubDate>
+			<dc:creator><![CDATA[AGROGENERATION]]></dc:creator>
+		</item>
+		<item>
+			<title><![CDATA[WAVESTONE : Wavestone continues its expansion in the United States with the acquisition of Sand Cherry]]></title>
+			<description><![CDATA[
+			<div class="act_cp">Full and original release on <a href="https://www.actusnews.com/en/wavestone/pr/2026/09/14/wavestone-continues-its-expansion-in-the-united-states-with-the-acquisition-of-sand-cherry" target="_blank">www.actusnews.com</a>.<br />
+					<a href="https://www.actusnews.com/en/subscriptions/7486">Subscribe</a> to this company's information.</div><hr />
+		]]>
+			</description>
+
+			<category>Actusnews</category>
+			<link>https://www.actusnews.com/en/wavestone/pr/2026/09/14/wavestone-continues-its-expansion-in-the-united-states-with-the-acquisition-of-sand-cherry</link>
+			<guid>https://www.actusnews.com/documents_communiques/ACTUS-0-100206-2026-09-ma-press-release-sand-cherry-en.pdf</guid>
+			<pubDate>Mon, 14 Sep 2026 07:30:00 +0200</pubDate>
+			<dc:creator><![CDATA[WAVESTONE]]></dc:creator>
+		</item>
+
+	</channel>
+</rss>
+<!-- CACHE-RETURN 299 -->
