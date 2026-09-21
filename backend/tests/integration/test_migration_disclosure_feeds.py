@@ -44,7 +44,7 @@ async def _enum_labels(url: str, type_name: str) -> set[str]:
 
 def test_source_provider_gains_the_disclosure_wire_labels(migrated_database: str) -> None:
     labels = asyncio.run(_enum_labels(migrated_database, "source_provider"))
-    assert NEW_LABELS <= labels
+    assert labels >= NEW_LABELS
 
 
 def test_the_migration_round_trips(migrated_database: str) -> None:

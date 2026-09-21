@@ -42,7 +42,7 @@ _CNMV_IP_LABEL = "Información privilegiada"
 _CNMV_OIR_LABEL = "Otra información relevante"
 
 #: Typographic apostrophes are normalised before matching so a rule written
-#: with an ASCII apostrophe still matches a feed that prints ``’``.
+#: with an ASCII apostrophe still matches a feed that prints U+2019.
 _APOSTROPHES = str.maketrans({"\u2018": "'", "\u2019": "'"})
 
 _BOILERPLATE_RULES: dict[SourceProvider, tuple[BoilerplateRule, ...]] = {

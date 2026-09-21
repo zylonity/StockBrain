@@ -57,7 +57,7 @@ def test_last_oir_row_fields() -> None:
     assert last.headline == (
         "Sobre instrumentos financieros La Sociedad comunica que va a proceder "
         "a la amortización anticipada total de la emisión de cédulas "
-        "territoriales denominada “Cédulas Territoriales – Marzo 2022” "
+        "territoriales denominada “Cédulas Territoriales – Marzo 2022” "  # noqa: RUF001 - literal fixture text
         "con código ISIN ES0413211A67."
     )
     assert last.company_name == "BANCO BILBAO VIZCAYA ARGENTARIA, S.A."
@@ -73,7 +73,11 @@ def test_inside_information_is_never_filtered_by_the_oir_rules() -> None:
     items = _oir()
     # The three ERCROS suspensions are real events, not warrant-issuer noise.
     assert sum(1 for item in items if "Sobre suspensiones" in item.headline) == 3
-    assert all(not is_boilerplate(item) for item in items if item.release_id in {"42823", "42822", "42821"})
+    assert all(
+        not is_boilerplate(item)
+        for item in items
+        if item.release_id in {"42823", "42822", "42821"}
+    )
 
 
 def test_an_empty_inside_information_channel_is_valid() -> None:
