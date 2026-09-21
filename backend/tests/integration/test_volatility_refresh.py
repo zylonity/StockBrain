@@ -85,6 +85,7 @@ async def _seed_position_with_peak(
     broker_ticker: str,
     exchange: str,
     currency: str | None,
+    market_symbol: str | None = None,
 ) -> None:
     """A funded holding, its listing's exchange, and the peak an ATR hangs on.
 
@@ -111,6 +112,7 @@ async def _seed_position_with_peak(
             BrokerInstrument(
                 broker=Broker.TRADING212,
                 broker_ticker=broker_ticker,
+                market_symbol=market_symbol,
                 name=broker_ticker,
                 exchange=exchange,
                 currency=currency,
@@ -211,6 +213,22 @@ async def test_refresh_stores_an_atr_in_the_instruments_currency(clean_tables: D
     assert peak.atr_period == 14 and peak.atr_currency == "USD" and peak.atr_source == "yahoo"
     assert peak.atr_as_of == (NOW - dt.timedelta(days=1)).date()
     assert peak.atr_refreshed_at == NOW  # the attempt clock, not the bar date
+
+
+async def test_the_listing_is_fetched_by_its_market_symbol_not_its_ticker_stem(
+    clean_tables: Database,
+) -> None:
+    """AGC_US_EQ is Grab: fetching "AGC" finds nothing (or someone else)."""
+    database = clean_tables
+    await _seed_position_with_peak(
+        database, broker_ticker="AGC_US_EQ", exchange="NASDAQ", currency="USD", market_symbol="GRAB"
+    )
+    bars = _FakeBars(currency="USD")
+    service = _volatility_service(database, bars)
+
+    counts = await service.refresh(now=NOW)
+
+    assert counts["refreshed"] == 1 and bars.calls == ["GRAB"]
 
 
 async def test_a_currency_mismatch_is_refused_not_converted(clean_tables: Database) -> None:

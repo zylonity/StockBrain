@@ -69,7 +69,12 @@ class VolatilityRefreshService:
         async with self._database.session() as session:
             rows = (
                 await session.execute(
-                    sa.select(Position, PositionPeak, BrokerInstrument.exchange)
+                    sa.select(
+                        Position,
+                        PositionPeak,
+                        BrokerInstrument.exchange,
+                        BrokerInstrument.market_symbol,
+                    )
                     .join(
                         PositionPeak,
                         sa.and_(
@@ -90,7 +95,7 @@ class VolatilityRefreshService:
             ).all()
 
         work: list[tuple[str, str, str | None]] = []
-        for position, peak, exchange in rows:
+        for position, peak, exchange, market_symbol in rows:
             counts["considered"] += 1
             if peak is None:
                 counts["skipped_no_peak"] += 1
@@ -108,7 +113,7 @@ class VolatilityRefreshService:
             ):
                 counts["skipped_fresh"] += 1
                 continue
-            symbol = yahoo_symbol(position.broker_ticker, exchange)
+            symbol = yahoo_symbol(position.broker_ticker, exchange, market_symbol=market_symbol)
             if symbol is None:
                 counts["skipped_no_symbol"] += 1
                 continue

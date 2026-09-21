@@ -50,6 +50,34 @@ def test_an_unknown_exchange_yields_no_symbol_rather_than_a_guess(exchange: str 
     assert yahoo_symbol("ABCl_EQ", exchange) is None
 
 
+@pytest.mark.parametrize(
+    ("ticker", "exchange", "market_symbol", "expected"),
+    [
+        # Trading 212's ticker stem is not the market symbol for a fifth of the
+        # US universe; the broker's own market_symbol is the truth.
+        ("AGC_US_EQ", "NASDAQ", "GRAB", "GRAB"),
+        ("BHI_US_EQ", "NASDAQ", "BKR", "BKR"),
+        ("VG1_US_EQ", "NYSE", "VG", "VG"),
+        # The share-class rule applies to the market symbol too.
+        ("BRKB_US_EQ", "NYSE", "BRK.B", "BRK-B"),
+        # Non-US: the market symbol has no venue letter; the suffix still applies.
+        ("KNOSl_EQ", "London Stock Exchange", "KNOS", "KNOS.L"),
+        ("ZPDFd_EQ", "Deutsche Börse Xetra", "ZPDF", "ZPDF.DE"),
+        # An empty market symbol falls back to the ticker stem.
+        ("AAPL_US_EQ", "NASDAQ", "", "AAPL"),
+        ("AAPL_US_EQ", "NASDAQ", None, "AAPL"),
+    ],
+)
+def test_the_market_symbol_wins_over_the_ticker_stem(
+    ticker: str, exchange: str, market_symbol: str | None, expected: str
+) -> None:
+    assert yahoo_symbol(ticker, exchange, market_symbol=market_symbol) == expected
+
+
+def test_an_unknown_exchange_yields_no_symbol_even_with_a_market_symbol() -> None:
+    assert yahoo_symbol("AGC_US_EQ", "Nowhere", market_symbol="GRAB") is None
+
+
 def test_a_ticker_without_the_eq_suffix_yields_no_symbol() -> None:
     assert yahoo_symbol("AAPL", "NASDAQ") is None
 

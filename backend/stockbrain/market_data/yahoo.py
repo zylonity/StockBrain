@@ -62,11 +62,23 @@ _US_SUFFIX = "_US_EQ"
 _EQ_SUFFIX = "_EQ"
 
 
-def yahoo_symbol(broker_ticker: str, exchange: str | None) -> str | None:
-    """The Yahoo symbol for a Trading 212 listing, or ``None`` when unknown."""
+def yahoo_symbol(
+    broker_ticker: str, exchange: str | None, *, market_symbol: str | None = None
+) -> str | None:
+    """The Yahoo symbol for a Trading 212 listing, or ``None`` when unknown.
+
+    ``market_symbol`` is the broker's own listing symbol and wins when given:
+    a fifth of the US universe has a ticker stem that is not the market symbol
+    (``AGC_US_EQ`` is Grab, ``GRAB``; ``BHI_US_EQ`` is Baker Hughes, ``BKR``),
+    and a symbol derived from the stem fetches nothing or, worse, another
+    company's bars.  The stem is the fallback for a listing with no symbol.
+    """
     if not exchange or exchange not in YAHOO_SUFFIX_BY_EXCHANGE:
         return None
     suffix = YAHOO_SUFFIX_BY_EXCHANGE[exchange]
+    if market_symbol:
+        # Yahoo spells share classes with a dash: BRK.B -> BRK-B.
+        return market_symbol.strip().replace(".", "-") + suffix
     if broker_ticker.endswith(_US_SUFFIX):
         base = broker_ticker[: -len(_US_SUFFIX)]
         # Yahoo spells share classes with a dash: BRK.B -> BRK-B.

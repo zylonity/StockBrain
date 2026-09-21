@@ -320,6 +320,22 @@ async def test_a_close_takes_its_reason_and_date_from_the_exit_sell(clean_tables
     assert grades[0].current_close == Decimal("92")  # the close on the sell date, not the rebound
 
 
+async def test_bars_are_fetched_by_the_listings_market_symbol(clean_tables: Database) -> None:
+    """The seeded listing is AAPL_US_EQ; relabel its market symbol and expect that fetched."""
+    await _executed(clean_tables)
+    await _hold(clean_tables)
+    async with clean_tables.transaction() as session:
+        await session.execute(
+            sa.update(ph.BrokerInstrument).values(market_symbol="GRAB")  # type: ignore[attr-defined]
+        )
+    bars = _world(instrument=["99", "100", "101"], benchmark=["500", "500", "501"])
+    bars.series["GRAB"] = bars.series.pop("AAPL")
+    service = MemoryService(clean_tables, _settings(), bars=bars)
+    await service.record()
+    await service.grade(now=dt.datetime(2026, 9, 3, 22, tzinfo=dt.UTC))
+    assert sorted(bars.calls) == ["GRAB", "SPY"]
+
+
 async def test_an_unknown_symbol_abandons_the_outcome(clean_tables: Database) -> None:
     await _executed(clean_tables)
     await _hold(clean_tables)

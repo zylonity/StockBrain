@@ -373,7 +373,9 @@ class MemoryService:
         async with self._database.session() as session:
             rows = (
                 await session.execute(
-                    sa.select(ThesisOutcome, BrokerInstrument.exchange)
+                    sa.select(
+                        ThesisOutcome, BrokerInstrument.exchange, BrokerInstrument.market_symbol
+                    )
                     .join(
                         BrokerInstrument, BrokerInstrument.id == ThesisOutcome.broker_instrument_id
                     )
@@ -386,7 +388,7 @@ class MemoryService:
                 )
             ).all()
             pending: list[_Pending] = []
-            for outcome, exchange in rows:
+            for outcome, exchange, market_symbol in rows:
                 counts["considered"] += 1
                 if (
                     outcome.last_attempt_at is not None
@@ -423,7 +425,9 @@ class MemoryService:
                 pending.append(
                     _Pending(
                         outcome=outcome,
-                        symbol=yahoo_symbol(outcome.broker_ticker, exchange),
+                        symbol=yahoo_symbol(
+                            outcome.broker_ticker, exchange, market_symbol=market_symbol
+                        ),
                         exchange=exchange,
                         held=held,
                         sold_at=sold[0] if sold else None,
