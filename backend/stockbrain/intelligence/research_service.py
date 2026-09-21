@@ -115,6 +115,10 @@ class ResearchService:
             ],
             "tools": ["read_research_context"],
             "debate_rounds": getattr(engine, "debate_rounds", 1),
+            # A run reasoned at a different effort is a different analysis.
+            "deep_reasoning_effort": getattr(
+                getattr(engine, "transport", None), "deep_reasoning_effort", None
+            ),
             # A packet with memory is a different analysis from one without, so
             # the flag forks the config version.
             "memory": memory_packet_enabled,

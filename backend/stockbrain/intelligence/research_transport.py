@@ -41,9 +41,12 @@ from stockbrain.llm.openai_compat import parse_usage, strict_json_schema
 from stockbrain.llm.pricing import PricingTable
 from stockbrain.llm.profiles import DEEPSEEK, ProviderProfile
 from stockbrain.llm.telemetry import LlmCallRecord, LlmTelemetry
+from stockbrain.logging import get_logger
 
 #: Finish reasons that are understood. Anything else is normalised to
 #: ``unknown`` so an unfamiliar value cannot be mistaken for a clean stop.
+log = get_logger(__name__)
+
 _KNOWN_FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "content_filter"})
 
 #: Finish reasons that mean the model produced a usable answer.
@@ -78,8 +81,16 @@ class ResearchTransport:
         http: ProviderHttpClient | None = None,
         max_tokens: int = 3000,
         pricing: PricingTable | None = None,
+        deep_reasoning_effort: str = "low",
     ) -> None:
         self.profile = profile
+        #: ``reasoning_effort`` for the thinking roles on a profile that has the
+        #: knob. Left unspecified, Muse Spark chose its own -- about 2,300
+        #: reasoning tokens on a bear call -- and the p99 manager call ran to
+        #: 109s against a 120s timeout. Measured on three stored packets, ``low``
+        #: reached the same action, horizon and confidence (+-0.02) in ~45% of
+        #: the time; the risk lists lost their fourth and fifth entries.
+        self.deep_reasoning_effort = deep_reasoning_effort
         self.base_url = (base_url or profile.base_url).strip()
         if not self.base_url:
             raise ValueError(
@@ -143,12 +154,11 @@ class ResearchTransport:
 
         if profile.reasoning == "deepseek_thinking":
             body["thinking"] = {"type": "enabled" if thinking else "disabled"}
-        elif (
-            profile.reasoning == "reasoning_effort"
-            and not thinking
-            and profile.minimum_reasoning_effort is not None
-        ):
-            body["reasoning_effort"] = profile.minimum_reasoning_effort
+        elif profile.reasoning == "reasoning_effort":
+            if thinking:
+                body["reasoning_effort"] = self.deep_reasoning_effort
+            elif profile.minimum_reasoning_effort is not None:
+                body["reasoning_effort"] = profile.minimum_reasoning_effort
 
         if tools:
             body["tools"] = tools
@@ -235,6 +245,22 @@ class ResearchTransport:
                 record.retry_count = attempt - 1
                 if finish in profile.retryable_finish_reasons:
                     raise ProviderUnavailable(f"{name} research: {finish}")
+                if finish == "length" and not message.get("content"):
+                    # Meta returns ``content: null`` on a capped completion and
+                    # bills every token of the discarded draft.  Naming that
+                    # keeps it from being read as a model that said nothing.
+                    log.warning(
+                        "research_response_discarded_at_cap",
+                        provider=name,
+                        role=role,
+                        cap_field=profile.max_output_tokens_field,
+                        cap=self.max_tokens,
+                        completion_tokens=usage.completion_tokens,
+                    )
+                    raise ProviderResponseError(
+                        f"{name} research: response discarded by the provider at "
+                        f"{profile.max_output_tokens_field}={self.max_tokens}; tokens billed"
+                    )
                 if finish not in _SUCCESS_FINISH_REASONS:
                     raise ProviderResponseError(f"{name} research: finish_reason={finish}")
                 if not message.get("content") and not message.get("tool_calls"):
@@ -279,13 +305,16 @@ class ResearchTransport:
                 record.error_class = type(exc).__name__
                 record.error = type(exc).__name__
                 await record_call(record)
-                # Only an explicit capacity response is repeated automatically. Transport
-                # failures have uncertain spend, so the run fails visibly instead.
-                if (
+                # Repeated automatically: an explicit capacity response, and one
+                # transport failure.  A read timeout has uncertain spend, but the
+                # run it sits in has already paid for up to eight other calls;
+                # one retry is cheaper than discarding them.  Every attempt is
+                # its own llm_calls row either way.
+                retryable = (
                     isinstance(exc, ProviderUnavailable)
                     and record.finish_reason in profile.retryable_finish_reasons
-                    and attempt < 2
-                ):
+                ) or _is_transport_failure(exc)
+                if retryable and attempt < 2:
                     await asyncio.sleep(0.5)
                     continue
                 raise safe_research_error(exc) from None
@@ -293,3 +322,8 @@ class ResearchTransport:
 
     async def aclose(self) -> None:
         await self.http.aclose()
+
+
+def _is_transport_failure(exc: BaseException) -> bool:
+    """The http client wraps every ``httpx.HTTPError`` in this one message shape."""
+    return isinstance(exc, ProviderUnavailable) and "transport failure" in str(exc)

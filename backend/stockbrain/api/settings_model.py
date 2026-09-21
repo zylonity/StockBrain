@@ -446,6 +446,15 @@ CATALOGUE: tuple[_Group, ...] = (
                 "and truncates the answer.",
                 unit="tokens",
             ),
+            _s(
+                "research_deep_reasoning_effort",
+                "Deep-role reasoning effort",
+                RESTART,
+                "reasoning_effort sent for bull, bear, manager and trader on a provider "
+                "with the knob (Meta). Unspecified, Muse Spark chose its own and the "
+                "slowest calls hit the transport timeout; low reaches the same verdicts "
+                "in under half the time. Ignored by DeepSeek, which has a thinking switch.",
+            ),
         ),
     ),
     _Group(

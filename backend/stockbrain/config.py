@@ -210,6 +210,11 @@ class Settings(BaseSettings):
     research_enabled: bool = True
     research_timeout_seconds: float = Field(default=600, ge=30, le=3600)
     research_max_output_tokens: int = Field(default=3000, ge=256, le=16000)
+    research_deep_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "low"
+    """``reasoning_effort`` sent for the thinking roles (bull, bear, manager,
+    trader) on a provider that has the knob. Left unspecified, Muse Spark chose
+    its own and the slowest calls ran into the transport timeout; ``low``
+    reached the same verdicts on stored packets in under half the time."""
 
     research_min_impact_materiality: float = Field(default=0.25, ge=0.0, le=1.0)
     """Materiality floor applied to each *impact*, not to the event.

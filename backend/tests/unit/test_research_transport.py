@@ -328,3 +328,136 @@ async def test_cancelled_upstream_thread_cannot_continue_provider_calls() -> Non
         await asyncio.wait_for(cancelled.wait(), timeout=5)
     assert calls == 1
     assert len(records) == 1 and not records[0].succeeded
+
+
+# ---------------------------------------------------------------------------
+# Provider-specific request shaping and failure handling (Meta / Muse Spark)
+# ---------------------------------------------------------------------------
+from stockbrain.llm.profiles import META  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("profile", "thinking", "effort", "expected"),
+    [
+        # Meta cannot switch reasoning off: a non-thinking role sends the floor.
+        (META, False, "low", "minimal"),
+        # A thinking role sends the configured deep effort.
+        (META, True, "low", "low"),
+        (META, True, "medium", "medium"),
+        # DeepSeek uses its own thinking switch and never sends reasoning_effort.
+        (DEEPSEEK, True, "low", None),
+        (DEEPSEEK, False, "low", None),
+    ],
+)
+def test_reasoning_effort_is_sent_per_profile_and_role(
+    profile: Any, thinking: bool, effort: str, expected: str | None
+) -> None:
+    client = ResearchTransport(SecretStr("key"), profile=profile, deep_reasoning_effort=effort)
+    body = client.build_body(
+        [HumanMessage(content="data")],
+        model="m",
+        thinking=thinking,
+        tools=None,
+        json_schema=None,
+    )
+    assert body.get("reasoning_effort") == expected
+    if profile is DEEPSEEK:
+        assert body["thinking"] == {"type": "enabled" if thinking else "disabled"}
+
+
+async def test_a_transport_timeout_is_retried_exactly_once() -> None:
+    """A read timeout has uncertain spend, but abandoning the other eight calls costs more."""
+    calls = 0
+    rows: list[LlmCallRecord] = []
+
+    async def record(row: LlmCallRecord) -> None:
+        rows.append(row)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("slow provider", request=request)
+        return httpx.Response(200, json=completion())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.deepseek.com"
+    ) as http:
+        client = ResearchTransport(
+            SecretStr("key"), http=ProviderHttpClient(provider="deepseek", base_url="", client=http)
+        )
+        response = await client.complete(
+            [HumanMessage(content="data")],
+            role="market",
+            model="deepseek-v4-flash",
+            thinking=False,
+            record_call=record,
+            check_budget=allowed,
+        )
+    assert calls == 2
+    assert response.content == "Public research summary."
+    assert [row.succeeded for row in rows] == [False, True]
+    assert rows[0].error_class == "ProviderUnavailable"
+    assert (rows[1].attempt, rows[1].retry_count) == (2, 1)
+
+
+async def test_a_second_transport_timeout_fails_the_call() -> None:
+    calls = 0
+
+    async def record(row: LlmCallRecord) -> None:
+        pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("slow provider", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.deepseek.com"
+    ) as http:
+        client = ResearchTransport(
+            SecretStr("key"), http=ProviderHttpClient(provider="deepseek", base_url="", client=http)
+        )
+        with pytest.raises(ProviderUnavailable):
+            await client.complete(
+                [HumanMessage(content="data")],
+                role="market",
+                model="deepseek-v4-flash",
+                thinking=False,
+                record_call=record,
+                check_budget=allowed,
+            )
+    assert calls == 2
+
+
+async def test_meta_discarding_a_capped_response_is_named_not_called_empty() -> None:
+    """Muse Spark returns content null on finish_reason=length and bills every token."""
+    rows: list[LlmCallRecord] = []
+
+    async def record(row: LlmCallRecord) -> None:
+        rows.append(row)
+
+    payload = completion(content="", model="muse-spark-1.3-contributor", reasoning=None)
+    payload["choices"][0]["message"]["content"] = None
+    payload["choices"][0]["finish_reason"] = "length"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload)),
+        base_url="https://api.meta.ai/v1",
+    ) as http:
+        client = ResearchTransport(
+            SecretStr("key"),
+            profile=META,
+            http=ProviderHttpClient(provider="meta", base_url="", client=http),
+        )
+        with pytest.raises(ProviderResponseError):
+            await client.complete(
+                [HumanMessage(content="data")],
+                role="manager",
+                model="muse-spark-1.3-contributor",
+                thinking=True,
+                record_call=record,
+                check_budget=allowed,
+            )
+    (row,) = rows
+    assert row.finish_reason == "length" and not row.succeeded
+    assert row.error_class == "ProviderResponseError"

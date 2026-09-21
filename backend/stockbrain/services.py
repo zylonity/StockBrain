@@ -544,6 +544,7 @@ class ServiceContainer:
                     timeout=settings.active_llm_timeout_seconds,
                     max_tokens=settings.research_max_output_tokens,
                     pricing=build_pricing_table(settings),
+                    deep_reasoning_effort=settings.research_deep_reasoning_effort,
                 )
                 engine = TradingAgentsResearchEngine(
                     self.research_transport,
