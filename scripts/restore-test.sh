@@ -14,6 +14,18 @@
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# How to reach the PostgreSQL container. From a repository checkout the compose
+# project answers; on TrueNAS the app is a pasted compose file with no checkout,
+# so name the container instead (`docker ps` shows it):
+#   STOCKBRAIN_PG_CONTAINER=ix-stockbrain-postgres-1 scripts/backup.sh /mnt/tank/apps/stockbrain/backups
+pg_exec() {
+  if [[ -n "${STOCKBRAIN_PG_CONTAINER:-}" ]]; then
+    docker exec -i "${STOCKBRAIN_PG_CONTAINER}" "$@"
+  else
+    (cd "${REPO_ROOT}" && docker compose exec -T postgres "$@")
+  fi
+}
 DUMP="${1:-}"
 DB_USER="${POSTGRES_USER:-stockbrain}"
 TEST_DB="stockbrain_restore_$$"
@@ -26,10 +38,10 @@ fi
 cd "${REPO_ROOT}"
 
 psql_admin() {
-  docker compose exec -T postgres psql -U "${DB_USER}" -d postgres -v ON_ERROR_STOP=1 "$@"
+  pg_exec psql -U "${DB_USER}" -d postgres -v ON_ERROR_STOP=1 "$@"
 }
 psql_test() {
-  docker compose exec -T postgres psql -U "${DB_USER}" -d "${TEST_DB}" -tA -v ON_ERROR_STOP=1 "$@"
+  pg_exec psql -U "${DB_USER}" -d "${TEST_DB}" -tA -v ON_ERROR_STOP=1 "$@"
 }
 
 cleanup() {
@@ -46,7 +58,7 @@ echo "==> restoring ${DUMP}"
 # `--exit-on-error` so a partially restored database is never reported as a
 # successful restore. `--no-owner`/`--no-privileges` because the dump was taken
 # the same way and the target role is the same one.
-docker compose exec -T postgres \
+pg_exec \
   pg_restore -U "${DB_USER}" -d "${TEST_DB}" --no-owner --no-privileges --exit-on-error \
   < "${DUMP}"
 

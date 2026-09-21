@@ -9,16 +9,119 @@
 
 ## TrueNAS deployment
 
-1. Create datasets for the two volumes and point the compose volumes at them as
-   bind mounts, so ZFS snapshots cover the data:
-   * `postgres_data` → PostgreSQL data directory
-   * `stockbrain_data` → application working data
-2. Place `.env` on the host with root-only permissions (`chmod 600`). Never bake
-   secrets into an image layer.
-3. Deploy the stack. `compose.yaml` publishes the GUI on `127.0.0.1:8080`; front
-   it with the reverse proxy or Tailscale interface you actually want, and leave
-   PostgreSQL unpublished.
-4. Do not apply `compose.dev.yaml` in production — it publishes PostgreSQL.
+StockBrain runs on TrueNAS SCALE as a **custom app**: a Docker Compose file
+pasted into the Apps UI, which TrueNAS then starts on boot and shows in its
+dashboard. The paste-ready file is `deploy/truenas/stockbrain.yaml`. It pulls a
+published image rather than building one, keeps every secret in a root-only
+`.env` on a dataset, and contains no `${VAR}` interpolation -- three things a
+pasted compose file, with no repository beside it, cannot do any other way.
+
+### Images
+
+`.github/workflows/image.yml` builds `backend/Dockerfile` on every push to
+`main` and publishes `ghcr.io/zylonity/stockbrain` with three kinds of tag:
+
+| tag | meaning |
+|---|---|
+| `sha-<7 hex>` | immutable; one commit. **Use this for anything that places orders.** |
+| `main` | the latest `main` build; moves |
+| `vX.Y.Z` | a release tag, when one is pushed |
+
+Rolling back is changing the tag and redeploying. The package is public because
+the repository is.
+
+### One-time setup
+
+1. **Datasets.** Under your pool (`tank` below), create:
+
+   ```
+   tank/apps/stockbrain             the .env lives here
+   tank/apps/stockbrain/postgres    PostgreSQL data directory
+   tank/apps/stockbrain/data        application working data
+   tank/apps/stockbrain/backups     pg_dump output
+   ```
+
+   Enable periodic snapshots on `postgres` and `backups`. A snapshot of a
+   running PostgreSQL directory is crash-consistent, not a backup (see
+   Backups), but it is a fast way back from a bad day.
+
+2. **`.env`.** Copy a working `.env` to `/mnt/tank/apps/stockbrain/.env` and
+   `chmod 600` it (owner root). Then change, for this host:
+
+   * `DATABASE_URL=postgresql+asyncpg://stockbrain:<password>@postgres:5432/stockbrain`
+     -- the compose-network form, with the same password as
+     `POSTGRES_PASSWORD`. The dev compose file overrides this variable; the
+     TrueNAS one deliberately does not, so the password stays out of the
+     pasted YAML.
+   * `STOCKBRAIN_SECRET_KEY` -- a fresh `openssl rand -hex 32`. Sharing a key
+     with another instance means its sessions are valid here.
+   * `T212_ENV` -- stays `demo` until you decide otherwise. This is the
+     live-money switch.
+   * `EXECUTION_POLICY=MANUAL` for the first days on a new host; go back to
+     `AUTOMATIC` once Telegram approvals have been seen to work from here.
+
+   Both containers read this file (`env_file:`); PostgreSQL takes
+   `POSTGRES_PASSWORD` from it and ignores the rest.
+
+3. **Install the app.** Apps > Discover > (⋮) > *Install via YAML*. Name it
+   `stockbrain`. Paste `deploy/truenas/stockbrain.yaml` with the three
+   placeholders replaced: `<<POOL>>`, `<<TAG>>` (a `sha-` tag from GHCR), and
+   `<<PORT>>` (the LAN port; the container always listens on 8080). Deploy.
+
+   The entrypoint waits for PostgreSQL and runs `alembic upgrade head`, so an
+   empty data directory gets the full schema. Until the web password is set the
+   app answers 503 on every route except health -- by design.
+
+4. **Web password**, from the NAS shell, inside the container so the hash is
+   made with the scrypt parameters that will verify it:
+
+   ```bash
+   docker exec -it ix-stockbrain-stockbrain-1 python -m stockbrain.hash_password
+   # paste the printed WEB_OWNER_PASSWORD_HASH=... line into .env
+   ```
+
+   then restart the app from the Apps UI. (`docker ps` shows the exact
+   container names; TrueNAS prefixes the app name with `ix-`.)
+
+5. **Reach it** at `http://<nas-lan-ip>:<PORT>`. Web authentication is the
+   security boundary, not the port; never forward it to the internet.
+   Telegram uses outbound long polling and needs no inbound port.
+
+6. **Backups**, as a TrueNAS cron job (System > Advanced > Cron Jobs, run as
+   root). The scripts need a repository checkout for nothing but themselves;
+   name the container instead of a compose project:
+
+   ```
+   17 3 * * *  STOCKBRAIN_PG_CONTAINER=ix-stockbrain-postgres-1 /mnt/tank/apps/stockbrain/scripts/backup.sh /mnt/tank/apps/stockbrain/backups
+   41 4 * * 0  STOCKBRAIN_PG_CONTAINER=ix-stockbrain-postgres-1 /mnt/tank/apps/stockbrain/scripts/restore-test.sh "$(ls -t /mnt/tank/apps/stockbrain/backups/*.dump | head -1)"
+   ```
+
+   A `git clone` of the repository into `/mnt/tank/apps/stockbrain` is the
+   simplest way to have the scripts there; nothing else in it is used.
+
+### Moving an existing database here
+
+To continue from another instance's history rather than start empty: take a
+dump there (`scripts/backup.sh`), copy it into `backups/` on the NAS, and
+restore it **before the first deploy** -- into the app's PostgreSQL container
+started on its own, or by deploying, stopping the `stockbrain` service, and
+running `pg_restore` against the still-running `postgres` one. "Restoring a
+backup" below has the invocation and the Telegram-callback caveat. Then **stop
+the other instance**: two copies polling one Telegram bot and one Trading 212
+account will act on each other's proposals.
+
+### Updating
+
+Edit the app in the Apps UI, change `<<TAG>>` to the new `sha-` tag, save. The
+app restarts on the new image and runs any new migrations on start. A `.env`
+change is a restart from the UI; no image change.
+
+### Do not
+
+* apply `compose.dev.yaml` here -- it publishes PostgreSQL to the host;
+* paste secrets into the YAML -- TrueNAS keeps it in its configuration
+  database, which is not `chmod 600`;
+* deploy the `main` tag to an instance that transmits orders.
 
 ### Networking
 
@@ -400,9 +503,11 @@ Schedule it on the host, not in the container:
 
 ```cron
 # 03:17 UTC daily. Staggered off the hour so it does not collide with anything.
-17 3 * * * cd /mnt/tank/apps/stockbrain && ./scripts/backup.sh >> /var/log/stockbrain-backup.log 2>&1
+# From a repository checkout the compose project is found from the script's
+# own location; on TrueNAS name the container instead (see TrueNAS deployment).
+17 3 * * * /mnt/tank/apps/stockbrain/scripts/backup.sh /mnt/tank/apps/stockbrain/backups >> /var/log/stockbrain-backup.log 2>&1
 # Weekly proof that the newest dump is restorable.
-41 4 * * 0 cd /mnt/tank/apps/stockbrain && ./scripts/restore-test.sh "$(ls -t backups/*.dump | head -1)" >> /var/log/stockbrain-backup.log 2>&1
+41 4 * * 0 /mnt/tank/apps/stockbrain/scripts/restore-test.sh "$(ls -t /mnt/tank/apps/stockbrain/backups/*.dump | head -1)" >> /var/log/stockbrain-backup.log 2>&1
 ```
 
 Retention: 14 daily dumps on the host, plus TrueNAS dataset snapshots of the

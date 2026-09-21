@@ -1,0 +1,82 @@
+# StockBrain as a TrueNAS SCALE custom app.
+#
+# Paste this whole file into Apps > Discover > (⋮) > Install via YAML.
+# TrueNAS stores it in its own config database and runs it with Docker Compose;
+# there is no repository checkout next to it, so:
+#
+#   * the image is pulled from GHCR (built by .github/workflows/image.yml on
+#     every push to main), never built here;
+#   * secrets stay in a root-only .env on a dataset, referenced by path, and
+#     are never pasted into this file -- TrueNAS would keep them in its config;
+#   * no `${VAR}` interpolation: Compose resolves that from a .env beside the
+#     compose file, which does not exist. `env_file:` feeds the containers only.
+#
+# Before pasting, replace every <<...>> placeholder. Pool name, dataset layout,
+# and the port are yours to choose; the container-side paths are not.
+#
+# Datasets (create first; enable periodic snapshots on postgres and backups):
+#   <<POOL>>/apps/stockbrain             .env lives here (chmod 600, root)
+#   <<POOL>>/apps/stockbrain/postgres    PostgreSQL data directory
+#   <<POOL>>/apps/stockbrain/data        application working data
+#   <<POOL>>/apps/stockbrain/backups     pg_dump output (scripts/backup.sh)
+#
+# The full procedure is docs/operations.md, "TrueNAS deployment".
+
+name: stockbrain
+
+services:
+  stockbrain:
+    # Pin a commit tag for anything that places orders; `main` moves.
+    # Tags: sha-<7 hex> (immutable), main (latest main), vX.Y.Z (releases).
+    image: ghcr.io/zylonity/stockbrain:<<TAG>>
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Everything, including DATABASE_URL, comes from the .env on the dataset.
+    # Unlike the dev compose file there is no DATABASE_URL override here: that
+    # would put the password in this file. Set it in .env to the compose-network
+    # form, with the same password POSTGRES_PASSWORD holds:
+    #   DATABASE_URL=postgresql+asyncpg://stockbrain:<password>@postgres:5432/stockbrain
+    env_file:
+      - /mnt/<<POOL>>/apps/stockbrain/.env
+    ports:
+      # LAN. Web authentication is the security boundary (WEB_AUTH_ENABLED=true
+      # and WEB_OWNER_PASSWORD_HASH set); the port is not. Never forward this
+      # to the internet -- Telegram needs no inbound port.
+      - "0.0.0.0:<<PORT>>:8080"
+    security_opt:
+      - no-new-privileges:true
+    # Shutdown drains the Telegram poller, scheduler and job workers.
+    stop_grace_period: 30s
+    volumes:
+      - /mnt/<<POOL>>/apps/stockbrain/data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health/live', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # No ports: reachable only on the compose network. Backups run pg_dump
+    # inside this container (scripts/backup.sh), so nothing needs a host port.
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    env_file:
+      - /mnt/<<POOL>>/apps/stockbrain/.env
+    environment:
+      POSTGRES_DB: stockbrain
+      POSTGRES_USER: stockbrain
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - /mnt/<<POOL>>/apps/stockbrain/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockbrain -d stockbrain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

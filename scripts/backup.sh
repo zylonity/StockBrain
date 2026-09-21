@@ -18,6 +18,18 @@
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# How to reach the PostgreSQL container. From a repository checkout the compose
+# project answers; on TrueNAS the app is a pasted compose file with no checkout,
+# so name the container instead (`docker ps` shows it):
+#   STOCKBRAIN_PG_CONTAINER=ix-stockbrain-postgres-1 scripts/backup.sh /mnt/tank/apps/stockbrain/backups
+pg_exec() {
+  if [[ -n "${STOCKBRAIN_PG_CONTAINER:-}" ]]; then
+    docker exec -i "${STOCKBRAIN_PG_CONTAINER}" "$@"
+  else
+    (cd "${REPO_ROOT}" && docker compose exec -T postgres "$@")
+  fi
+}
 DEST="${1:-${REPO_ROOT}/backups}"
 RETAIN_DAYS="${BACKUP_RETAIN_DAYS:-14}"
 DB_NAME="${POSTGRES_DB:-stockbrain}"
@@ -35,8 +47,7 @@ echo "==> dumping ${DB_NAME} to ${TARGET}"
 # `docker compose exec -T` so this works unattended from cron. `pg_dump` runs
 # *inside* the container, so the host needs no PostgreSQL client and no
 # published database port -- which is why compose does not publish one.
-cd "${REPO_ROOT}"
-docker compose exec -T postgres \
+pg_exec \
   pg_dump -U "${DB_USER}" -d "${DB_NAME}" --format=custom --no-owner --no-privileges \
   > "${TARGET}.partial"
 
@@ -47,13 +58,13 @@ mv "${TARGET}.partial" "${TARGET}"
 # Verify the archive is readable before reporting success. `pg_restore -l`
 # parses the table of contents; a dump that cannot be listed cannot be restored,
 # and finding that out now is the entire point.
-if ! docker compose exec -T postgres pg_restore -l < "${TARGET}" > /dev/null; then
+if ! pg_exec pg_restore -l < "${TARGET}" > /dev/null; then
   echo "!!! ${TARGET} is not a readable archive; keeping it for inspection" >&2
   exit 1
 fi
 
 SIZE="$(du -h "${TARGET}" | cut -f1)"
-COUNT="$(docker compose exec -T postgres pg_restore -l < "${TARGET}" | grep -c '^[0-9]' || true)"
+COUNT="$(pg_exec pg_restore -l < "${TARGET}" | grep -c '^[0-9]' || true)"
 echo "==> ok: ${SIZE}, ${COUNT} archive entries"
 
 # Retention. Only files matching the generated name are considered, so nothing
