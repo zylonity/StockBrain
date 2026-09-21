@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -32,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
+from stockbrain.db.models.sources import EventSourceLink, Source
 from stockbrain.db.session import Database
 from stockbrain.enums import Broker, ResolutionStatus
 from stockbrain.instruments.normalize import instrument_name_key, normalize_isin, normalize_ticker
@@ -40,6 +42,7 @@ from stockbrain.instruments.resolver import (
     ResolutionRequest,
     ResolutionResult,
 )
+from stockbrain.intelligence.normalize import company_key
 from stockbrain.logging import get_logger
 from stockbrain.observability.metrics import METRICS
 
@@ -133,11 +136,13 @@ class ResolutionService:
                 return None
 
             resolver = InstrumentResolver(session)
+            source_metadata = await self._source_metadata(session, impact.event_id)
             outcome = await resolver.resolve(
                 ResolutionRequest(
                     name_hint=impact.company_name_hint,
                     ticker_hint=impact.ticker_hint,
                     exchange_hint=impact.exchange_hint,
+                    isin_hint=self._isin_hint_for_impact(impact, source_metadata),
                     broker=self._broker,
                 )
             )
@@ -162,6 +167,49 @@ class ResolutionService:
         return outcome
 
     # ------------------------------------------------------------------
+    @staticmethod
+    async def _source_metadata(session: AsyncSession, event_id: uuid.UUID) -> dict[str, Any]:
+        """The primary source's provider metadata for one event."""
+        stmt = (
+            sa.select(Source.provider_metadata)
+            .join(EventSourceLink, EventSourceLink.source_id == Source.id)
+            .where(EventSourceLink.event_id == event_id)
+            .order_by(
+                sa.case((EventSourceLink.relationship_type == "PRIMARY", 0), else_=1),
+                Source.received_at.asc(),
+            )
+            .limit(1)
+        )
+        metadata = (await session.execute(stmt)).scalar_one_or_none()
+        return dict(metadata or {})
+
+    @staticmethod
+    def _isin_hint_for_impact(
+        impact: EventCompanyImpact, metadata: dict[str, Any]
+    ) -> str | None:
+        """The source's ISIN, but only for an impact the source actually names.
+
+        An impact row has no ISIN column, so the hand-off happens here: the
+        document's own identity travels with the impact when the impact's
+        ticker or normalised company key matches what the feed printed.
+        """
+        isin = normalize_isin(str(metadata.get("isin") or ""))
+        if not isin:
+            return None
+        raw_symbols = metadata.get("symbols")
+        document_symbol = (
+            normalize_ticker(str(raw_symbols[0]))
+            if isinstance(raw_symbols, list) and len(raw_symbols) == 1
+            else ""
+        )
+        ticker = normalize_ticker(impact.ticker_hint)
+        if document_symbol and ticker and ticker == document_symbol:
+            return isin
+        document_key = company_key(str(metadata.get("company_name") or ""))
+        if document_key and document_key == impact.company_key:
+            return isin
+        return None
+
     async def _link_company(
         self, session: AsyncSession, broker_instrument_id: uuid.UUID
     ) -> uuid.UUID | None:

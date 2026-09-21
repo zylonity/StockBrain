@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -42,6 +43,7 @@ from stockbrain.enums import (
     ImpactDirection,
 )
 from stockbrain.errors import ProviderError, ProviderResponseError
+from stockbrain.instruments.normalize import normalize_ticker
 from stockbrain.intelligence.classifier import ClassificationInput, EventClassifier
 from stockbrain.intelligence.normalize import company_key
 from stockbrain.intelligence.schemas import ClassifiedEvent
@@ -232,6 +234,8 @@ class ClassificationService:
             url=source.canonical_url if source else None,
             published_at=(source.published_at if source else None) or event.event_time,
             symbol_hints=symbols[:20],
+            exchange_hint=_optional_str(metadata.get("exchange_hint")),
+            isin=_optional_str(metadata.get("isin")),
             event_id=event.id,
         )
 
@@ -561,7 +565,11 @@ class ClassificationService:
             event.candidate_score = self._candidate_score(classification)
             event.updated_at = utcnow()
 
-            written = await self._upsert_impacts(session, event_id, classification)
+            source = await self._primary_source(session, event_id)
+            source_metadata = (source.provider_metadata if source else {}) or {}
+            written = await self._upsert_impacts(
+                session, event_id, classification, source_metadata=source_metadata
+            )
 
             session.add(
                 AuditLog(
@@ -592,7 +600,12 @@ class ClassificationService:
         return ClassificationResult(event_id=event_id, status=status, company_count=written)
 
     async def _upsert_impacts(
-        self, session: AsyncSession, event_id: uuid.UUID, classification: ClassifiedEvent
+        self,
+        session: AsyncSession,
+        event_id: uuid.UUID,
+        classification: ClassifiedEvent,
+        *,
+        source_metadata: dict[str, Any] | None = None,
     ) -> int:
         """Insert or update one impact row per company.
 
@@ -602,6 +615,15 @@ class ClassificationService:
         """
         if not classification.companies:
             return 0
+
+        metadata = source_metadata or {}
+        raw_symbols = metadata.get("symbols")
+        document_symbol = (
+            normalize_ticker(str(raw_symbols[0]))
+            if isinstance(raw_symbols, list) and len(raw_symbols) == 1
+            else ""
+        )
+        document_exchange = str(metadata.get("exchange_hint") or "")
 
         rows: list[dict[str, object]] = []
         seen: set[str] = set()
@@ -616,7 +638,12 @@ class ClassificationService:
                     "company_key": key,
                     "company_name_hint": company.company_name,
                     "ticker_hint": company.ticker_hint,
-                    "exchange_hint": company.exchange_hint,
+                    "exchange_hint": _impact_exchange_hint(
+                        company.ticker_hint,
+                        company.exchange_hint,
+                        document_symbol=document_symbol,
+                        document_exchange=document_exchange,
+                    ),
                     "direction": _DIRECTIONS.get(company.direction, ImpactDirection.UNKNOWN),
                     "relationship_type": company.relationship,
                     "impact_path": company.impact_path,
@@ -678,3 +705,31 @@ class ClassificationService:
             + 0.10 * classification.novelty,
             4,
         )
+
+
+def _optional_str(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _impact_exchange_hint(
+    ticker_hint: str | None,
+    exchange_hint: str | None,
+    *,
+    document_symbol: str,
+    document_exchange: str,
+) -> str | None:
+    """Use the model's exchange when it gave one, else the feed's.
+
+    The feed knows the venue; the model may not repeat it.  The backfill happens
+    only when the document carried exactly one symbol and the impact's
+    normalised ticker is that symbol.
+    """
+    if exchange_hint is not None:
+        return exchange_hint
+    if not document_symbol or not document_exchange:
+        return None
+    if normalize_ticker(ticker_hint) != document_symbol:
+        return None
+    return document_exchange

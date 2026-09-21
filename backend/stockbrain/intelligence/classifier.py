@@ -58,6 +58,8 @@ class ClassificationInput:
     url: str | None = None
     published_at: dt.datetime | None = None
     symbol_hints: list[str] | None = None
+    exchange_hint: str | None = None
+    isin: str | None = None
     event_id: uuid.UUID | None = None
 
 
@@ -113,6 +115,16 @@ class EventClassifier:
         """
         template = self.prompt
         hints = ", ".join(payload.symbol_hints or []) or "(none)"
+        identity: list[str] = []
+        if payload.exchange_hint:
+            identity.append(f"exchange: {payload.exchange_hint}")
+        if payload.isin:
+            identity.append(f"isin: {payload.isin}")
+        if identity:
+            # The prompt file's metadata block is frozen at v1; provider-known
+            # identity is folded into the symbol-hints value so the model sees
+            # it without a prompt-version change.
+            hints = f"{hints} ({'; '.join(identity)})"
         system, user = template.render(
             {
                 "SCHEMA_EXAMPLE": json.dumps(example_classifier_payload(), indent=2),
