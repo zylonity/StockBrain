@@ -52,7 +52,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Layer cache in GHCR so a docs-only push does not rebuild the
-          # frontend and reinstall Python from scratch.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/stockbrain:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/stockbrain:buildcache,mode=max
+          # GitHub's own cache backend: needs no extra registry package and
+          # no permission beyond the job's. A docs-only push then reuses the
+          # frontend and Python layers instead of rebuilding them.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
