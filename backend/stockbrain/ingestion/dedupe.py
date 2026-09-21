@@ -93,7 +93,9 @@ async def find_duplicate_source(
 
     stmt = sa.select(Source).where(Source.content_hash == normalized.content_hash)
     existing = (await session.execute(stmt.limit(1))).scalar_one_or_none()
-    if existing is not None:
+    if existing is not None and not (
+        document.is_distinct_event and document.provider_item_id
+    ):
         return SourceMatch(existing, DuplicateReason.CONTENT_HASH)
 
     return None

@@ -80,6 +80,13 @@ class SourceProvider(StrEnum):
     FIRECRAWL = "FIRECRAWL"
     SEC = "SEC"
     MANUAL = "MANUAL"
+    # Keyless non-US disclosure wires.  Each is its own provenance value; there
+    # is deliberately no generic "DISCLOSURE" member.
+    INVESTEGATE = "INVESTEGATE"
+    EQS = "EQS"
+    CNMV = "CNMV"
+    GLOBENEWSWIRE = "GLOBENEWSWIRE"
+    ACTUSNEWS = "ACTUSNEWS"
 
 
 class SourceCategory(StrEnum):
@@ -516,6 +523,8 @@ class JobType(StrEnum):
     """
 
     SEC_REFRESH = "SEC_REFRESH"
+    DISCLOSURE_FEED_POLL = "DISCLOSURE_FEED_POLL"
+    """One disclosure feed's walk-until-known poll; the feed name is payload."""
     INSTRUMENT_REFRESH = "INSTRUMENT_REFRESH"
     EXPIRE_PROPOSALS = "EXPIRE_PROPOSALS"
     PROVIDER_HEALTH_CHECK = "PROVIDER_HEALTH_CHECK"

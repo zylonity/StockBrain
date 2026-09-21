@@ -56,6 +56,11 @@ class ProviderName(StrEnum):
     TRADING212 = "trading212"
     TELEGRAM = "telegram"
     TRADINGAGENTS = "tradingagents"
+    INVESTEGATE = "investegate"
+    EQS = "eqs"
+    CNMV = "cnmv"
+    GLOBENEWSWIRE = "globenewswire"
+    ACTUSNEWS = "actusnews"
 
 
 class Subsystem(StrEnum):

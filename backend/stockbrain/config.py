@@ -118,6 +118,9 @@ class ExecutionMode(StrEnum):
 # fails before any validator runs.
 CommaSeparatedInts = Annotated[list[int], NoDecode, Field(default_factory=list)]
 CommaSeparatedStrs = Annotated[list[str], NoDecode, Field(default_factory=list)]
+GlobeNewswireCountries = Annotated[list[str], NoDecode]
+"""A list with a non-empty default, so it cannot reuse ``CommaSeparatedStrs``
+(which already carries ``default_factory=list`` and would raise)."""
 
 
 class Settings(BaseSettings):
@@ -621,6 +624,41 @@ class Settings(BaseSettings):
     sec_www_base_url: str = "https://www.sec.gov"
 
     # ------------------------------------------------------------------
+    # Keyless non-US disclosure feeds (all default off)
+    # ------------------------------------------------------------------
+    disclosure_feeds_enabled: bool = False
+    """Master gate.  Nothing below it runs: no client, no schedule, no job."""
+    disclosure_feed_user_agent_contact: str = ""
+    """Contact for the shared User-Agent; falls back to SEC_CONTACT_EMAIL."""
+    disclosure_feed_timeout_seconds: float = Field(default=20.0, ge=5.0, le=120.0)
+
+    investegate_enabled: bool = False
+    investegate_interval_seconds: float = Field(default=300.0, ge=60.0, le=86400.0)
+    investegate_max_pages: int = Field(default=3, ge=1, le=20)
+
+    eqs_enabled: bool = False
+    eqs_interval_seconds: float = Field(default=300.0, ge=60.0, le=86400.0)
+
+    cnmv_enabled: bool = False
+    cnmv_interval_seconds: float = Field(default=600.0, ge=60.0, le=86400.0)
+
+    globenewswire_enabled: bool = False
+    globenewswire_countries: GlobeNewswireCountries = Field(
+        default_factory=lambda: [
+            "France",
+            "Netherlands",
+            "Belgium",
+            "Portugal",
+            "Spain",
+            "Canada",
+        ]
+    )
+    globenewswire_interval_seconds: float = Field(default=900.0, ge=60.0, le=86400.0)
+
+    actusnews_enabled: bool = False
+    actusnews_interval_seconds: float = Field(default=900.0, ge=60.0, le=86400.0)
+
+    # ------------------------------------------------------------------
     # FRED
     # ------------------------------------------------------------------
     fred_api_key: SecretStr = SecretStr("")
@@ -1022,6 +1060,7 @@ class Settings(BaseSettings):
         "risk_allowed_instrument_types",
         "risk_allowed_sessions",
         "brave_result_filter",
+        "globenewswire_countries",
         mode="before",
     )
     @classmethod

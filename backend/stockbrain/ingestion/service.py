@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -69,7 +69,19 @@ log = get_logger(__name__)
 #: search are still in the table with only a snippet.  They remain eligible for
 #: (free, local) extraction; what changed is that nothing discovers new ones.
 METADATA_ONLY_PROVIDERS: frozenset[SourceProvider] = frozenset(
-    {SourceProvider.BRAVE, SourceProvider.EXA, SourceProvider.FIRECRAWL}
+    {
+        SourceProvider.BRAVE,
+        SourceProvider.EXA,
+        SourceProvider.FIRECRAWL,
+        # The disclosure feeds deliver metadata only; their bodies are the
+        # CONTENT_EXTRACT path's job.  Without this, the sweep would never offer
+        # them and `extraction_method` would falsely claim PROVIDER.
+        SourceProvider.INVESTEGATE,
+        SourceProvider.EQS,
+        SourceProvider.CNMV,
+        SourceProvider.GLOBENEWSWIRE,
+        SourceProvider.ACTUSNEWS,
+    }
 )
 
 #: Headline used when a provider supplies none. Never silently invented content:
@@ -467,6 +479,29 @@ class IngestionService:
         document must not discard the rest of a search's results.
         """
         return [await self.ingest(document) for document in documents]
+
+    async def known_release_ids(
+        self, provider: SourceProvider, release_ids: Sequence[str]
+    ) -> set[str]:
+        """Which of these provider item ids have already been ingested.
+
+        The ingest provider identity layer is the whole idempotency story for
+        the disclosure feeds: the unique index on ``(provider,
+        provider_item_id)`` makes a re-poll or a late translation a duplicate,
+        and this read is how a poll discovers it has reached what it already
+        has without walking every page.
+        """
+        wanted = [value for value in release_ids if value]
+        if not wanted:
+            return set()
+        async with self._database.session() as session:
+            rows = await session.execute(
+                sa.select(Source.provider_item_id).where(
+                    Source.provider == provider,
+                    Source.provider_item_id.in_(wanted),
+                )
+            )
+        return {str(value) for value in rows.scalars() if value}
 
     @staticmethod
     async def _event_id_for_source(session: AsyncSession, source_id: uuid.UUID) -> uuid.UUID | None:
