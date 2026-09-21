@@ -288,11 +288,12 @@ async def handle_content_extract(context: HandlerContext) -> None:
             log.info("content_extract_skipped", source_id=str(source_id), reason="already fetched")
             return
         url = source.canonical_url or source.original_url
+        language = _source_language(source)
         if not url:
             log.info("content_extract_skipped", source_id=str(source_id), reason="no url")
             return
 
-    result: ExtractionResult = await extractor.extract(url)
+    result: ExtractionResult = await extractor.extract(url, language=language)
     if result.succeeded:
         await _store_extraction(context, source_id, result)
         services.health.record(ProviderName.CONTENT_EXTRACTION, ProviderStatus.HEALTHY)
@@ -311,7 +312,7 @@ async def handle_content_extract(context: HandlerContext) -> None:
         detail=f"{failure.value if failure else 'UNKNOWN'}: {result.detail or ''}"[:300],
     )
 
-    fallback = await _firecrawl_fallback(context, source_id, url, failure)
+    fallback = await _firecrawl_fallback(context, source_id, url, failure, language)
     if fallback is not None and fallback.succeeded:
         await _store_extraction(context, source_id, fallback)
         log.info(
@@ -336,11 +337,25 @@ async def handle_content_extract(context: HandlerContext) -> None:
     )
 
 
+def _source_language(source: Source) -> str:
+    """The source's own language, defaulting to English.
+
+    A disclosure feed records ``metadata.language`` on ``provider_metadata``;
+    every other provider leaves it absent and gets ``en``.
+    """
+    metadata = source.provider_metadata or {}
+    value = metadata.get("language")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "en"
+
+
 async def _firecrawl_fallback(
     context: HandlerContext,
     source_id: uuid.UUID,
     url: str,
     failure: ExtractionFailure | None,
+    language: str,
 ) -> ExtractionResult | None:
     """One paid fetch, or ``None`` with the reason logged.
 
@@ -375,7 +390,7 @@ async def _firecrawl_fallback(
     if reservation is None:
         return None
 
-    result: ExtractionResult = await fallback.extract(url)
+    result: ExtractionResult = await fallback.extract(url, language=language)
     if result.succeeded:
         await budget.record_success(
             reservation,

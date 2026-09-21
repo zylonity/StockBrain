@@ -64,14 +64,16 @@ class FirecrawlContentExtractor:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def extract(self, url: str) -> ExtractionResult:
+    async def extract(self, url: str, *, language: str = "en") -> ExtractionResult:
         """Scrape one page.  **Never retried.**
 
-        The SSRF check runs here too.  Firecrawl fetches from its own
-        infrastructure rather than from inside this network, so it is not an
-        SSRF path in the usual sense -- but asking a paid third party to fetch
-        ``http://postgres:5432`` is still a request StockBrain should never
-        make, and it would still be billed.
+        ``language`` is accepted to satisfy the extractor interface but is not
+        sent: Firecrawl is the paid fallback, and the free local extractor is
+        the one that honours a source's language.  The SSRF check runs here too.
+        Firecrawl fetches from its own infrastructure rather than from inside
+        this network, so it is not an SSRF path in the usual sense -- but asking
+        a paid third party to fetch ``http://postgres:5432`` is still a request
+        StockBrain should never make, and it would still be billed.
         """
         try:
             verify_public_url(url)

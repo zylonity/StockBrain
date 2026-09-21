@@ -550,3 +550,33 @@ def test_every_outbound_request_is_preceded_by_the_ssrf_check() -> None:
     assert firecrawl.index("verify_public_url(url)") < firecrawl.index(
         "await self._client.scrape("
     ), "the Firecrawl fallback scrapes before it verifies"
+
+
+async def test_the_request_language_is_sent_per_request() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["language"] = request.headers.get("accept-language", "")
+        return httpx.Response(200, text=ARTICLE_HTML, headers={"content-type": "text/html"})
+
+    extractor = _extractor(handler)
+    try:
+        await extractor.extract("https://example.com/article", language="de")
+    finally:
+        await extractor.aclose()
+    assert seen["language"] == "de"
+
+
+async def test_the_request_language_defaults_to_english() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["language"] = request.headers.get("accept-language", "")
+        return httpx.Response(200, text=ARTICLE_HTML, headers={"content-type": "text/html"})
+
+    extractor = _extractor(handler)
+    try:
+        await extractor.extract("https://example.com/article")
+    finally:
+        await extractor.aclose()
+    assert seen["language"] == "en"

@@ -84,9 +84,11 @@ class RecordingExtractor:
     def __init__(self, result: ExtractionResult) -> None:
         self._result = result
         self.calls: list[str] = []
+        self.languages: list[str] = []
 
-    async def extract(self, url: str) -> ExtractionResult:
+    async def extract(self, url: str, *, language: str = "en") -> ExtractionResult:
         self.calls.append(url)
+        self.languages.append(language)
         return self._result
 
     async def aclose(self) -> None:

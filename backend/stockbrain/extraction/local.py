@@ -118,7 +118,6 @@ class LocalContentExtractor:
                 # to get around that is both dishonest and fragile.
                 "User-Agent": settings.content_extract_user_agent,
                 "Accept": "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8",
-                "Accept-Language": "en",
             },
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
@@ -126,10 +125,14 @@ class LocalContentExtractor:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def extract(self, url: str) -> ExtractionResult:
-        """Fetch and extract one page.  Never raises for an ordinary failure."""
+    async def extract(self, url: str, *, language: str = "en") -> ExtractionResult:
+        """Fetch and extract one page.  Never raises for an ordinary failure.
+
+        ``language`` is the source's own language from its provider metadata,
+        default English; it is sent as ``Accept-Language`` on this request only.
+        """
         try:
-            fetched = await self._fetch(url)
+            fetched = await self._fetch(url, language=language)
         except SsrfRefused as exc:
             METRICS.inc(
                 "stockbrain_content_extraction_total",
@@ -193,7 +196,7 @@ class LocalContentExtractor:
     # ------------------------------------------------------------------
     # Fetching
     # ------------------------------------------------------------------
-    async def _fetch(self, url: str) -> ExtractionResult:
+    async def _fetch(self, url: str, *, language: str = "en") -> ExtractionResult:
         """Follow up to :data:`MAX_REDIRECTS` hops, checking every one.
 
         Returns a result carrying the decoded HTML in ``metadata["html"]`` on
@@ -206,7 +209,9 @@ class LocalContentExtractor:
             # about where its Location header points.
             verify_public_url(current)
             try:
-                request = self._client.build_request("GET", current)
+                request = self._client.build_request(
+                    "GET", current, headers={"Accept-Language": language}
+                )
                 response = await self._client.send(request, stream=True)
             except httpx.HTTPError as exc:
                 return ExtractionResult(
