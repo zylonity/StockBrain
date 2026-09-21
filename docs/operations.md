@@ -48,6 +48,11 @@ the repository is.
 2. **`.env`.** Copy a working `.env` to `/mnt/tank/apps/stockbrain/.env` and
    `chmod 600` it (owner root). Then change, for this host:
 
+   * `APP_ENV=production`. It requires the secret key, refuses unauthenticated
+     web access unless acknowledged, and marks the session cookie `Secure` --
+     which a browser will not store over plain `http://`. So, until the GUI
+     is behind TLS, also set `WEB_COOKIE_SECURE=false`; remove that line the
+     day a reverse proxy or Tailscale HTTPS fronts it.
    * `DATABASE_URL=postgresql+asyncpg://stockbrain:<password>@postgres:5432/stockbrain`
      -- the compose-network form, with the same password as
      `POSTGRES_PASSWORD`. The dev compose file overrides this variable; the
