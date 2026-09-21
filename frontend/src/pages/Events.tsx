@@ -29,7 +29,9 @@ const STATUSES: EventStatus[] = [
 // Every provider that can appear on a source row. BRAVE and EXA were missing,
 // so two of the three live discovery backends could not be filtered on at all.
 // FIRECRAWL is kept because rows it discovered before the provider split still
-// exist and are still valid evidence.
+// exist and are still valid evidence. The five disclosure feeds were missing
+// next -- same bug, same consequence -- so this array is the dropdown's copy of
+// the server's `SourceProvider` enum and has to stay in step with it.
 const PROVIDERS: SourceProvider[] = [
   "ALPACA",
   "BRAVE",
@@ -37,6 +39,11 @@ const PROVIDERS: SourceProvider[] = [
   "FIRECRAWL",
   "SEC",
   "MANUAL",
+  "INVESTEGATE",
+  "EQS",
+  "CNMV",
+  "GLOBENEWSWIRE",
+  "ACTUSNEWS",
 ];
 
 export function Events() {

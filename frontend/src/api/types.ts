@@ -85,6 +85,11 @@ export interface ExecutionStatusResponse {
  * not be filtered on. `FIRECRAWL` stays because rows it discovered before the
  * split still exist and are still valid evidence -- rewriting them to claim
  * another provider found them would be falsifying provenance.
+ *
+ * The five keyless disclosure feeds repeated that mistake: the server emits
+ * them, so every one of them was visible on an event but un-filterable. This
+ * union is the client's copy of the server's `SourceProvider` enum and has to
+ * stay in the same order as it, which is why the feeds sit after `MANUAL`.
  */
 export type SourceProvider =
   | "ALPACA"
@@ -92,7 +97,12 @@ export type SourceProvider =
   | "EXA"
   | "FIRECRAWL"
   | "SEC"
-  | "MANUAL";
+  | "MANUAL"
+  | "INVESTEGATE"
+  | "EQS"
+  | "CNMV"
+  | "GLOBENEWSWIRE"
+  | "ACTUSNEWS";
 
 export type EventStatus =
   | "NEW"
