@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections.abc import Callable
 from threading import Lock
 from typing import Any
@@ -208,6 +209,14 @@ class TradingAgentsResearchEngine:
     ) -> ResearchResult:
         reports: dict[str, str] = {}
 
+        # One session for one run. A Responses endpoint groups calls by
+        # ``x-opencode-session`` for routing and prompt-cache affinity, and
+        # every role call in a run repeats the same byte-identical prefix, so
+        # one session per packet is what makes the provider's cache discount
+        # engage. The id is a UUID and nothing else: not a credential, never
+        # persisted, regenerated for every run by construction.
+        session_id = str(uuid.uuid4())
+
         async def role_call(
             role: str, prompt: Any, *, with_tools: bool = False, final: bool = False
         ) -> AIMessage:
@@ -257,6 +266,7 @@ class TradingAgentsResearchEngine:
                     check_budget=check_budget,
                     tools=[CONTEXT_TOOL] if with_tools else None,
                     json_schema=ResearchDecision.model_json_schema() if final else None,
+                    session_id=session_id,
                 )
                 if not response.tool_calls:
                     return AIMessage(content=public_text(response.content))

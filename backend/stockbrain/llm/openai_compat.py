@@ -359,6 +359,13 @@ class OpenAICompatibleClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
+    def _parse_payload(
+        self, payload: dict[str, Any], *, latency_ms: int, attempts: int
+    ) -> CompletionResult:
+        """Decode one success payload. Subclasses with a different wire
+        dialect (``meta-go``: the Responses API) replace this."""
+        return parse_completion(payload, self.profile, latency_ms=latency_ms, attempts=attempts)
+
     async def verify_credentials(self) -> None:
         """Prove the API key is accepted, spending no tokens.
 
@@ -403,7 +410,7 @@ class OpenAICompatibleClient:
                     retry_safe=False,
                 )
                 latency_ms = int((loop.time() - call_started) * 1000)
-                result = parse_completion(payload, profile, latency_ms=latency_ms, attempts=attempt)
+                result = self._parse_payload(payload, latency_ms=latency_ms, attempts=attempt)
                 result.started_at = started
                 result.completed_at = dt.datetime.now(dt.UTC)
                 self._record_metrics(result)

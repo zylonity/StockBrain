@@ -20,6 +20,7 @@ the message round-trips without it.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage
@@ -40,6 +41,11 @@ from stockbrain.llm.base import CompletionResult, TokenUsage
 from stockbrain.llm.openai_compat import parse_usage, strict_json_schema
 from stockbrain.llm.pricing import PricingTable
 from stockbrain.llm.profiles import DEEPSEEK, ProviderProfile
+from stockbrain.llm.responses_api import (
+    _flatten_tool,
+    build_input,
+    parse_responses_usage,
+)
 from stockbrain.llm.telemetry import LlmCallRecord, LlmTelemetry
 from stockbrain.logging import get_logger
 
@@ -143,6 +149,10 @@ class ResearchTransport:
         json_schema: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Serialize messages and add only the fields this profile documents."""
+        if self.profile.api_style == "responses":
+            return self._build_responses_body(
+                messages, model=model, thinking=thinking, tools=tools, json_schema=json_schema
+            )
         profile = self.profile
         serializer = self.serializer(model)
         body: dict[str, Any] = serializer._get_request_payload(messages)
@@ -177,6 +187,61 @@ class ResearchTransport:
                 body["response_format"] = {"type": "json_object"}
         return body
 
+    def _build_responses_body(
+        self,
+        messages: list[BaseMessage],
+        *,
+        model: str,
+        thinking: bool,
+        tools: list[dict[str, Any]] | None,
+        json_schema: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """The same telemetrized body for a Responses-API research call.
+
+        Message conversion is shared with the classifier client
+        (:func:`build_input`) rather than reinvented here: the boundary between
+        "chat turn" and "input item" is a wire decision, not a caller decision,
+        and the two callers must not drift apart. What is research-specific and
+        therefore lives here: the tuned ``reasoning`` effort for the thinking
+        roles, the tool re-spelling, and the strict decision schema under
+        ``text.format``.
+        """
+        profile = self.profile
+        body: dict[str, Any] = {
+            "model": model,
+            "input": build_input(messages, profile),
+            "stream": False,
+        }
+        body[profile.max_output_tokens_field] = self.max_tokens
+
+        # Same effort policy as the chat dialect, same rationale (see
+        # ``deep_reasoning_effort``): omitted, the endpoint picks its own.
+        if thinking:
+            body["reasoning"] = {"effort": self.deep_reasoning_effort}
+        elif profile.minimum_reasoning_effort is not None:
+            body["reasoning"] = {"effort": profile.minimum_reasoning_effort}
+
+        if tools:
+            # Chat's wrapped function specs are a different dialect's spelling;
+            # the responses provider rejects the wrapper before any model runs.
+            body["tools"] = [_flatten_tool(tool) for tool in tools]
+        if json_schema is not None:
+            if profile.structured_output != "json_schema":
+                raise ValueError(
+                    f"{profile.name!r} uses a Responses endpoint but not json_schema "
+                    "structured output; no fallback is documented"
+                )
+            declared: dict[str, Any] = {
+                "type": "json_schema",
+                "name": "research_decision",
+                "schema": json_schema,
+            }
+            if profile.strict_structured_output:
+                declared["schema"] = strict_json_schema(json_schema)
+                declared["strict"] = True
+            body["text"] = {"format": declared}
+        return body
+
     async def complete(
         self,
         messages: list[BaseMessage],
@@ -188,10 +253,21 @@ class ResearchTransport:
         check_budget: CheckBudget,
         tools: list[dict[str, Any]] | None = None,
         json_schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> AIMessage:
         profile = self.profile
         name = profile.name
-        serializer = self.serializer(model)
+        # Responses endpoints only: one research run carries its session id so
+        # all of a run's calls land in the provider's same prompt-cache group
+        # (``x-opencode-session`` is a routing hint, not a credential). A chat
+        # profile never sets the header at all -- cast nothing onto an endpoint
+        # that has never heard of it.
+        session_headers = (
+            {"x-opencode-session": session_id}
+            if session_id and profile.api_style == "responses"
+            else None
+        )
+        serializer = self.serializer(model) if profile.api_style == "chat_completions" else None
         body = self.build_body(
             messages, model=model, thinking=thinking, tools=tools, json_schema=json_schema
         )
@@ -201,20 +277,37 @@ class ResearchTransport:
             record: LlmCallRecord | None = None
             try:
                 # Retry is explicit here so every attempt is accounted for separately.
-                payload = await self.http.request_json("POST", profile.chat_path, json_body=body)
+                payload = await self.http.request_json(
+                    "POST",
+                    profile.chat_path,
+                    json_body=body,
+                    headers=session_headers,
+                )
                 if not isinstance(payload, dict):
                     raise ProviderResponseError(f"{name} research: malformed response")
                 try:
-                    usage = parse_usage(payload.get("usage"), profile)
-                    validate_usage(usage)
-                    choice = payload["choices"][0]
-                    message = choice["message"]
-                    finish = choice["finish_reason"]
-                    if finish not in _KNOWN_FINISH_REASONS | profile.retryable_finish_reasons:
-                        finish = "unknown"
-                    reported_model = payload["model"]
-                    if not isinstance(message, dict) or reported_model != model:
-                        raise ValueError("unexpected model or message")
+                    if profile.api_style == "responses":
+                        usage, choice_message, finish, reported_model, had_reasoning, tool_calls = (
+                            _decode_responses(payload, model, profile)
+                        )
+                    else:
+                        usage = parse_usage(payload.get("usage"), profile)
+                        validate_usage(usage)
+                        choice = payload["choices"][0]
+                        message = choice["message"]
+                        choice_message = message
+                        finish = choice["finish_reason"]
+                        if finish not in _KNOWN_FINISH_REASONS | profile.retryable_finish_reasons:
+                            finish = "unknown"
+                        reported_model = payload["model"]
+                        if not isinstance(message, dict) or reported_model != model:
+                            raise ValueError("unexpected model or message")
+                        had_reasoning = (
+                            bool(message.get(profile.reasoning_content_field))
+                            if profile.reasoning_content_field
+                            else False
+                        )
+                        tool_calls = list(message.get("tool_calls") or [])
                     result = CompletionResult(
                         content="",
                         model=reported_model,
@@ -224,11 +317,7 @@ class ResearchTransport:
                         started_at=started,
                         completed_at=utcnow(),
                         latency_ms=int((utcnow() - started).total_seconds() * 1000),
-                        had_reasoning_content=(
-                            bool(message.get(profile.reasoning_content_field))
-                            if profile.reasoning_content_field
-                            else False
-                        ),
+                        had_reasoning_content=had_reasoning,
                     )
                 except (KeyError, IndexError, TypeError, ValueError):
                     raise ProviderResponseError(f"{name} research: malformed response") from None
@@ -245,7 +334,7 @@ class ResearchTransport:
                 record.retry_count = attempt - 1
                 if finish in profile.retryable_finish_reasons:
                     raise ProviderUnavailable(f"{name} research: {finish}")
-                if finish == "length" and not message.get("content"):
+                if finish == "length" and not choice_message.get("content"):
                     # Meta returns ``content: null`` on a capped completion and
                     # bills every token of the discarded draft.  Naming that
                     # keeps it from being read as a model that said nothing.
@@ -263,14 +352,22 @@ class ResearchTransport:
                     )
                 if finish not in _SUCCESS_FINISH_REASONS:
                     raise ProviderResponseError(f"{name} research: finish_reason={finish}")
-                if not message.get("content") and not message.get("tool_calls"):
+                if not choice_message.get("content") and not tool_calls:
                     raise ProviderResponseError(f"{name} research: empty response")
-                try:
-                    response = serializer._create_chat_result(payload).generations[0].message
-                except Exception:
-                    raise ProviderResponseError(
-                        f"{name} research: invalid assistant message"
-                    ) from None
+                if serializer is not None:
+                    try:
+                        response = serializer._create_chat_result(payload).generations[0].message
+                    except Exception:
+                        raise ProviderResponseError(
+                            f"{name} research: invalid assistant message"
+                        ) from None
+                else:
+                    # The Responses dialect has no upstream serializer to borrow;
+                    # the already-validated decode produces the AIMessage itself.
+                    response = AIMessage(
+                        content=str(choice_message.get("content") or ""),
+                        tool_calls=list(tool_calls or []),
+                    )
                 if not isinstance(response, AIMessage) or response.invalid_tool_calls:
                     raise ResearchValidationError(f"{name} research: malformed tool call")
                 record.used = True
@@ -322,6 +419,73 @@ class ResearchTransport:
 
     async def aclose(self) -> None:
         await self.http.aclose()
+
+
+def _decode_responses(
+    payload: dict[str, Any],
+    model: str,
+    profile: ProviderProfile,
+) -> tuple[TokenUsage, dict[str, Any], str, str, bool, list[dict[str, Any]]]:
+    """Decode the Responses dialect into the same values as a chat choice.
+
+    Returns ``(usage, message_view, finish, model, had_reasoning, tool_calls)``.
+    ``message_view`` is a chat-shaped view of the output: the joined
+    ``output_text`` parts plus ``tool_calls`` when present, which is the shape
+    every downstream consumer of a transport result already speaks. Both
+    dialect paths decode tool-call arguments and build the AIMessage exactly
+    once, so there is no unshared secondary parser to fall out of step.
+    """
+    status = payload.get("status")
+    finish = "stop" if status == "completed" else "unknown"
+    if status == "incomplete":
+        details = payload.get("incomplete_details") or {}
+        if isinstance(details, dict) and details.get("reason") == "max_output_tokens":
+            # Same treatment as the chat dialect's ``finish_reason=length``:
+            # the truncation branch below names the real cause; tokens billed.
+            finish = "length"
+    reported_model = payload.get("model")
+    if reported_model != model or not isinstance(payload.get("output"), list):
+        raise ValueError("unexpected model or output list")
+
+    content_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    had_reasoning = False
+    for item in payload["output"]:
+        if not isinstance(item, dict):
+            raise ValueError("malformed output item")
+        kind = item.get("type")
+        if kind == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        content_parts.append(text)
+        elif kind == "function_call":
+            try:
+                args = json.loads(item.get("arguments") or "{}")
+            except ValueError:
+                raise ValueError("function_call arguments were not valid JSON") from None
+            if not isinstance(args, dict):
+                raise ValueError("function_call arguments decoded to a non-object")
+            tool_calls.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "args": args,
+                    "id": str(item.get("call_id") or ""),
+                    "type": "tool_call",
+                }
+            )
+        elif kind == "reasoning":
+            # A flag only; the reasoning text itself (provider-encrypted here)
+            # is never persisted.
+            had_reasoning = True
+        else:
+            raise ValueError(f"unexpected output item type {kind!r}")
+
+    usage = parse_responses_usage(payload.get("usage"), profile)
+    validate_usage(usage)
+    message_view = {"content": "".join(content_parts), "tool_calls": tool_calls}
+    return (usage, message_view, finish, str(reported_model or ""), had_reasoning, tool_calls)
 
 
 def _is_transport_failure(exc: BaseException) -> bool:

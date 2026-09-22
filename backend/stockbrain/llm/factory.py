@@ -19,6 +19,7 @@ from stockbrain.config import Settings
 from stockbrain.llm.deepseek import DeepSeekClient
 from stockbrain.llm.openai_compat import OpenAICompatibleClient
 from stockbrain.llm.pricing import PricingTable
+from stockbrain.llm.responses_api import ResponsesApiClient
 
 __all__ = ["build_llm_client", "build_pricing_table"]
 
@@ -28,11 +29,22 @@ def build_llm_client(settings: Settings) -> OpenAICompatibleClient:
 
     DeepSeek keeps its own subclass so its settings-shaped constructor and its
     regression suite continue to exercise the DeepSeek dialect directly. Every
-    other provider is the generic client plus a profile -- there is no
-    per-provider class to write.
+    other chat-completions provider is the generic client plus a profile; a
+    provider whose profile declares a different wire protocol gets that
+    protocol's client (``meta-go``: the Responses API, with its required
+    ``x-opencode-session`` header).
     """
     if settings.llm_is_deepseek:
         return DeepSeekClient(settings, max_attempts=settings.active_llm_max_attempts)
+
+    if settings.llm_profile.api_style == "responses":
+        return ResponsesApiClient(
+            settings.llm_profile,
+            api_key=settings.active_llm_api_key.get_secret_value(),
+            base_url=settings.active_llm_base_url,
+            timeout_seconds=settings.active_llm_timeout_seconds,
+            max_attempts=settings.active_llm_max_attempts,
+        )
 
     return OpenAICompatibleClient(
         settings.llm_profile,

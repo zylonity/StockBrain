@@ -27,6 +27,7 @@ from typing import Literal
 
 __all__ = [
     "PROFILES",
+    "ApiStyle",
     "CacheUsageStyle",
     "ProviderProfile",
     "ReasoningStyle",
@@ -49,6 +50,19 @@ StructuredOutputStyle = Literal["json_object", "json_schema", "none"]
 #: ``minimum_reasoning_effort`` is the closest thing to disabled.
 #: ``none`` -- the endpoint has no reasoning control; send nothing.
 ReasoningStyle = Literal["deepseek_thinking", "reasoning_effort", "none"]
+
+#: The wire protocol the endpoint speaks, not just its field spellings.
+#:
+#: ``chat_completions`` -- ``POST /chat/completions`` with a ``messages`` list
+#: and ``choices[0].message`` back. What all profiles below assumed before
+#: OpenCode Go's Muse Spark endpoint: that one is served *only* through the
+#: Responses API (a ``chat/completions`` POST returns 503 "Endpoint is
+#: unavailable" for the contributor model, verified live 2026-09-21), so a
+#: profile that cannot be expressed as fields on a chat body needs this knob.
+#: ``responses`` -- ``POST`` to :attr:`chat_path` (``/responses``) with an
+#: ``input`` list and an ``output`` item list back; see
+#: :mod:`stockbrain.llm.responses_api` for the builders that speak it.
+ApiStyle = Literal["chat_completions", "responses"]
 
 #: Where cached prompt tokens appear in ``usage``.
 #:
@@ -73,6 +87,10 @@ class ProviderProfile:
     base_url: str = ""
 
     chat_path: str = "/chat/completions"
+
+    #: Which wire protocol ``chat_path`` serves. Chat-completions for every
+    #: shipped profile except ``meta-go``; see :data:`ApiStyle`.
+    api_style: ApiStyle = "chat_completions"
 
     #: Catalogue endpoint used to validate a credential without spending tokens.
     #: ``None`` means the endpoint has none and startup must not probe it.
@@ -178,6 +196,61 @@ META = ProviderProfile(
     ),
 )
 
+#: OpenCode Go's Muse Spark contributor endpoint. The *prices* are Meta's
+#: contributor list card forwarded unchanged (OpenCode documents that it passes
+#: provider rates through; the subscription buys ~6x usage, it does not change
+#: the rate card), so operator pricing stays ``0.10 / 0.002 / 0.20``.
+#:
+#: Same Muse Spark quirks as the direct ``meta`` profile, but served only
+#: through the Responses API -- verified live 2026-09-21: ``/chat/completions``
+#: returns 503 "Endpoint is unavailable" for this model, ``/responses`` answers.
+#: Two differences beyond field spellings, both verified live the same day:
+#:
+#: * credential probe must carry ``x-opencode-session`` (a hard 400 without it:
+#:   "MissingSessionID ... cannot be routed efficiently"), so the client sets a
+#:   stable per-process session id, and the research transport re-scopes it per
+#:   research run. It is a routing/cache-affinity hint, not a credential.
+#: * the workspace's privacy settings must allow "paid endpoints that train on
+#:   request data" -- this is the contributor tier, whose entire discount is
+#:   Meta's right to train on prompts and completions. Denied there, every call
+#:   is a 400 that no client-side retry can fix.
+#:
+#: Requires ``LLM_API_KEY`` (a Go key) and, if overridden, an ``LLM_BASE_URL``
+#: that is the ``/v1`` root -- the client appends :attr:`chat_path` itself.
+META_GO = ProviderProfile(
+    name="meta-go",
+    base_url="https://opencode.ai/zen/go/v1",
+    chat_path="/responses",
+    api_style="responses",
+    # Responses-spelling field, not chat's ``max_completion_tokens``.
+    max_output_tokens_field="max_output_tokens",
+    structured_output="json_schema",
+    requires_json_keyword=False,
+    # Same live-observed rule as ``meta``: an unenforced schema is only a hint
+    # and produced corrupted key escaping on the direct endpoint. Tighter is the
+    # only safe reading here.
+    strict_structured_output=True,
+    reasoning="reasoning_effort",
+    # Muse Spark cannot switch reasoning off ("none"), on the Responses API
+    # spelled ``{"reasoning": {"effort": ...}}``; the delta from ``meta`` is the
+    # builder's job, not a second reasoning style.
+    minimum_reasoning_effort="minimal",
+    # Same economics and cache mechanic as the direct ``meta`` profile; the
+    # Responses usage dialect's field names are mapped by the responses parser.
+    cache_usage="openai_details",
+    reasoning_content_field=None,
+    retryable_finish_reasons=frozenset(),
+    time_of_day_pricing=False,
+    documented_rpm=100,  # contributor tier, same as direct
+    notes=(
+        "served only through the Responses API; chat/completions is a 503",
+        "requires x-opencode-session on every call (stability, not security)",
+        "reasoning cannot be disabled; minimal is the floor",
+        "workspace privacy must allow endpoints that train on request data",
+        "the -contributor model tier trains on prompts and completions",
+    ),
+)
+
 #: OpenAI itself, and the many gateways that mirror it exactly.
 OPENAI = ProviderProfile(
     name="openai",
@@ -223,7 +296,7 @@ GENERIC_NO_JSON = ProviderProfile(
 
 
 PROFILES: dict[str, ProviderProfile] = {
-    profile.name: profile for profile in (DEEPSEEK, META, OPENAI, GENERIC, GENERIC_NO_JSON)
+    profile.name: profile for profile in (DEEPSEEK, META, META_GO, OPENAI, GENERIC, GENERIC_NO_JSON)
 }
 
 
