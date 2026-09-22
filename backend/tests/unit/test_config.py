@@ -7,6 +7,7 @@ the system, so it is tested exhaustively rather than by example.
 from __future__ import annotations
 
 import itertools
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -313,3 +314,16 @@ def test_a_bars_window_that_cannot_cover_the_atr_period_is_refused(
     """
     with pytest.raises(ValidationError, match="twice RISK_EXIT_ATR_PERIOD"):
         make_settings(VOLATILITY_BARS_DAYS="40", RISK_EXIT_ATR_PERIOD="20")
+
+
+def test_portfolio_rotation_is_opt_in_and_bounded(make_settings: Any) -> None:
+    settings = make_settings()
+    assert settings.portfolio_rotation_enabled is False
+    assert settings.portfolio_rotation_min_candidate_confidence == Decimal("0.85")
+    assert settings.portfolio_rotation_min_confidence_advantage == Decimal("0.10")
+
+    with pytest.raises(ValidationError, match="PORTFOLIO_ROTATION_INTERVAL_SECONDS"):
+        make_settings(PORTFOLIO_ROTATION_INTERVAL_SECONDS="0")
+
+    with pytest.raises(ValidationError, match="risk configuration"):
+        make_settings(PORTFOLIO_ROTATION_MIN_CONFIDENCE_ADVANTAGE="1.1")

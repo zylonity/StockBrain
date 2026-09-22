@@ -25,10 +25,10 @@ from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.portfolio import Position, PositionPeak
 from stockbrain.db.models.proposals import TradeProposal
-from stockbrain.db.models.research import Thesis
+from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.session import Database
+from stockbrain.enums import ResearchStatus, ThesisAction
 from stockbrain.logging import get_logger
-from stockbrain.proposals.lifecycle import thesis_is_superseded
 from stockbrain.proposals.service import ProposalService
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES
 from stockbrain.risk.config import RiskConfig
@@ -298,7 +298,19 @@ class ExitSweepService:
     async def _superseded(self, session: AsyncSession, thesis_id: uuid.UUID) -> bool:
         """Whether research has published a successor to the opening thesis.
 
-        The same question `proposals.lifecycle` already asks of a pending
-        proposal, asked of a holding -- and answered by the same query.
+        A reaffirming BUY is a refreshed reason to keep holding, not an exit
+        signal. Only a successor that no longer recommends adding exposure can
+        retire the opening thesis for exit purposes. Pending entry proposals
+        still use lifecycle's stricter "any successor invalidates" rule.
         """
-        return await thesis_is_superseded(session, thesis_id)
+        adverse = await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(Thesis)
+            .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
+            .where(
+                Thesis.supersedes_thesis_id == thesis_id,
+                ResearchRun.status == ResearchStatus.SUCCEEDED,
+                Thesis.action.in_((ThesisAction.HOLD, ThesisAction.REDUCE, ThesisAction.SELL)),
+            )
+        )
+        return bool(adverse)

@@ -117,6 +117,7 @@ from stockbrain.observability.alerts import OperationalAlerts
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
 from stockbrain.proposals.exits import ExitSweepService
+from stockbrain.proposals.rotation import PortfolioRotationService
 from stockbrain.proposals.service import ProposalService
 from stockbrain.risk.config import RiskConfig, risk_config_from_settings
 from stockbrain.telegram.notifier import pipeline_dedupe_key, summary_entity_id
@@ -184,6 +185,7 @@ class ServiceContainer:
     instrument_sync: InstrumentSyncService | None = field(default=None, init=False)
     proposals: ProposalService | None = field(default=None, init=False)
     exits: ExitSweepService | None = field(default=None, init=False)
+    rotation: PortfolioRotationService | None = field(default=None, init=False)
     volatility: VolatilityRefreshService | None = field(default=None, init=False)
     memory: MemoryService | None = field(default=None, init=False)
     risk_config: RiskConfig = field(init=False)
@@ -286,6 +288,17 @@ class ServiceContainer:
         else:
             self.exits = None
             self.volatility = None
+        if (
+            self.settings.portfolio_rotation_enabled
+            and self.proposals is not None
+            and self.research is not None
+        ):
+            self.rotation = PortfolioRotationService(
+                self.proposals,
+                self.research,
+                candidate_floor=self.settings.portfolio_rotation_min_candidate_confidence,
+                minimum_advantage=self.settings.portfolio_rotation_min_confidence_advantage,
+            )
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
@@ -927,6 +940,16 @@ class ServiceContainer:
                     jitter_ratio=0.1,
                 )
             )
+        if self.rotation is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="portfolio_rotation",
+                    interval_seconds=self.settings.portfolio_rotation_interval_seconds,
+                    run=self._rotation_sweep,
+                    initial_delay_seconds=130.0,
+                    jitter_ratio=0.1,
+                )
+            )
         if self.telegram is not None and self.settings.telegram_daily_summary_time:
             # Ticks every minute and decides nothing about cadence: the row the
             # delivery side claims is the cadence. A restart after the configured
@@ -1317,6 +1340,10 @@ class ServiceContainer:
     async def _exit_sweep(self) -> None:
         if self.exits is not None:
             await self.exits.sweep()
+
+    async def _rotation_sweep(self) -> None:
+        if self.rotation is not None:
+            await self.rotation.sweep()
 
     async def _telegram_daily_summary(self) -> None:
         """Enqueue the day's summary once the configured UTC time has passed.

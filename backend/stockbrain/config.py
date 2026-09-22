@@ -871,6 +871,11 @@ class Settings(BaseSettings):
     risk_min_calibration_size_factor: Decimal = Decimal("0.5")
     risk_reduce_fraction: Decimal = Decimal("0.5")
 
+    portfolio_rotation_enabled: bool = False
+    portfolio_rotation_min_candidate_confidence: Decimal = Decimal("0.85")
+    portfolio_rotation_min_confidence_advantage: Decimal = Decimal("0.10")
+    portfolio_rotation_interval_seconds: float = 300.0
+
     risk_exit_hard_stop_pct: Decimal = Decimal("0.08")
     risk_exit_trailing_pct: Decimal = Decimal("0.05")
     risk_exit_trailing_arm_pct: Decimal = Decimal("0.10")
@@ -1191,6 +1196,12 @@ class Settings(BaseSettings):
             "RISK_MIN_CONFIDENCE_SIZE_FACTOR": self.risk_min_confidence_size_factor,
             "RISK_WIDE_SPREAD_SIZE_FACTOR": self.risk_wide_spread_size_factor,
             "RISK_REDUCE_FRACTION": self.risk_reduce_fraction,
+            "PORTFOLIO_ROTATION_MIN_CANDIDATE_CONFIDENCE": (
+                self.portfolio_rotation_min_candidate_confidence
+            ),
+            "PORTFOLIO_ROTATION_MIN_CONFIDENCE_ADVANTAGE": (
+                self.portfolio_rotation_min_confidence_advantage
+            ),
         }
         problems = [
             f"{name} must be between 0 and 1 (got {value})"
@@ -1199,6 +1210,8 @@ class Settings(BaseSettings):
         ]
         if self.risk_reduce_fraction <= 0:
             problems.append("RISK_REDUCE_FRACTION must be greater than 0")
+        if self.portfolio_rotation_interval_seconds <= 0:
+            problems.append("PORTFOLIO_ROTATION_INTERVAL_SECONDS must be greater than 0")
         if self.risk_max_spread_bps <= 0:
             problems.append("RISK_MAX_SPREAD_BPS must be greater than 0")
         if self.risk_max_notional_per_trade <= 0:
