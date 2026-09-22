@@ -88,9 +88,7 @@ class GlobeNewswireFeed:
             raise ProviderResponseError("globenewswire: root element was not rss")
         channel = root.find("channel")
         if channel is None:
-            raise ProviderResponseError(
-                "globenewswire: no channel element (page shape changed)"
-            )
+            raise ProviderResponseError("globenewswire: no channel element (page shape changed)")
         raw_items = channel.findall("item")
         if not raw_items:
             raise ProviderResponseError("globenewswire: feed carried no items")

@@ -639,9 +639,7 @@ class ServiceContainer:
             account_sync_available=self.t212_account is not None,
             execution_available=self.execution is not None,
         )
-        self.registry.register(
-            JobType.DISCLOSURE_FEED_POLL.value, handle_disclosure_feed_poll
-        )
+        self.registry.register(JobType.DISCLOSURE_FEED_POLL.value, handle_disclosure_feed_poll)
 
         # Before a worker or the scheduler can act, say out loud whether this
         # process is coming back up halted. A crash while paused or killed must

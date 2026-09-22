@@ -59,16 +59,12 @@ async def _jobs(database: Database) -> list[Job]:
 
 
 async def test_the_master_flag_off_builds_no_feeds(clean_tables: Database) -> None:
-    container = _container(
-        clean_tables, disclosure_feeds_enabled=False, investegate_enabled=True
-    )
+    container = _container(clean_tables, disclosure_feeds_enabled=False, investegate_enabled=True)
     assert container.disclosure_feeds == {}
 
 
 async def test_an_enabled_feed_is_constructed_and_closed(clean_tables: Database) -> None:
-    container = _container(
-        clean_tables, disclosure_feeds_enabled=True, investegate_enabled=True
-    )
+    container = _container(clean_tables, disclosure_feeds_enabled=True, investegate_enabled=True)
     try:
         assert set(container.disclosure_feeds) == {"investegate"}
     finally:
@@ -85,9 +81,7 @@ async def test_one_task_per_enabled_feed(clean_tables: Database) -> None:
     try:
         scheduler = Scheduler(clean_tables)
         container._register_schedules(scheduler)
-        assert {
-            name for name in scheduler._tasks if name.startswith("disclosure_feed:")
-        } == {
+        assert {name for name in scheduler._tasks if name.startswith("disclosure_feed:")} == {
             "disclosure_feed:investegate",
             "disclosure_feed:eqs",
         }
@@ -116,17 +110,13 @@ async def test_a_globe_newswire_country_gets_its_own_task(clean_tables: Database
 
 
 async def test_the_master_flag_off_enqueues_nothing(clean_tables: Database) -> None:
-    container = _container(
-        clean_tables, disclosure_feeds_enabled=False, investegate_enabled=True
-    )
+    container = _container(clean_tables, disclosure_feeds_enabled=False, investegate_enabled=True)
     await container._enqueue_disclosure_feed("investegate")
     assert await _jobs(clean_tables) == []
 
 
 async def test_enqueue_uses_the_feed_dedupe_key_and_priority(clean_tables: Database) -> None:
-    container = _container(
-        clean_tables, disclosure_feeds_enabled=True, investegate_enabled=True
-    )
+    container = _container(clean_tables, disclosure_feeds_enabled=True, investegate_enabled=True)
     try:
         await container._enqueue_disclosure_feed("investegate")
     finally:

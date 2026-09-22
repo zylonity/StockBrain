@@ -58,9 +58,7 @@ async def test_provider_item_id_is_checked_before_url_and_hash(
     assert second.detail == "PROVIDER_ITEM_ID"
 
     async with clean_tables.session() as session:
-        count = (
-            await session.execute(sa.select(sa.func.count()).select_from(Source))
-        ).scalar_one()
+        count = (await session.execute(sa.select(sa.func.count()).select_from(Source))).scalar_one()
     assert count == 1
 
 
@@ -107,7 +105,5 @@ async def test_distinct_regulatory_events_with_the_same_headline_are_not_collaps
     assert second.event_id != first.event_id
 
     async with clean_tables.session() as session:
-        count = (
-            await session.execute(sa.select(sa.func.count()).select_from(Source))
-        ).scalar_one()
+        count = (await session.execute(sa.select(sa.func.count()).select_from(Source))).scalar_one()
     assert count == 2

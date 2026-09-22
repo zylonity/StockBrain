@@ -36,9 +36,7 @@ class ActusNewsFeed:
     provider = SourceProvider.ACTUSNEWS
     native_language = _NATIVE_LANGUAGE
 
-    def __init__(
-        self, settings: Settings, *, client: httpx.AsyncClient | None = None
-    ) -> None:
+    def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
         self.max_pages = 1
         self.allow_empty = False
         self._http = FeedHttpClient(
@@ -67,9 +65,7 @@ class ActusNewsFeed:
             raise ProviderResponseError("actusnews: root element was not rss")
         channel = root.find("channel")
         if channel is None:
-            raise ProviderResponseError(
-                "actusnews: no channel element (page shape changed)"
-            )
+            raise ProviderResponseError("actusnews: no channel element (page shape changed)")
         raw_items = channel.findall("item")
         if not raw_items:
             raise ProviderResponseError("actusnews: feed carried no items")

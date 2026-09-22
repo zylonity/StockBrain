@@ -183,9 +183,7 @@ async def test_a_matching_impact_gets_the_exchange_hint_and_a_peer_does_not(
             impact.company_key: impact
             for impact in (
                 await session.execute(
-                    sa.select(EventCompanyImpact).where(
-                        EventCompanyImpact.event_id == event_id
-                    )
+                    sa.select(EventCompanyImpact).where(EventCompanyImpact.event_id == event_id)
                 )
             ).scalars()
         }
@@ -249,9 +247,7 @@ async def test_the_source_isin_reaches_resolution_for_a_matching_impact(
     async with clean_tables.session() as session:
         impact_id = (
             await session.execute(
-                sa.select(EventCompanyImpact.id).where(
-                    EventCompanyImpact.event_id == event_id
-                )
+                sa.select(EventCompanyImpact.id).where(EventCompanyImpact.event_id == event_id)
             )
         ).scalar_one()
 

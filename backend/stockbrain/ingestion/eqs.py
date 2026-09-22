@@ -50,9 +50,7 @@ class EQSFeed:
     provider = SourceProvider.EQS
     native_language = _NATIVE_LANGUAGE
 
-    def __init__(
-        self, settings: Settings, *, client: httpx.AsyncClient | None = None
-    ) -> None:
+    def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
         self.max_pages = 1
         self.allow_empty = False
         self._http = FeedHttpClient(
@@ -96,9 +94,7 @@ class EQSFeed:
         release_id = (anchor.get("data-news-item") or "").strip()
         if not href or not release_id:
             return None
-        language = (
-            _language_from_url(href) or _language_from_attribute(anchor) or _NATIVE_LANGUAGE
-        )
+        language = _language_from_url(href) or _language_from_attribute(anchor) or _NATIVE_LANGUAGE
         category = _category_from_url(href)
         company = _first_text(anchor, './/h4[contains(@class,"news__company")]')
         heading = _first_text(anchor, './/p[contains(@class,"news__heading")]')
@@ -192,9 +188,9 @@ def _parse_datetime(date_text: str | None, time_text: str | None) -> dt.datetime
     if not date_text or not time_text:
         return None
     try:
-        local = dt.datetime.strptime(
-            f"{date_text} {time_text}", _DATE_FORMAT
-        ).replace(tzinfo=_BERLIN)
+        local = dt.datetime.strptime(f"{date_text} {time_text}", _DATE_FORMAT).replace(
+            tzinfo=_BERLIN
+        )
     except ValueError:
         return None
     return local.astimezone(dt.UTC)

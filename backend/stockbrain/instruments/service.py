@@ -184,9 +184,7 @@ class ResolutionService:
         return dict(metadata or {})
 
     @staticmethod
-    def _isin_hint_for_impact(
-        impact: EventCompanyImpact, metadata: dict[str, Any]
-    ) -> str | None:
+    def _isin_hint_for_impact(impact: EventCompanyImpact, metadata: dict[str, Any]) -> str | None:
         """The source's ISIN, but only for an impact the source actually names.
 
         An impact row has no ISIN column, so the hand-off happens here: the

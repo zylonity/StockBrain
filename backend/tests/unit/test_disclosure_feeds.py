@@ -174,9 +174,7 @@ def test_a_substantive_investegate_headline_survives() -> None:
 
 
 def test_eqs_category_and_headline_rules_apply() -> None:
-    assert is_boilerplate(
-        _item(provider=SourceProvider.EQS, category="voting-rights", headline="")
-    )
+    assert is_boilerplate(_item(provider=SourceProvider.EQS, category="voting-rights", headline=""))
     assert is_boilerplate(
         _item(provider=SourceProvider.EQS, category="directors-dealings", headline="")
     )

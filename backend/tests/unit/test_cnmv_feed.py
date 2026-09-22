@@ -74,9 +74,7 @@ def test_inside_information_is_never_filtered_by_the_oir_rules() -> None:
     # The three ERCROS suspensions are real events, not warrant-issuer noise.
     assert sum(1 for item in items if "Sobre suspensiones" in item.headline) == 3
     assert all(
-        not is_boilerplate(item)
-        for item in items
-        if item.release_id in {"42823", "42822", "42821"}
+        not is_boilerplate(item) for item in items if item.release_id in {"42823", "42822", "42821"}
     )
 
 

@@ -76,9 +76,7 @@ class FakeFeed:
     max_pages = 1
     allow_empty = False
 
-    def __init__(
-        self, pages: dict[int, list[FeedItem]], *, error: Exception | None = None
-    ) -> None:
+    def __init__(self, pages: dict[int, list[FeedItem]], *, error: Exception | None = None) -> None:
         self._pages = pages
         self._error = error
         self.pages_fetched: list[int] = []

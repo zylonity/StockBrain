@@ -32,9 +32,7 @@ _DATETIME_FORMAT = "%d %b %Y %I:%M %p"
 #: The page prints wall-clock Europe/London time (GMT/BST), not UTC.
 _LONDON = ZoneInfo("Europe/London")
 _COMPANY_RE = re.compile(r"^(?P<name>.+?)\s*\((?P<ticker>[A-Za-z0-9.\-]+)\)\s*$")
-_ANNOUNCEMENT_LINK = (
-    'a[contains(concat(" ", normalize-space(@class), " "), " announcement-link ")]'
-)
+_ANNOUNCEMENT_LINK = 'a[contains(concat(" ", normalize-space(@class), " "), " announcement-link ")]'
 
 
 class InvestegateFeed:
@@ -44,9 +42,7 @@ class InvestegateFeed:
     provider = SourceProvider.INVESTEGATE
     native_language = _NATIVE_LANGUAGE
 
-    def __init__(
-        self, settings: Settings, *, client: httpx.AsyncClient | None = None
-    ) -> None:
+    def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
         self.max_pages = settings.investegate_max_pages
         self.allow_empty = False
         self._http = FeedHttpClient(

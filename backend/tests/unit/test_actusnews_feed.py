@@ -59,8 +59,7 @@ def test_last_row_fields() -> None:
         "with-the-acquisition-of-sand-cherry"
     )
     assert last.headline == (
-        "Wavestone continues its expansion in the United States with the acquisition "
-        "of Sand Cherry"
+        "Wavestone continues its expansion in the United States with the acquisition of Sand Cherry"
     )
     assert last.company_name == "WAVESTONE"
     assert last.published_at == dt.datetime(2026, 9, 14, 5, 30, tzinfo=dt.UTC)
