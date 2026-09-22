@@ -1591,6 +1591,16 @@ class ServiceContainer:
                     )
                 )
             else:
+                # Only ever move forward.  The stream, backfill and disclosure
+                # feeds do not deliver in published order, so an older article
+                # can arrive after a newer one; overwriting would regress the
+                # watermark and re-backfill an already-covered window.
+                current = row.value.get("last_seen_at")
+                try:
+                    if current and dt.datetime.fromisoformat(str(current)) >= seen_at:
+                        return
+                except (TypeError, ValueError):
+                    pass  # unparseable bookmark: fall through and overwrite it
                 row.value = {"last_seen_at": seen_at.isoformat()}
                 row.updated_at = utcnow()
         METRICS.set("stockbrain_news_watermark_epoch", seen_at.timestamp())
