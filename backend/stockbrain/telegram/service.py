@@ -34,8 +34,10 @@ from stockbrain.db.models.sources import Event
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     TRANSIENT_RULE_IDS,
+    Broker,
     EventStatus,
     ExecutionPolicy,
+    OrderSide,
     ProposalStatus,
     ProviderStatus,
     ResearchStatus,
@@ -54,6 +56,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DailySummaryView",
     "EventView",
+    "OpeningThesisView",
     "PortfolioView",
     "PositionView",
     "ProposalView",
@@ -267,6 +270,18 @@ class ResearchView:
     risks: list[str]
     invalidation_conditions: list[str]
     created_at: dt.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OpeningThesisView:
+    broker_ticker: str
+    company: str | None
+    action: str | None
+    horizon: str | None
+    summary: str | None
+    catalysts: list[str]
+    opened_at: dt.datetime | None
+    missing_reason: str | None = None
 
 
 class TelegramService:
@@ -727,6 +742,64 @@ class TelegramService:
             invalidation_conditions=_items(thesis.invalidation_conditions),
             created_at=thesis.created_at,
         )
+
+    async def opening_theses(self, ticker: str | None = None) -> list[OpeningThesisView]:
+        """Show the executed opening BUY thesis for one or all active holdings."""
+        origin_thesis_id = (
+            sa.select(TradeProposal.thesis_id)
+            .where(
+                TradeProposal.broker == Broker.TRADING212,
+                TradeProposal.broker_ticker == Position.broker_ticker,
+                TradeProposal.broker_environment == self._settings.t212_env.value,
+                TradeProposal.side == OrderSide.BUY,
+                TradeProposal.status == ProposalStatus.EXECUTED,
+                TradeProposal.thesis_id.is_not(None),
+                TradeProposal.executed_at.is_not(None),
+            )
+            .order_by(TradeProposal.executed_at.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        query = (
+            sa.select(Position, BrokerInstrument.market_symbol, BrokerInstrument.name, Thesis)
+            .outerjoin(
+                BrokerInstrument,
+                sa.and_(
+                    BrokerInstrument.broker_ticker == Position.broker_ticker,
+                    BrokerInstrument.broker == Position.broker,
+                ),
+            )
+            .outerjoin(Thesis, Thesis.id == origin_thesis_id)
+            .where(Position.broker == Broker.TRADING212, Position.quantity > 0)
+            .order_by(Position.broker_ticker)
+        )
+        wanted = ticker.strip().upper() if ticker else None
+        if wanted:
+            query = query.where(
+                sa.or_(
+                    sa.func.upper(Position.broker_ticker) == wanted,
+                    sa.func.upper(BrokerInstrument.market_symbol) == wanted,
+                )
+            )
+        async with self._database.session() as session:
+            rows = (await session.execute(query)).all()
+        return [
+            OpeningThesisView(
+                broker_ticker=position.broker_ticker,
+                company=name,
+                action=thesis.action.value if thesis else None,
+                horizon=thesis.time_horizon.value if thesis else None,
+                summary=thesis.summary if thesis else None,
+                catalysts=_items(thesis.catalysts) if thesis else [],
+                opened_at=thesis.created_at if thesis else None,
+                missing_reason=(
+                    "No executed StockBrain buy thesis is linked to this holding."
+                    if thesis is None
+                    else None
+                ),
+            )
+            for position, _symbol, name, thesis in rows
+        ]
 
     async def _locate_thesis(self, session: AsyncSession, text: str) -> uuid.UUID | None:
         candidate_uuid: uuid.UUID | None = None

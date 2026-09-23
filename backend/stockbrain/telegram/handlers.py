@@ -40,6 +40,7 @@ from stockbrain.telegram.tokens import parse_callback_data
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from stockbrain.portfolio_reviews import PositionReviewService
     from stockbrain.telegram.runtime import TelegramRuntime
 
 __all__ = ["ALLOWED_UPDATES", "TelegramHandlers", "to_markup"]
@@ -83,6 +84,7 @@ class TelegramHandlers:
         coordinator: ApprovalCoordinator,
         control: ControlStateService,
         runtime: TelegramRuntime | None = None,
+        position_reviews: PositionReviewService | None = None,
     ) -> None:
         self._settings = settings
         self._auth = authorizer
@@ -90,6 +92,7 @@ class TelegramHandlers:
         self._coordinator = coordinator
         self._control = control
         self._runtime = runtime
+        self._position_reviews = position_reviews
         self._last_research: dict[int, float] = {}
 
     def register(self, application: Application) -> None:  # type: ignore[type-arg]
@@ -102,6 +105,8 @@ class TelegramHandlers:
             "proposals": self.proposals,
             "events": self.events,
             "research": self.research,
+            "review": self.review,
+            "thesis": self.thesis,
             "pause": self.pause,
             "resume": self.resume,
             "kill": self.kill,
@@ -267,6 +272,31 @@ class TelegramHandlers:
         await self._reply(
             update, messages.render_research(await self._service.research(query), query)
         )
+
+    async def review(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._authorise(update, "review") is None:
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await self._reply(update, esc("Usage: /review <ticker|all>"))
+            return
+        if self._position_reviews is None:
+            await self._reply(update, esc("Position reviews are unavailable."))
+            return
+        target = args[0].strip()
+        result = await self._position_reviews.request(None if target.lower() == "all" else target)
+        await self._reply(update, messages.render_position_review(result))
+
+    async def thesis(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._authorise(update, "thesis") is None:
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await self._reply(update, esc("Usage: /thesis <ticker|all>"))
+            return
+        target = args[0].strip()
+        views = await self._service.opening_theses(None if target.lower() == "all" else target)
+        await self._reply(update, messages.render_opening_theses(views, target))
 
     def _research_cooldown(self, user_id: int) -> float:
         """Seconds the caller must still wait, and stamp the call if they may go.

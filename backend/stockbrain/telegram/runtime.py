@@ -48,6 +48,7 @@ from stockbrain.enums import ApprovalChannel, ProviderStatus
 from stockbrain.errors import TelegramSendError
 from stockbrain.logging import get_logger
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
+from stockbrain.portfolio_reviews import PositionReviewService
 from stockbrain.proposals.service import ProposalService
 from stockbrain.telegram.approvals import ApprovalCoordinator, Button
 from stockbrain.telegram.auth import TelegramAuthorizer
@@ -135,11 +136,13 @@ class TelegramRuntime:
         control: ControlStateService,
         preferences: NotificationPreferences | None = None,
         exits: ExitSweepService | None = None,
+        position_reviews: PositionReviewService | None = None,
     ) -> None:
         self._settings = settings
         self._database = database
         self._health = health
         self._control = control
+        self._position_reviews = position_reviews
 
         self._authorizer = TelegramAuthorizer(
             allowed_user_ids=settings.telegram_allowed_user_ids,
@@ -348,6 +351,7 @@ class TelegramRuntime:
             coordinator=self._coordinator,
             control=self._control,
             runtime=self,
+            position_reviews=self._position_reviews,
         )
         handlers.register(application)
         application.add_error_handler(self._on_error)

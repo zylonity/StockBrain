@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 
 import { api } from "../api/client";
@@ -229,6 +230,31 @@ function ExitCells({ position }: { position: PortfolioPosition }) {
 }
 
 function Positions({ data }: { data: PortfolioResponse }) {
+  const [reviewing, setReviewing] = useState<string | null>(null);
+  const [reviewNotice, setReviewNotice] = useState<string | null>(null);
+
+  async function review(ticker?: string) {
+    const label = ticker ?? "all active holdings";
+    if (!window.confirm(
+      `Re-review ${label}? A SELL/REDUCE conclusion will enter the configured trade authorization flow.`,
+    )) return;
+    setReviewing(ticker ?? "all");
+    setReviewNotice(null);
+    try {
+      const result = await api.reviewPositions(ticker);
+      const queued = Object.keys(result.requested);
+      const skipped = Object.entries(result.skipped).map(([key, reason]) => `${key}: ${reason}`);
+      setReviewNotice([
+        queued.length ? `Queued ${queued.join(", ")}.` : "Nothing queued.",
+        ...skipped,
+      ].join(" "));
+    } catch (error) {
+      setReviewNotice(error instanceof Error ? error.message : "Review request failed.");
+    } finally {
+      setReviewing(null);
+    }
+  }
+
   if (data.positions.length === 0) {
     return (
       <EmptyState title="No open positions">
@@ -243,11 +269,17 @@ function Positions({ data }: { data: PortfolioResponse }) {
     <div className="card card-table">
       <div className="card-head">
         <h2>Open positions</h2>
-        <span className="detail">
-          {data.positions.length} shown
-          {data.position_count > data.positions.length && ` of ${data.position_count}`}
-        </span>
+        <div className="button-row">
+          <span className="detail">
+            {data.positions.length} shown
+            {data.position_count > data.positions.length && ` of ${data.position_count}`}
+          </span>
+          <button disabled={reviewing !== null} onClick={() => void review()}>
+            {reviewing === "all" ? "Queueing…" : "Re-review all"}
+          </button>
+        </div>
       </div>
+      {reviewNotice && <div className="banner banner-info" role="status">{reviewNotice}</div>}
       <TableWrap>
         <table>
           <thead>
@@ -260,6 +292,7 @@ function Positions({ data }: { data: PortfolioResponse }) {
               <th className="tight">Floors</th>
               <th className="num">Result</th>
               <th className="tight">Synced</th>
+              <th className="tight">Review</th>
             </tr>
           </thead>
           <tbody>
@@ -292,6 +325,15 @@ function Positions({ data }: { data: PortfolioResponse }) {
                 </td>
                 <td className="tight detail" title={formatTimestamp(position.last_synced_at)}>
                   {formatRelative(position.last_synced_at)}
+                </td>
+                <td className="tight">
+                  <button
+                    disabled={reviewing !== null || position.exit?.managed === false}
+                    title={position.exit?.managed === false ? "No StockBrain opening thesis" : undefined}
+                    onClick={() => void review(position.broker_ticker)}
+                  >
+                    {reviewing === position.broker_ticker ? "Queueing…" : "Re-review"}
+                  </button>
                 </td>
               </tr>
             ))}

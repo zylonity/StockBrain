@@ -41,6 +41,7 @@ import type {
   LogQueryResponse,
   NotificationPreferences,
   PortfolioResponse,
+  PositionReviewResponse,
   Resolution,
   ResolutionListResponse,
   ResolutionStatus,
@@ -279,6 +280,8 @@ export const api = {
   updateNotificationPreferences: (categories: Record<string, boolean>) =>
     put<NotificationPreferences>("/api/v1/system/telegram/preferences", { categories }),
   portfolio: () => request<PortfolioResponse>("/api/v1/portfolio"),
+  reviewPositions: (ticker?: string) =>
+    post<PositionReviewResponse>("/api/v1/portfolio/review", ticker ? { ticker } : {}),
   // Holds *scheduled discovery*: no new paid searches, filings sweeps or
   // backfills are enqueued. Deliberately not the trading pause.
   pauseDiscovery: (reason?: string) =>

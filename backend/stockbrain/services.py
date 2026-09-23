@@ -116,6 +116,7 @@ from stockbrain.market_data.yahoo import YahooDailyBars
 from stockbrain.observability.alerts import OperationalAlerts
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
+from stockbrain.portfolio_reviews import PositionReviewService
 from stockbrain.proposals.exits import ExitSweepService
 from stockbrain.proposals.rotation import PortfolioRotationService
 from stockbrain.proposals.service import ProposalService
@@ -186,6 +187,7 @@ class ServiceContainer:
     proposals: ProposalService | None = field(default=None, init=False)
     exits: ExitSweepService | None = field(default=None, init=False)
     rotation: PortfolioRotationService | None = field(default=None, init=False)
+    position_reviews: PositionReviewService | None = field(default=None, init=False)
     volatility: VolatilityRefreshService | None = field(default=None, init=False)
     memory: MemoryService | None = field(default=None, init=False)
     risk_config: RiskConfig = field(init=False)
@@ -299,6 +301,8 @@ class ServiceContainer:
                 candidate_floor=self.settings.portfolio_rotation_min_candidate_confidence,
                 minimum_advantage=self.settings.portfolio_rotation_min_confidence_advantage,
             )
+        if self.proposals is not None and self.research is not None:
+            self.position_reviews = PositionReviewService(self.proposals, self.research)
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
@@ -352,6 +356,7 @@ class ServiceContainer:
                 control=self.control,
                 preferences=self.notification_preferences,
                 exits=self.exits,
+                position_reviews=self.position_reviews,
             )
 
     async def _announce_discovered_event(self, session: AsyncSession, event_id: uuid.UUID) -> None:

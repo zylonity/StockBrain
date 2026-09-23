@@ -19,10 +19,12 @@ no route here that changes anything.
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from stockbrain.api.dependencies import DbSession, ServicesDep, SettingsDep
 from stockbrain.api.schemas import (
@@ -38,6 +40,26 @@ if TYPE_CHECKING:
     from stockbrain.proposals.exits import PositionExitStatus
 
 router = APIRouter(prefix="/api/v1", tags=["portfolio"])
+
+
+class PositionReviewRequest(BaseModel):
+    ticker: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class PositionReviewResponse(BaseModel):
+    requested: dict[str, uuid.UUID]
+    skipped: dict[str, str]
+
+
+@router.post("/portfolio/review", response_model=PositionReviewResponse)
+async def review_positions(
+    body: PositionReviewRequest, services: ServicesDep
+) -> PositionReviewResponse:
+    review = services.position_reviews if services is not None else None
+    if review is None:
+        raise HTTPException(status_code=503, detail="Position reviews are unavailable")
+    result = await review.request(body.ticker)
+    return PositionReviewResponse(requested=result.requested, skipped=result.skipped)
 
 
 def _exit_response(status: PositionExitStatus) -> PositionExitResponse:

@@ -81,6 +81,14 @@ priced in. A position's unrealised move is the tape, not the event. Calibration
 records describe how this system's past calls in the same situation performed; a
 poor record is a reason for lower confidence, never a reason to invert a direction
 the evidence supports.
+When previous_thesis is present, this is an explicit position reassessment. Compare
+the original reason, catalysts, invalidation conditions and horizon with subsequent
+evidence and the position's observed performance. Decide whether the market has had
+enough time to reflect the expected catalyst. If that reaction should reasonably
+have occurred but has not, treat the failed confirmation as evidence against the
+position and return SELL or REDUCE when it outweighs the remaining case. Explain the
+expected reaction, elapsed window and observed result; do not keep a position merely
+because the original thesis once supported buying it.
 """
 
 CONTEXT_TOOL: dict[str, Any] = {

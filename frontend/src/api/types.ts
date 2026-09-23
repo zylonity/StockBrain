@@ -1221,6 +1221,11 @@ export interface PortfolioResponse {
   max_age_seconds: number | null;
 }
 
+export interface PositionReviewResponse {
+  requested: Record<string, string>;
+  skipped: Record<string, string>;
+}
+
 /* --- Discovery hold ------------------------------------------------------- */
 
 export interface DiscoveryHold {

@@ -9,8 +9,8 @@
  * figure is the server's own decimal string, grouped for reading.
  */
 
-import { describe, expect, it } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 import { Portfolio } from "./Portfolio";
 import { failWith, portfolioResponse, renderAt, stubFetch } from "../test/harness";
@@ -229,5 +229,25 @@ describe("Portfolio", () => {
     // one request every five seconds and this page must not spend it.
     expect(fetchStub.calls.every((call) => call.url.startsWith("/api/"))).toBe(true);
     expect(fetchStub.callsTo("/api/v1/portfolio")).toHaveLength(1);
+  });
+
+  it("can queue a confirmed re-review for one held stock", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const fetchStub = stubFetch({
+      "GET /api/v1/portfolio": portfolioResponse,
+      "POST /api/v1/portfolio/review": {
+        requested: { AAPL_US_EQ: "00000000-0000-0000-0000-000000000001" },
+        skipped: {},
+      },
+    });
+    renderAt(<Portfolio />, "/portfolio");
+
+    const row = (await screen.findByText("Apple Inc")).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: "Re-review" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Queued AAPL_US_EQ");
+    expect(fetchStub.callsTo("/api/v1/portfolio/review")[0]?.body).toEqual({
+      ticker: "AAPL_US_EQ",
+    });
   });
 });

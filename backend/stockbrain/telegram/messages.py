@@ -18,11 +18,13 @@ from typing import TYPE_CHECKING
 
 from stockbrain.control.state import ControlSnapshot
 from stockbrain.enums import ProposalStatus, ProviderStatus
+from stockbrain.portfolio_reviews import PositionReviewResult
 from stockbrain.telegram.formatting import age, bold, code, esc, money, quantity, stamp, trim
 from stockbrain.telegram.preferences import PipelineEvent
 from stockbrain.telegram.service import (
     DailySummaryView,
     EventView,
+    OpeningThesisView,
     PortfolioView,
     PositionView,
     ProposalView,
@@ -107,6 +109,11 @@ def render_help() -> str:
         ("/proposals", "active and recent trade proposals"),
         ("/events", "recent significant events"),
         ("/research &lt;id|symbol&gt;", "normalised thesis for a proposal, event or symbol"),
+        ("/review &lt;ticker|all&gt;", "re-review held positions against their opening thesis"),
+        (
+            "/thesis &lt;ticker|all&gt;",
+            "show why an active holding was bought and its reaction horizon",
+        ),
         ("/pause", "stop new proposals and all authorization"),
         ("/resume", "lift a pause"),
         ("/kill", "emergency stop: no authorization, no future execution"),
@@ -117,6 +124,49 @@ def render_help() -> str:
         f"{esc(AUTHORIZATION_NOTICE)}\n"
         f"{esc('/kill never liquidates a position and never cancels a broker order.')}"
     )
+
+
+def render_position_review(result: PositionReviewResult) -> str:
+    lines = [bold("Position review")]
+    if result.requested:
+        lines.append(esc("Queued: " + ", ".join(sorted(result.requested))))
+    if result.skipped:
+        lines.extend(
+            esc(f"{ticker}: {reason}") for ticker, reason in sorted(result.skipped.items())
+        )
+    if not result.requested and not result.skipped:
+        lines.append(esc("No active positions found."))
+    lines.append(esc("A SELL/REDUCE result follows the normal risk and authorization policy."))
+    return "\n".join(lines)
+
+
+def render_opening_theses(views: list[OpeningThesisView], query: str) -> str:
+    if not views:
+        return f"{bold('Opening thesis')}\nNo active holding found for {code(trim(query, 40))}."
+    lines = [bold("Opening thesis")]
+    for view in views:
+        lines.append(f"\n{trim(view.company, _NAME_LIMIT)} {code(view.broker_ticker)}")
+        if view.missing_reason:
+            lines.append(esc(view.missing_reason))
+            continue
+        if view.action and view.horizon:
+            lines.append(f"{esc(view.action)} · expected reaction window: {esc(view.horizon)}")
+        if view.opened_at:
+            lines.append(f"Opened on thesis: {esc(stamp(view.opened_at))}")
+        if view.summary:
+            lines.append(f"{bold('Why bought')}: {trim(view.summary, _TEXT_LIMIT)}")
+        if view.catalysts:
+            lines.append(
+                bold("Expected catalysts")
+                + "\n"
+                + "\n".join(f"• {trim(item, _REASON_LIMIT)}" for item in view.catalysts[:4])
+            )
+    lines.append(
+        esc(
+            "The reaction window is the research horizon, an estimate rather than a dated forecast."
+        )
+    )
+    return "\n".join(lines)
 
 
 def control_line(control: ControlSnapshot) -> str:

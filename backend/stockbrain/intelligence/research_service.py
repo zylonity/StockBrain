@@ -187,7 +187,10 @@ class ResearchService:
                 raise ResearchValidationError("previous thesis is not valid for this listing/time")
             previous = ResearchDecision.model_validate(old.structured_decision)
         memory: ResearchMemory | None = None
-        if self.memory_packet_enabled and self.memory is not None:
+        # Reassessments must see entry/current performance even when optional
+        # memory enrichment is off; otherwise they cannot test the expected
+        # market reaction against what actually happened.
+        if self.memory is not None and (self.memory_packet_enabled or previous_thesis_id):
             memory = await self.memory.research_memory(
                 session,
                 company_id=company.id,
