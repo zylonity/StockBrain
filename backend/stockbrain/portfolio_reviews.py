@@ -56,11 +56,13 @@ class PositionReviewService:
                     skipped[position.broker_ticker] = "opening research cannot be replayed"
                     continue
                 active = await session.scalar(
-                    sa.select(ResearchRun.id).where(
+                    sa.select(ResearchRun.id)
+                    .where(
                         ResearchRun.trigger == "POSITION_REASSESSMENT",
                         ResearchRun.status.in_((ResearchStatus.PENDING, ResearchStatus.RUNNING)),
                         ResearchRun.broker_instrument_id == origin_run.broker_instrument_id,
-                    ).limit(1)
+                    )
+                    .limit(1)
                 )
                 if active is not None:
                     skipped[position.broker_ticker] = "review already pending"
