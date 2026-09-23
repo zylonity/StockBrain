@@ -69,6 +69,10 @@ _EXPECTED_MUTATIONS = {
     # body can redirect.
     "POST /api/v1/discovery/pause",
     "POST /api/v1/discovery/resume",
+    # Requests an advisory reassessment from the research service. It creates
+    # no order and a resulting SELL/REDUCE still follows ordinary proposal
+    # validation and authorization.
+    "POST /api/v1/portfolio/review",
     # Which categories of Telegram message are delivered. Writes one
     # module-constant settings key. A notification is derived from state and is
     # never state, so nothing here can change what the system does -- only what

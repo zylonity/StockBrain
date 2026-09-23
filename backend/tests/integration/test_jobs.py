@@ -223,8 +223,17 @@ async def test_runner_executes_a_registered_handler(clean_tables: Database) -> N
     await runner.start()
     try:
         for _ in range(100):
+            async with clean_tables.session() as session:
+                job = (await session.execute(sa.select(Job))).scalar_one()
+                if job.status is JobStatus.SUCCEEDED:
+                    break
             if seen:
-                break
+                # The handler records its observation before the runner's
+                # separate completion transaction commits. Wait for the job
+                # lifecycle, not just the handler side effect, before stopping
+                # the worker (which cancels in-flight work).
+                await asyncio.sleep(0.05)
+                continue
             await asyncio.sleep(0.05)
     finally:
         await runner.stop()

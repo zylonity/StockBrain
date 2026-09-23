@@ -301,4 +301,7 @@ def test_the_runtime_never_receives_a_broker_credential() -> None:
         # The read-only source of each position's exit floors. Evaluates the
         # stored mirror and the risk rules; it prices nothing and sends nothing.
         "exits",
+        # Narrow operator request to queue research for an active holding. The
+        # service carries no broker client or broker credential.
+        "position_reviews",
     }
