@@ -78,6 +78,10 @@ class ResearchService:
         evidence_chars: int = 12000,
         min_impact_materiality: float = 0.0,
         max_impacts_per_event: int = 0,
+        company_cooldown_hours: float = 0.0,
+        cooldown_bypass_importance: float = 1.0,
+        skip_event_types: tuple[str, ...] = (),
+        max_event_age_hours: float | None = None,
         macro: MacroDataProvider | None = None,
         supplemental: SupplementalResearchProvider | None = None,
         fundamentals: SupplementalResearchProvider | None = None,
@@ -99,6 +103,10 @@ class ResearchService:
         # so tightening these must not invalidate and re-run existing work.
         self.min_impact_materiality = min_impact_materiality
         self.max_impacts_per_event = max_impacts_per_event
+        self.company_cooldown_hours = company_cooldown_hours
+        self.cooldown_bypass_importance = cooldown_bypass_importance
+        self.skip_event_types = tuple(kind.strip().upper() for kind in skip_event_types if kind)
+        self.max_event_age_hours = max_event_age_hours
         self.macro = macro
         self.supplemental = supplemental
         self.fundamentals = fundamentals
@@ -658,7 +666,7 @@ class ResearchService:
             # happened to be inserted first.  ``id`` breaks ties so a rerun
             # selects the same impacts rather than a fresh arbitrary subset.
             query = (
-                sa.select(EventCompanyImpact.id)
+                sa.select(EventCompanyImpact.id, EventCompanyImpact.company_id)
                 .add_columns(ranked.label("rank"))
                 .join(Event, Event.id == EventCompanyImpact.event_id)
                 .where(
@@ -668,9 +676,37 @@ class ResearchService:
                     EventCompanyImpact.materiality_score >= self.min_impact_materiality,
                 )
             )
+            if self.skip_event_types:
+                query = query.where(
+                    sa.or_(
+                        Event.event_type.is_(None),
+                        sa.func.upper(Event.event_type).not_in(self.skip_event_types),
+                    )
+                )
+            if self.company_cooldown_hours > 0:
+                recent = sa.exists(
+                    sa.select(ResearchRun.id).where(
+                        ResearchRun.company_id == EventCompanyImpact.company_id,
+                        ResearchRun.status != ResearchStatus.FAILED,
+                        ResearchRun.created_at
+                        > sa.func.now() - dt.timedelta(hours=self.company_cooldown_hours),
+                    )
+                )
+                query = query.where(
+                    sa.or_(
+                        ~recent,
+                        sa.func.coalesce(Event.importance_score, 0.0)
+                        >= self.cooldown_bypass_importance,
+                    )
+                )
             if event_id is not None:
                 query = query.where(Event.id == event_id)
             else:
+                if self.max_event_age_hours is not None:
+                    query = query.where(
+                        Event.first_seen_at
+                        > sa.func.now() - dt.timedelta(hours=self.max_event_age_hours)
+                    )
                 query = query.where(
                     ~sa.exists(
                         sa.select(ResearchRun.id).where(
@@ -680,10 +716,17 @@ class ResearchService:
                     )
                 )
             selected = query.subquery()
-            capped = sa.select(selected.c.id)
+            capped = sa.select(selected.c.id, selected.c.company_id)
             if self.max_impacts_per_event:
                 capped = capped.where(selected.c.rank <= self.max_impacts_per_event)
-            for impact_id in await session.scalars(capped.limit(25)):
+            # One run per company per pass: several queued stories about the
+            # same company become one research run, not one each.
+            seen_companies: set[uuid.UUID] = set()
+            for impact_id, company_id in (await session.execute(capped.limit(25))).all():
+                if self.company_cooldown_hours > 0:
+                    if company_id in seen_companies:
+                        continue
+                    seen_companies.add(company_id)
                 try:
                     await self.request(session, impact_id)
                 except (InstrumentResolutionError, ResearchValidationError):

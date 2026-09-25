@@ -509,3 +509,88 @@ async def test_job_pipeline_and_research_inspection(clean_tables: Database) -> N
             "alpaca_market_data",
         }
         assert (await http.get("/api/v1/research/" + str(uuid.uuid4()))).status_code == 404
+
+
+async def _second_story(
+    db: Database, value: ResearchPacket, *, importance: float, event_type: str | None = None
+) -> uuid.UUID:
+    event_id = uuid.uuid4()
+    async with db.transaction() as session:
+        session.add(
+            Event(
+                id=event_id,
+                title="Another story about the same company",
+                title_hash="c" * 64,
+                summary="More news.",
+                first_seen_at=utcnow(),
+                event_time=utcnow(),
+                status=EventStatus.CANDIDATE,
+                importance_score=importance,
+                event_type=event_type,
+            )
+        )
+        await session.flush()
+        session.add(
+            EventCompanyImpact(
+                id=uuid.uuid4(),
+                event_id=event_id,
+                company_id=value.company.company_id,
+                company_name_hint="Apple",
+                company_key="apple",
+                direction=ImpactDirection.POSITIVE,
+                materiality_score=0.8,
+                confidence=0.8,
+                impact_path=value.impact_path,
+                relationship_type=value.relationship,
+                explanation=value.classifier_rationale,
+                broker_instrument_id=value.company.broker_instrument_id,
+                resolution_status=ResolutionStatus.RESOLVED,
+            )
+        )
+        session.add(
+            EventSourceLink(
+                event_id=event_id,
+                source_id=value.evidence[0].source_id,
+                relationship_type=EventSourceRelationship.PRIMARY,
+            )
+        )
+    return event_id
+
+
+def _throttled(db: Database, engine: Engine) -> ResearchService:
+    research = service(db, engine)
+    research.company_cooldown_hours = 6.0
+    research.cooldown_bypass_importance = 0.85
+    research.skip_event_types = ("MACRO",)
+    return research
+
+
+async def _runs(db: Database) -> int:
+    async with db.session() as session:
+        return int(await session.scalar(sa.select(sa.func.count(ResearchRun.id))) or 0)
+
+
+async def test_a_company_in_cooldown_is_not_researched_again(clean_tables: Database) -> None:
+    value = await seed(clean_tables)
+    research = _throttled(clean_tables, Engine())
+    await research.enqueue_event(value.event_id)
+    second = await _second_story(clean_tables, value, importance=0.7)
+    await research.enqueue_event(second)
+    assert await _runs(clean_tables) == 1
+
+
+async def test_high_importance_news_bypasses_the_cooldown(clean_tables: Database) -> None:
+    value = await seed(clean_tables)
+    research = _throttled(clean_tables, Engine())
+    await research.enqueue_event(value.event_id)
+    second = await _second_story(clean_tables, value, importance=0.9)
+    await research.enqueue_event(second)
+    assert await _runs(clean_tables) == 2
+
+
+async def test_market_wide_event_types_are_not_researched(clean_tables: Database) -> None:
+    value = await seed(clean_tables)
+    research = _throttled(clean_tables, Engine())
+    story = await _second_story(clean_tables, value, importance=0.9, event_type="macro")
+    await research.enqueue_event(story)
+    assert await _runs(clean_tables) == 0
