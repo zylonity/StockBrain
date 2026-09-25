@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 from stockbrain.enums import RiskOutcome, RuleOutcome
 from stockbrain.risk.engine import RiskEngine
 from stockbrain.risk.models import RiskDecision
-from stockbrain.risk.rules import conviction_weight
+from stockbrain.risk.rules import conviction_targets, conviction_weight
 from tests import risk_helpers as h
 
 
@@ -90,3 +91,45 @@ def test_cap_mode_is_unchanged() -> None:
     decision = RiskEngine().evaluate(h.inputs(risk_config=h.config()))
     ids = {rule.rule_id for rule in decision.rules}
     assert "max_trade_pct_of_portfolio" in ids and "conviction_target" not in ids
+
+
+def test_targets_split_the_whole_account_by_weight() -> None:
+    config = _config(max_position_pct_of_portfolio=Decimal("1"))
+    targets = conviction_targets(
+        Decimal("300"),
+        {"A": Decimal("2"), "B": Decimal("1")},
+        config,  # type: ignore[arg-type]
+    )
+    assert targets == {"A": Decimal("200"), "B": Decimal("100")}
+
+
+def test_a_capped_holdings_excess_is_redistributed() -> None:
+    config = _config(max_position_pct_of_portfolio=Decimal("0.25"))
+    targets = conviction_targets(
+        Decimal("400"),
+        {"A": Decimal("10"), "B": Decimal("1"), "C": Decimal("1"), "D": Decimal("1")},
+        config,  # type: ignore[arg-type]
+    )
+    assert all(value == Decimal("100") for value in targets.values())
+
+
+def test_self_adjusting_target_shrinks_as_the_book_grows() -> None:
+    def notional(others: tuple[Decimal, ...]) -> Decimal:
+        state = h.account(cash=Decimal("8000"), total=Decimal("8000"), invested=Decimal("0"))
+        decision = RiskEngine().evaluate(
+            replace(
+                h.inputs(
+                    confidence=Decimal("0.79"),
+                    risk_config=_config(target_positions=0),  # type: ignore[arg-type]
+                    state=state,
+                ),
+                other_holding_weights=others,
+            )
+        )
+        return decision.sizing.notional_account_currency
+
+    alone = notional(())
+    crowded = notional((Decimal("1.375"),) * 9)
+    # Alone it is capped at 30% (2400); among ten equal ideas it gets a tenth.
+    assert Decimal("2350") < alone <= Decimal("2400")
+    assert Decimal("750") < crowded <= Decimal("800")

@@ -119,6 +119,7 @@ from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 from stockbrain.observability.metrics import METRICS
 from stockbrain.portfolio_reviews import PositionReviewService
 from stockbrain.proposals.exits import ExitSweepService
+from stockbrain.proposals.rebalance import RebalanceService
 from stockbrain.proposals.rotation import PortfolioRotationService
 from stockbrain.proposals.service import ProposalService
 from stockbrain.risk.config import RiskConfig, risk_config_from_settings
@@ -189,6 +190,7 @@ class ServiceContainer:
     exits: ExitSweepService | None = field(default=None, init=False)
     rotation: PortfolioRotationService | None = field(default=None, init=False)
     position_reviews: PositionReviewService | None = field(default=None, init=False)
+    rebalance: RebalanceService | None = field(default=None, init=False)
     volatility: VolatilityRefreshService | None = field(default=None, init=False)
     memory: MemoryService | None = field(default=None, init=False)
     risk_config: RiskConfig = field(init=False)
@@ -306,6 +308,8 @@ class ServiceContainer:
             )
         if self.proposals is not None and self.research is not None:
             self.position_reviews = PositionReviewService(self.proposals, self.research)
+        if self.proposals is not None:
+            self.rebalance = RebalanceService(self.proposals, self.proposals.account_state)
         self.ingestion = IngestionService(
             self.database,
             queue=self.queue,
@@ -360,6 +364,7 @@ class ServiceContainer:
                 preferences=self.notification_preferences,
                 exits=self.exits,
                 position_reviews=self.position_reviews,
+                rebalance=self.rebalance,
             )
 
     async def _announce_discovered_event(self, session: AsyncSession, event_id: uuid.UUID) -> None:

@@ -39,6 +39,7 @@ from stockbrain.enums import (
     TimeHorizon,
 )
 from stockbrain.proposals.exits import ExitSweepService
+from stockbrain.proposals.rebalance import RebalanceService
 from stockbrain.proposals.service import GenerationResult, ProposalService
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES
 from stockbrain.risk.config import risk_config_from_settings
@@ -869,3 +870,66 @@ async def test_status_reports_no_floors_for_a_position_with_no_tradable_shares(
     assert status.floors is None
     assert status.reason is not None
     assert "no tradable shares" in status.reason
+
+
+def _rebalancer(database: Database, **overrides: object) -> RebalanceService:
+    resolved = ph.settings(risk_sizing_mode="conviction", risk_target_positions=0, **overrides)
+    service = ph.service_with(database, resolved)
+    return RebalanceService(service, service.account_state)
+
+
+async def test_rebalance_preview_trades_nothing(clean_tables: Database) -> None:
+    await _seed_executed_buy(clean_tables, broker_ticker="AAPL_US_EQ")
+    plan = await _rebalancer(clean_tables, risk_max_position_pct="0.01").plan()
+    assert plan.unavailable is None
+    [line] = plan.lines
+    # 9 shares at 200 = 1800 held; one holding capped at 1% of 100000 = 1000.
+    assert line.action == "TRIM" and line.target == Decimal("1000")
+    async with clean_tables.session() as session:
+        count = await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(TradeProposal)
+            .where(TradeProposal.side == OrderSide.SELL)
+        )
+    assert count == 0
+
+
+async def test_rebalance_confirm_proposes_a_partial_trim(clean_tables: Database) -> None:
+    await _seed_executed_buy(clean_tables, broker_ticker="AAPL_US_EQ")
+    plan = await _rebalancer(clean_tables, risk_max_position_pct="0.01").execute()
+    assert "trim proposed" in plan.submitted["AAPL_US_EQ"], plan.submitted
+    async with clean_tables.session() as session:
+        sell = await session.scalar(
+            sa.select(TradeProposal).where(TradeProposal.side == OrderSide.SELL)
+        )
+    assert sell is not None
+    # 800 of 1800 is ~44% of nine shares, rounded down to whole shares.
+    assert Decimal("0") < sell.proposed_quantity < Decimal("9")
+    assert sell.research_action == ThesisAction.REDUCE.value
+
+
+async def test_rebalance_needs_conviction_sizing(clean_tables: Database) -> None:
+    await _seed_executed_buy(clean_tables, broker_ticker="AAPL_US_EQ")
+    service = ph.service_with(clean_tables, ph.settings())
+    plan = await RebalanceService(service, service.account_state).plan()
+    assert plan.unavailable and "conviction" in plan.unavailable
+
+
+async def test_rebalance_confirm_proposes_a_top_up_on_the_latest_thesis(
+    clean_tables: Database,
+) -> None:
+    bought = await _seed_executed_buy(clean_tables, broker_ticker="AAPL_US_EQ")
+    plan = await _rebalancer(
+        clean_tables, risk_max_position_pct="0.03", risk_max_notional_per_trade="5000"
+    ).execute()
+    assert plan.submitted["AAPL_US_EQ"] == "top-up proposed", plan.submitted
+    async with clean_tables.session() as session:
+        buy = await session.scalar(
+            sa.select(TradeProposal).where(
+                TradeProposal.side == OrderSide.BUY,
+                TradeProposal.status != ProposalStatus.EXECUTED,
+            )
+        )
+    assert buy is not None and buy.thesis_id == bought.thesis_id
+    # Target 3000, 1800 held: the top-up is at most the 1200 gap.
+    assert buy.estimated_notional <= Decimal("1200")

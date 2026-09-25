@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from stockbrain.control.state import ControlSnapshot
 from stockbrain.enums import ProposalStatus, ProviderStatus
 from stockbrain.portfolio_reviews import PositionReviewResult
+from stockbrain.proposals.rebalance import RebalancePlan
 from stockbrain.telegram.formatting import age, bold, code, esc, money, quantity, stamp, trim
 from stockbrain.telegram.preferences import PipelineEvent
 from stockbrain.telegram.service import (
@@ -111,6 +112,10 @@ def render_help() -> str:
         ("/research &lt;id|symbol&gt;", "normalised thesis for a proposal, event or symbol"),
         ("/review &lt;ticker|all&gt;", "re-review held positions against their opening thesis"),
         (
+            "/rebalance [confirm]",
+            "preview, then propose, trims and top-ups toward conviction targets",
+        ),
+        (
             "/thesis &lt;ticker|all&gt;",
             "show why an active holding was bought and its reaction horizon",
         ),
@@ -137,6 +142,39 @@ def render_position_review(result: PositionReviewResult) -> str:
     if not result.requested and not result.skipped:
         lines.append(esc("No active positions found."))
     lines.append(esc("A SELL/REDUCE result follows the normal risk and authorization policy."))
+    return "\n".join(lines)
+
+
+def render_rebalance(plan: RebalancePlan, *, executed: bool) -> str:
+    title = bold("Rebalance" + (" — proposed" if executed else " — preview"))
+    if plan.unavailable:
+        return f"{title}\n{esc(plan.unavailable)}"
+    currency = plan.currency or ""
+    lines = [title, esc(f"Account value {plan.total:.2f} {currency}".rstrip())]
+    if not plan.lines:
+        lines.append(esc("No open positions."))
+    for line in plan.lines:
+        head = f"{code(line.broker_ticker)} {esc(f'{line.value:.2f} → {line.target:.2f}')}"
+        if line.action == "TRIM":
+            detail = f"sell {-line.delta:.2f}"
+        elif line.action == "TOP_UP":
+            detail = f"buy {line.delta:.2f}"
+        else:
+            detail = line.reason or line.action.lower()
+        outcome = plan.submitted.get(line.broker_ticker)
+        lines.append(
+            f"{head} · {esc(detail)}" + (f" — {esc(trim(outcome, 120))}" if outcome else "")
+        )
+    if executed:
+        lines.append(
+            esc(
+                "Each trade is an ordinary proposal on the normal risk and approval path. "
+                "Top-ups the cash cannot fund yet wait for the sales to fill; "
+                "run /rebalance confirm again afterwards."
+            )
+        )
+    else:
+        lines.append(esc("Nothing has traded. Send /rebalance confirm to propose these."))
     return "\n".join(lines)
 
 

@@ -473,6 +473,15 @@ class RiskInputs:
     """This system's record for the proposal's (event_type, action) bucket.
     ``None`` when memory is off, nothing is graded yet, or the path is an exit."""
 
+    other_holding_weights: tuple[Decimal, ...] | None = None
+    """Conviction weights of every *other* current holding.  Present only under
+    self-adjusting conviction sizing, where a buy's target is its weight's share
+    of the whole book rather than a fixed 1/N."""
+
+    reduce_fraction: Decimal | None = None
+    """A REDUCE's fraction of the available position, overriding the configured
+    default.  Set by rebalancing, which trims to a computed target."""
+
 
 @dataclass(frozen=True, slots=True)
 class RuleResult:

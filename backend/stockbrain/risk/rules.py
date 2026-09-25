@@ -814,7 +814,20 @@ def notional_caps(inputs: RiskInputs) -> list[NotionalCap]:
 
     if config.sizing_mode == "conviction":
         weight = conviction_weight(config, inputs.confidence)
-        target = total / Decimal(config.target_positions) * weight
+        if config.target_positions == 0:
+            # Self-adjusting: this idea's weight against the whole book.
+            ticker = inputs.identity.broker_ticker
+            weights = {ticker: weight}
+            for index, other in enumerate(inputs.other_holding_weights or ()):
+                weights[f"{_OTHER}{index}"] = other
+            target = conviction_targets(total, weights, config)[ticker]
+            share = f"{len(weights)}-holding book's weighted"
+        else:
+            target = min(
+                total / Decimal(config.target_positions) * weight,
+                _pct(total, config.max_position_pct_of_portfolio),
+            )
+            share = f"1/{config.target_positions}"
         caps.append(
             NotionalCap(
                 rule_id="conviction_target",
@@ -824,7 +837,7 @@ def notional_caps(inputs: RiskInputs) -> list[NotionalCap]:
                 threshold=str(target),
                 reason=(
                     f"confidence {inputs.confidence} weights the {total} {account.currency} "
-                    f"account's 1/{config.target_positions} share by {weight}: a target "
+                    f"account's {share} share by {weight}: a target "
                     f"holding of {target}, {held_value} already held"
                 ),
                 defines_intent=True,
@@ -1009,6 +1022,38 @@ def conviction_weight(config: RiskConfig, confidence: Decimal) -> Decimal:
     progress = min(Decimal(1), max(ZERO, progress))
     low, high = config.conviction_min_weight, config.conviction_max_weight
     return low + (high - low) * progress
+
+
+_OTHER = "\x00other:"
+
+
+def conviction_targets(
+    total: Decimal, weights: dict[str, Decimal], config: RiskConfig
+) -> dict[str, Decimal]:
+    """Split ``total`` across holdings in proportion to their weights.
+
+    No holding may exceed ``max_position_pct_of_portfolio``; what a capped
+    holding cannot take is redistributed among the rest (water-filling), so the
+    whole account is allocated unless every holding is at its cap.
+    """
+    cap = _pct(total, config.max_position_pct_of_portfolio)
+    targets: dict[str, Decimal] = {}
+    remaining = total
+    open_names = {name for name, weight in weights.items() if weight > ZERO}
+    while open_names and remaining > ZERO:
+        weight_sum = sum((weights[name] for name in open_names), ZERO)
+        share = {name: remaining * weights[name] / weight_sum for name in open_names}
+        capped = {name for name, value in share.items() if value >= cap}
+        if not capped:
+            targets.update(share)
+            break
+        for name in capped:
+            targets[name] = cap
+            remaining -= cap
+        open_names -= capped
+    for name in weights:
+        targets.setdefault(name, ZERO)
+    return targets
 
 
 def target_fill_rule(caps: list[NotionalCap], config: RiskConfig) -> RuleResult | None:

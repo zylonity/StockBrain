@@ -98,6 +98,7 @@ class RiskEngine:
             max_notional=effective_cap,
             size_factor=size_factor,
             fx=inputs.fx,
+            reduce_fraction=inputs.reduce_fraction,
         )
 
         reduced = any(rule.outcome is RuleOutcome.REDUCE for rule in rules)

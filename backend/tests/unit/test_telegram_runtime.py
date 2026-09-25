@@ -304,4 +304,7 @@ def test_the_runtime_never_receives_a_broker_credential() -> None:
         # Narrow operator request to queue research for an active holding. The
         # service carries no broker client or broker credential.
         "position_reviews",
+        # Operator rebalance: reads the stored account snapshot and creates
+        # ordinary proposals through the same proposal service. No broker client.
+        "rebalance",
     }

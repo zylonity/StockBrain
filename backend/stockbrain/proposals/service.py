@@ -564,8 +564,13 @@ class ProposalService:
         signal: ExitSignal,
         *,
         now: dt.datetime | None = None,
+        thesis_id: uuid.UUID | None = None,
     ) -> GenerationResult:
         """Turn one exit signal into a proposal, on the ordinary risk path.
+
+        Rebalancing also uses this path for a top-up (``signal.action`` BUY),
+        passing the holding's latest BUY ``thesis_id``: the proposal is built on
+        that thesis, and gated and sized exactly like any other buy.
 
         The signal decides *that* the position should be reduced and *why*.
         Everything else -- the quantity, the reference price, the spread, the
@@ -593,7 +598,7 @@ class ProposalService:
                         "so there is no thesis this exit could supersede"
                     ),
                 )
-            thesis_id = origin.thesis_id
+            thesis_id = thesis_id or origin.thesis_id
             candidate = await self._load_candidate(session, thesis_id)
 
         if candidate is None:
@@ -621,7 +626,11 @@ class ProposalService:
             verdict = await evaluator.evaluate(
                 session,
                 EvaluationContext(
-                    candidate.action, candidate.confidence, fresh_identity, account_id
+                    candidate.action,
+                    candidate.confidence,
+                    fresh_identity,
+                    account_id,
+                    reduce_fraction=signal.fraction,
                 ),
                 facts,
                 now=moment,
@@ -739,7 +748,11 @@ class ProposalService:
             # An exit is auto-authorized only when EXECUTION_AUTO_AUTHORIZE_EXITS
             # says so; otherwise, under either execution policy, a human must
             # see it.
-            auto_exit = self._auto_authorizes_exits
+            auto_exit = self._auto_authorizes_exits or (
+                signal.action is ThesisAction.BUY
+                and self.execution_policy is ExecutionPolicy.AUTOMATIC
+                and self.settings.automatic_authorization_permitted
+            )
             if not auto_exit:
                 await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_MANUAL)
             proposal_id = proposal.id

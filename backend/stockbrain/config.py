@@ -899,7 +899,10 @@ class Settings(BaseSettings):
     """``cap``: size each buy as the smallest cap times the confidence factor.
     ``conviction``: size each buy toward a target holding that scales with the
     whole account and with research confidence -- see ``RiskConfig``."""
-    risk_target_positions: int = Field(default=8, ge=1, le=100)
+    risk_target_positions: int = Field(default=8, ge=0, le=100)
+    """Conviction sizing's equal-share count. 0 self-adjusts: each holding's
+    target is its conviction weight's share of the whole book, capped at
+    RISK_MAX_POSITION_PCT."""
     risk_conviction_full_confidence: Decimal = Decimal("0.90")
     risk_conviction_min_weight: Decimal = Decimal("0.75")
     risk_conviction_max_weight: Decimal = Decimal("2.0")

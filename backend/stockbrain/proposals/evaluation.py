@@ -26,6 +26,7 @@ from stockbrain.fx.base import normalize_currency
 from stockbrain.fx.service import FxService
 from stockbrain.intelligence.memory import MemoryService
 from stockbrain.logging import get_logger
+from stockbrain.proposals.holdings import holding_weights
 from stockbrain.proposals.quotes import QuoteFetcher
 from stockbrain.proposals.state_machine import (
     EXPOSURE_RESERVING_STATUSES,
@@ -44,6 +45,7 @@ from stockbrain.risk.models import (
     RuleResult,
 )
 from stockbrain.risk.rules import (
+    EXPOSURE_INCREASING_ACTIONS,
     fx_rate_drift,
     proposal_ttl,
     reference_price_drift,
@@ -127,6 +129,7 @@ class EvaluationContext:
     account_id: str
     proposal: TradeProposal | None = None
     event_type: str | None = None
+    reduce_fraction: Decimal | None = None
 
 
 class ProposalEvaluator:
@@ -230,6 +233,25 @@ class ProposalEvaluator:
             calibration = await self.memory.calibration(
                 session, event_type=context.event_type, action=context.action, as_of=now
             )
+        other_weights = None
+        if (
+            self.config.sizing_mode == "conviction"
+            and self.config.target_positions == 0
+            and context.action in EXPOSURE_INCREASING_ACTIONS
+        ):
+            other_weights = await holding_weights(
+                session,
+                broker=self.broker,
+                environment=self.settings.t212_env.value,
+                config=self.config,
+                exclude_ticker=context.identity.broker_ticker,
+            )
+        reduce_fraction = context.reduce_fraction
+        if proposal is not None and context.action is ThesisAction.REDUCE:
+            # Re-evaluating an existing trim: the envelope a sell must fit is
+            # the whole available position, not the default fraction -- the
+            # quantity on the row was already chosen and can only be smaller.
+            reduce_fraction = Decimal(1)
         decision = self.engine.evaluate(
             RiskInputs(
                 config=self.config,
@@ -245,6 +267,8 @@ class ProposalEvaluator:
                 account_state_missing_reason=facts.account_reason,
                 quote_missing_reason=facts.quote_reason,
                 calibration=calibration,
+                other_holding_weights=other_weights,
+                reduce_fraction=reduce_fraction,
             ),
             now=now,
         )

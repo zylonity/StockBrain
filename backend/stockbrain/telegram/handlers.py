@@ -41,6 +41,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from stockbrain.portfolio_reviews import PositionReviewService
+    from stockbrain.proposals.rebalance import RebalanceService
     from stockbrain.telegram.runtime import TelegramRuntime
 
 __all__ = ["ALLOWED_UPDATES", "TelegramHandlers", "to_markup"]
@@ -85,8 +86,10 @@ class TelegramHandlers:
         control: ControlStateService,
         runtime: TelegramRuntime | None = None,
         position_reviews: PositionReviewService | None = None,
+        rebalance: RebalanceService | None = None,
     ) -> None:
         self._settings = settings
+        self._rebalance = rebalance
         self._auth = authorizer
         self._service = service
         self._coordinator = coordinator
@@ -106,6 +109,7 @@ class TelegramHandlers:
             "events": self.events,
             "research": self.research,
             "review": self.review,
+            "rebalance": self.rebalance,
             "thesis": self.thesis,
             "pause": self.pause,
             "resume": self.resume,
@@ -286,6 +290,22 @@ class TelegramHandlers:
         target = args[0].strip()
         result = await self._position_reviews.request(None if target.lower() == "all" else target)
         await self._reply(update, messages.render_position_review(result))
+
+    async def rebalance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._authorise(update, "rebalance") is None:
+            return
+        args = [arg.strip().lower() for arg in (context.args or [])]
+        if args not in ([], ["confirm"]):
+            await self._reply(update, esc("Usage: /rebalance [confirm]"))
+            return
+        if self._rebalance is None:
+            await self._reply(update, esc("Rebalancing is unavailable."))
+            return
+        if args == ["confirm"]:
+            plan = await self._rebalance.execute()
+        else:
+            plan = await self._rebalance.plan()
+        await self._reply(update, messages.render_rebalance(plan, executed=bool(args)))
 
     async def thesis(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._authorise(update, "thesis") is None:

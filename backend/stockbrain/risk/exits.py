@@ -85,6 +85,9 @@ class ExitSignal:
     action: ThesisAction
     reason: str
     rule: RuleResult
+    fraction: Decimal | None = None
+    """For REDUCE: the share of the available position to sell (rebalancing).
+    ``None`` uses the configured default fraction."""
 
 
 @dataclass(frozen=True, slots=True)

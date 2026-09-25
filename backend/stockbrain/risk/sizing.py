@@ -70,6 +70,7 @@ def size_trade(
     max_notional: Decimal,
     size_factor: Decimal = Decimal(1),
     fx: FxSnapshot | None = None,
+    reduce_fraction: Decimal | None = None,
 ) -> SizingResult:
     """Produce the order parameters, or explain why there are none.
 
@@ -161,6 +162,7 @@ def size_trade(
             account_currency=account_currency,
             fx=snapshot,
             reasons=reasons,
+            reduce_fraction=reduce_fraction,
         )
     except ValueError as exc:  # pragma: no cover - the gates run first
         reasons.append(f"the conversion could not be performed: {exc}")
@@ -330,6 +332,7 @@ def _size_sell(
     account_currency: str | None,
     fx: FxSnapshot,
     reasons: list[str],
+    reduce_fraction: Decimal | None = None,
 ) -> SizingResult:
     """Reduce or close an owned long.
 
@@ -356,9 +359,10 @@ def _size_sell(
         quantity = _round_quantity(available, config, identity)
         reasons.append(f"SELL closes the whole available position of {available} share(s)")
     else:
-        quantity = _round_quantity(available * config.reduce_fraction, config, identity)
+        fraction = min(Decimal(1), reduce_fraction or config.reduce_fraction)
+        quantity = _round_quantity(available * fraction, config, identity)
         reasons.append(
-            f"REDUCE trims {config.reduce_fraction} of the {available} available share(s) -- "
+            f"REDUCE trims {fraction} of the {available} available share(s) -- "
             "a deterministic partial exit, not a liquidation"
         )
         if quantity <= ZERO and available >= Decimal(1) and not config.allow_fractional_quantity:
