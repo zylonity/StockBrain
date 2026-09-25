@@ -925,6 +925,11 @@ class Settings(BaseSettings):
     risk_min_calibration_size_factor: Decimal = Decimal("0.5")
     risk_reduce_fraction: Decimal = Decimal("0.5")
 
+    execution_auto_authorize_exits: bool = False
+    """Under the AUTOMATIC policy, also authorize exits (stops, trailing stops,
+    time exits, rotation sales) without a human. Off, every exit waits for a
+    manual approval and lapses at the proposal TTL if none comes."""
+
     portfolio_rotation_enabled: bool = False
     portfolio_rotation_min_candidate_confidence: Decimal = Decimal("0.85")
     portfolio_rotation_min_confidence_advantage: Decimal = Decimal("0.10")
