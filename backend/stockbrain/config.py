@@ -895,6 +895,15 @@ class Settings(BaseSettings):
     risk_max_aggregate_exposure_pct: Decimal = Decimal("0.60")
     risk_min_cash_reserve_pct: Decimal = Decimal("0.10")
     risk_min_trade_notional: Decimal = Decimal("20")
+    risk_sizing_mode: Literal["cap", "conviction"] = "cap"
+    """``cap``: size each buy as the smallest cap times the confidence factor.
+    ``conviction``: size each buy toward a target holding that scales with the
+    whole account and with research confidence -- see ``RiskConfig``."""
+    risk_target_positions: int = Field(default=8, ge=1, le=100)
+    risk_conviction_full_confidence: Decimal = Decimal("0.90")
+    risk_conviction_min_weight: Decimal = Decimal("0.75")
+    risk_conviction_max_weight: Decimal = Decimal("2.0")
+    risk_min_fill_fraction: Decimal = Decimal("0.5")
     risk_allow_fractional_quantity: bool = False
     risk_default_quantity_precision: int = 2
     """Decimal places a fractional quantity is rounded down to until the broker
@@ -1255,6 +1264,18 @@ class Settings(BaseSettings):
         ]
         if self.risk_reduce_fraction <= 0:
             problems.append("RISK_REDUCE_FRACTION must be greater than 0")
+        if not 0 < self.risk_conviction_min_weight <= self.risk_conviction_max_weight:
+            problems.append(
+                "RISK_CONVICTION_MIN_WEIGHT must be greater than 0 and not above "
+                "RISK_CONVICTION_MAX_WEIGHT"
+            )
+        if not self.risk_min_research_confidence < self.risk_conviction_full_confidence <= 1:
+            problems.append(
+                "RISK_CONVICTION_FULL_CONFIDENCE must be above RISK_MIN_RESEARCH_CONFIDENCE "
+                "and at most 1"
+            )
+        if not 0 <= self.risk_min_fill_fraction <= 1:
+            problems.append("RISK_MIN_FILL_FRACTION must be between 0 and 1")
         if self.portfolio_rotation_interval_seconds <= 0:
             problems.append("PORTFOLIO_ROTATION_INTERVAL_SECONDS must be greater than 0")
         if self.risk_max_spread_bps <= 0:

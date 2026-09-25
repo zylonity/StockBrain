@@ -35,7 +35,7 @@ from stockbrain.enums import (
     SpreadStatus,
     ThesisAction,
 )
-from stockbrain.risk.config import SpreadPolicy
+from stockbrain.risk.config import RiskConfig, SpreadPolicy
 from stockbrain.risk.models import ZERO, FxSnapshot, RiskInputs, RuleResult
 
 __all__ = [
@@ -806,23 +806,45 @@ def notional_caps(inputs: RiskInputs) -> list[NotionalCap]:
             reason=f"absolute per-trade ceiling of {config.max_notional_per_trade}",
             defines_intent=True,
         ),
-        NotionalCap(
-            rule_id="max_trade_pct_of_portfolio",
-            rule_version=1,
-            limit=_pct(total, config.max_trade_pct_of_portfolio),
-            observed=str(total),
-            threshold=str(config.max_trade_pct_of_portfolio),
-            reason=(
-                f"{config.max_trade_pct_of_portfolio} of the {total} {account.currency} "
-                "portfolio may be committed to one trade"
-            ),
-            defines_intent=True,
-        ),
     ]
 
     # Concentration: how much more of this name may be held in total.
     position = account.position(inputs.identity.broker_ticker)
     held_value = (position.market_value or ZERO) if position else ZERO
+
+    if config.sizing_mode == "conviction":
+        weight = conviction_weight(config, inputs.confidence)
+        target = total / Decimal(config.target_positions) * weight
+        caps.append(
+            NotionalCap(
+                rule_id="conviction_target",
+                rule_version=1,
+                limit=max(ZERO, target - held_value),
+                observed=str(held_value),
+                threshold=str(target),
+                reason=(
+                    f"confidence {inputs.confidence} weights the {total} {account.currency} "
+                    f"account's 1/{config.target_positions} share by {weight}: a target "
+                    f"holding of {target}, {held_value} already held"
+                ),
+                defines_intent=True,
+            )
+        )
+    else:
+        caps.append(
+            NotionalCap(
+                rule_id="max_trade_pct_of_portfolio",
+                rule_version=1,
+                limit=_pct(total, config.max_trade_pct_of_portfolio),
+                observed=str(total),
+                threshold=str(config.max_trade_pct_of_portfolio),
+                reason=(
+                    f"{config.max_trade_pct_of_portfolio} of the {total} {account.currency} "
+                    "portfolio may be committed to one trade"
+                ),
+                defines_intent=True,
+            )
+        )
     concentration_headroom = _pct(total, config.max_position_pct_of_portfolio) - held_value
     caps.append(
         NotionalCap(
@@ -974,6 +996,57 @@ def cap_rule_results(caps: Iterable[NotionalCap], intended: Decimal) -> list[Rul
     return results
 
 
+def conviction_weight(config: RiskConfig, confidence: Decimal) -> Decimal:
+    """How many equal shares of the account a holding at this confidence targets.
+
+    Linear from ``conviction_min_weight`` at the confidence floor to
+    ``conviction_max_weight`` at ``conviction_full_confidence``, clamped to
+    that band.  Below the floor nothing trades at all -- the gate blocks it.
+    """
+    floor = config.min_research_confidence
+    span = config.conviction_full_confidence - floor
+    progress = Decimal(1) if span <= ZERO else (confidence - floor) / span
+    progress = min(Decimal(1), max(ZERO, progress))
+    low, high = config.conviction_min_weight, config.conviction_max_weight
+    return low + (high - low) * progress
+
+
+def target_fill_rule(caps: list[NotionalCap], config: RiskConfig) -> RuleResult | None:
+    """Block a conviction buy the remaining capacity can fund only a scrap of.
+
+    ``None`` outside conviction sizing or when there is no target.  A block
+    here is a *capacity* block: portfolio rotation reads it as "a stronger
+    idea is waiting for room".
+    """
+    if config.sizing_mode != "conviction":
+        return None
+    target = next((cap.limit for cap in caps if cap.rule_id == "conviction_target"), None)
+    if target is None or target <= ZERO:
+        return None
+    available = min(cap.limit for cap in caps)
+    needed = target * config.min_fill_fraction
+    if available >= needed:
+        return RuleResult(
+            rule_id="target_fill",
+            rule_version=1,
+            outcome=RuleOutcome.PASS,
+            reason=f"{available} of the {target} target can be funded",
+            observed=str(available),
+            threshold=str(needed),
+        )
+    return RuleResult(
+        rule_id="target_fill",
+        rule_version=1,
+        outcome=RuleOutcome.BLOCK,
+        reason=(
+            f"only {available} of the {target} target can be funded, below the "
+            f"{config.min_fill_fraction} minimum fill; a scrap position is not placed"
+        ),
+        observed=str(available),
+        threshold=str(needed),
+    )
+
+
 def confidence_size_factor(inputs: RiskInputs) -> RuleResult | None:
     """Scale the size with research confidence, inside the hard caps.
 
@@ -984,7 +1057,9 @@ def confidence_size_factor(inputs: RiskInputs) -> RuleResult | None:
     lifts a block; it is a ranking feature, not a probability.
     """
     config = inputs.config
-    if not config.confidence_modulates_size:
+    if not config.confidence_modulates_size or config.sizing_mode == "conviction":
+        # Under conviction sizing confidence is already in the target; applying
+        # it again here would shrink exactly the trades it is meant to enlarge.
         return None
     floor = config.min_research_confidence
     factor_floor = config.min_confidence_size_factor

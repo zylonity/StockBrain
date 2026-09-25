@@ -39,6 +39,7 @@ from stockbrain.risk.rules import (
     confidence_size_factor,
     gate_results,
     notional_caps,
+    target_fill_rule,
 )
 from stockbrain.risk.sizing import size_trade
 
@@ -55,6 +56,10 @@ class RiskEngine:
         caps = notional_caps(inputs)
         intended = min((cap.limit for cap in caps if cap.defines_intent), default=ZERO)
         rules.extend(cap_rule_results(caps, intended))
+
+        fill_rule = target_fill_rule(caps, inputs.config)
+        if fill_rule is not None:
+            rules.append(fill_rule)
 
         confidence_rule = confidence_size_factor(inputs)
         if confidence_rule is not None:
