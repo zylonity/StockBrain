@@ -105,7 +105,8 @@ from stockbrain.jobs.registry import JobRegistry
 from stockbrain.jobs.runner import JobRunner
 from stockbrain.jobs.scheduler import ScheduledTask, Scheduler
 from stockbrain.llm.budget import BudgetGuard, BudgetStatus
-from stockbrain.llm.factory import build_llm_client, build_pricing_table
+from stockbrain.llm.factory import build_llm_client_with_fallback, build_pricing_table
+from stockbrain.llm.fallback import FallbackLlmClient, FallbackResearchTransport
 from stockbrain.llm.openai_compat import OpenAICompatibleClient
 from stockbrain.llm.telemetry import LlmTelemetry
 from stockbrain.logging import get_logger
@@ -176,7 +177,7 @@ class ServiceContainer:
     content_extractor: ContentExtractor | None = field(default=None, init=False)
     firecrawl_extractor: FirecrawlContentExtractor | None = field(default=None, init=False)
 
-    llm: OpenAICompatibleClient | None = field(default=None, init=False)
+    llm: OpenAICompatibleClient | FallbackLlmClient | None = field(default=None, init=False)
     classification: ClassificationService | None = field(default=None, init=False)
     budget: BudgetGuard | None = field(default=None, init=False)
 
@@ -196,7 +197,9 @@ class ServiceContainer:
     fx_provider: FxRateProvider | None = field(default=None, init=False)
     fx: FxService = field(init=False)
     research: ResearchService | None = field(default=None, init=False)
-    research_transport: ResearchTransport | None = field(default=None, init=False)
+    research_transport: ResearchTransport | FallbackResearchTransport | None = field(
+        default=None, init=False
+    )
     fred: FredMacroProvider | None = field(default=None, init=False)
 
     control: ControlStateService = field(init=False)
@@ -522,7 +525,7 @@ class ServiceContainer:
         self.resolution = ResolutionService(self.database, broker=Broker.TRADING212)
 
         if settings.classifier_enabled and settings.active_llm_api_key.get_secret_value():
-            self.llm = build_llm_client(settings)
+            self.llm = build_llm_client_with_fallback(settings)
             telemetry = LlmTelemetry(build_pricing_table(settings))
             self.budget = BudgetGuard(
                 self.database,
@@ -575,6 +578,23 @@ class ServiceContainer:
                     pricing=build_pricing_table(settings),
                     deep_reasoning_effort=settings.research_deep_reasoning_effort,
                 )
+                if settings.llm_fallback_enabled:
+                    self.research_transport = FallbackResearchTransport(
+                        self.research_transport,
+                        ResearchTransport(
+                            settings.llm_fallback_api_key,
+                            profile=settings.llm_fallback_profile,
+                            base_url=settings.active_llm_fallback_base_url,
+                            timeout=settings.active_llm_timeout_seconds,
+                            max_tokens=settings.research_max_output_tokens,
+                            pricing=build_pricing_table(settings),
+                            deep_reasoning_effort=settings.research_deep_reasoning_effort,
+                        ),
+                        fallback_provider=settings.llm_fallback_profile.name,
+                        primary_deep_model=settings.active_llm_deep_model,
+                        fallback_model=settings.llm_fallback_model,
+                        fallback_deep_model=settings.active_llm_fallback_deep_model,
+                    )
                 engine = TradingAgentsResearchEngine(
                     self.research_transport,
                     quick_model=settings.active_llm_quick_model,

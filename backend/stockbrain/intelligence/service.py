@@ -180,8 +180,8 @@ class ClassificationService:
             record = self._telemetry.from_result(
                 outcome.result,
                 purpose="CLASSIFY_EVENT",
-                provider="deepseek",
-                model=self._classifier.model,
+                provider=outcome.result.provider or self._settings.llm_provider,
+                model=(outcome.result.model if outcome.result.provider else self._classifier.model),
                 prompt_version=outcome.prompt_version,
                 thinking_enabled=False,
                 event_id=event_id,
@@ -294,7 +294,7 @@ class ClassificationService:
             record = self._telemetry.from_failure(
                 error,
                 purpose="CLASSIFY_EVENT",
-                provider="deepseek",
+                provider=self._settings.llm_provider,
                 model=self._classifier.model,
                 prompt_version=self._classifier.prompt_version,
                 thinking_enabled=False,
@@ -391,7 +391,7 @@ class ClassificationService:
                     self._telemetry.from_failure(
                         exc,
                         purpose="DEDUPE_EVENT",
-                        provider="deepseek",
+                        provider=self._settings.llm_provider,
                         model=self._classifier.model,
                         prompt_version=self._deduplicator.prompt_version,
                         thinking_enabled=False,
@@ -411,8 +411,12 @@ class ClassificationService:
                     self._telemetry.from_result(
                         outcome.result,
                         purpose="DEDUPE_EVENT",
-                        provider="deepseek",
-                        model=self._classifier.model,
+                        provider=outcome.result.provider or self._settings.llm_provider,
+                        model=(
+                            outcome.result.model
+                            if outcome.result.provider
+                            else self._classifier.model
+                        ),
                         prompt_version=outcome.prompt_version,
                         thinking_enabled=False,
                         event_id=event_id,
