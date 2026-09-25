@@ -25,8 +25,8 @@ from stockbrain.risk.rules import conviction_weight
 
 __all__ = ["HoldingBelief", "holding_weights", "load_holding_beliefs"]
 
-#: Latest-thesis actions that still argue for holding the position. HOLD is
-#: absent: a successor HOLD is an exit signal (see ``proposals.exits``).
+#: Latest-thesis actions that argue for *adding*. A HOLD keeps the position
+#: but earns only the minimum weight: it is not a reason to buy more.
 _HOLDING_ACTIONS = frozenset({ThesisAction.BUY})
 
 

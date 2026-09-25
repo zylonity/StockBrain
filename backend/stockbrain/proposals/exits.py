@@ -296,21 +296,26 @@ class ExitSweepService:
         return bool(count)
 
     async def _superseded(self, session: AsyncSession, thesis_id: uuid.UUID) -> bool:
-        """Whether research has published a successor to the opening thesis.
+        """Whether the latest research on this holding says to get out.
 
-        A reaffirming BUY is a refreshed reason to keep holding, not an exit
-        signal. Only a successor that no longer recommends adding exposure can
-        retire the opening thesis for exit purposes. Pending entry proposals
-        still use lifecycle's stricter "any successor invalidates" rule.
+        Only the *most recent* successor counts, and only a REDUCE or SELL
+        retires the opening thesis for exit purposes. A reaffirming BUY or a
+        HOLD is a refreshed reason to keep holding, and a stale adverse view a
+        newer review has since overturned is no longer the current opinion.
+        Pending entry proposals still use lifecycle's stricter "any successor
+        invalidates" rule.
         """
-        adverse = await session.scalar(
-            sa.select(sa.func.count())
-            .select_from(Thesis)
+        latest = await session.scalar(
+            sa.select(Thesis.action)
             .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
             .where(
-                Thesis.supersedes_thesis_id == thesis_id,
+                sa.or_(
+                    Thesis.supersedes_thesis_id == thesis_id,
+                    Thesis.original_thesis_id == thesis_id,
+                ),
                 ResearchRun.status == ResearchStatus.SUCCEEDED,
-                Thesis.action.in_((ThesisAction.HOLD, ThesisAction.REDUCE, ThesisAction.SELL)),
             )
+            .order_by(Thesis.created_at.desc())
+            .limit(1)
         )
-        return bool(adverse)
+        return latest in (ThesisAction.REDUCE, ThesisAction.SELL)

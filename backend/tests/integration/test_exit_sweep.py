@@ -933,3 +933,66 @@ async def test_rebalance_confirm_proposes_a_top_up_on_the_latest_thesis(
     assert buy is not None and buy.thesis_id == bought.thesis_id
     # Target 3000, 1800 held: the top-up is at most the 1200 gap.
     assert buy.estimated_notional <= Decimal("1200")
+
+
+@pytest.mark.parametrize(
+    "successor,exits",
+    [(ThesisAction.HOLD, False), (ThesisAction.BUY, False), (ThesisAction.SELL, True)],
+)
+async def test_only_adverse_latest_research_exits_a_holding(
+    clean_tables: Database, successor: ThesisAction, exits: bool
+) -> None:
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("100"),
+    )
+    async with database.transaction() as session:
+        session.add(
+            Thesis(
+                id=uuid.uuid4(),
+                research_run_id=ph.RUN_ID,
+                action=successor,
+                confidence=0.8,
+                time_horizon=TimeHorizon.DAYS,
+                supersedes_thesis_id=ph.THESIS_ID,
+            )
+        )
+    resolved = ph.settings()
+    config = risk_config_from_settings(resolved)
+    proposals = ph.service_with(database, resolved, config=config)
+    counts = await ExitSweepService(database, resolved, proposals=proposals, config=config).sweep()
+    assert (counts["proposed"] == 1) is exits
+
+
+async def test_a_newer_buy_overturns_an_older_sell_view(clean_tables: Database) -> None:
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    await _seed_position(
+        database,
+        broker_ticker="AAPL_US_EQ",
+        average_price=Decimal("100"),
+        current_price=Decimal("100"),
+    )
+    earlier = utcnow() - dt.timedelta(hours=2)
+    async with database.transaction() as session:
+        for action, created in ((ThesisAction.SELL, earlier), (ThesisAction.BUY, utcnow())):
+            session.add(
+                Thesis(
+                    id=uuid.uuid4(),
+                    research_run_id=ph.RUN_ID,
+                    action=action,
+                    confidence=0.8,
+                    time_horizon=TimeHorizon.DAYS,
+                    supersedes_thesis_id=ph.THESIS_ID,
+                    created_at=created,
+                )
+            )
+    resolved = ph.settings()
+    config = risk_config_from_settings(resolved)
+    proposals = ph.service_with(database, resolved, config=config)
+    counts = await ExitSweepService(database, resolved, proposals=proposals, config=config).sweep()
+    assert counts["proposed"] == 0

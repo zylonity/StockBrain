@@ -260,8 +260,9 @@ def evaluate_exit(
             ),
         )
 
-    # 4. thesis_superseded -- research has published a newer conclusion about
-    #    this company, so the reason recorded for holding is out of date.
+    # 4. thesis_superseded -- the latest research on this holding says REDUCE
+    #    or SELL, so the reason recorded for holding no longer stands. A newer
+    #    BUY or HOLD does not set this (see ``ExitSweepService._superseded``).
     if observation.thesis_superseded:
         return ExitSignal(
             rule_id="thesis_superseded",

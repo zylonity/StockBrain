@@ -136,8 +136,7 @@ class RebalanceService:
 
         if not belief.managed:
             return line("SKIP", "not opened by StockBrain")
-        if belief.action is not ThesisAction.BUY:
-            # HOLD included: a successor HOLD is an exit signal on this system.
+        if belief.action not in (ThesisAction.BUY, ThesisAction.HOLD):
             said = belief.action.value if belief.action else "nothing"
             return line("SKIP", f"latest research says {said}; the exit path handles it")
         if belief.thesis_at is None or now - belief.thesis_at > self.max_thesis_age:
@@ -145,6 +144,8 @@ class RebalanceService:
         delta = target - value
         if abs(delta) < self.min_move:
             return line("HOLD", "within the minimum move")
+        if delta > 0 and belief.action is ThesisAction.HOLD:
+            return line("HOLD", "latest research says HOLD: kept, not added to")
         return line("TOP_UP" if delta > 0 else "TRIM")
 
     async def execute(self, *, now: dt.datetime | None = None) -> RebalancePlan:
