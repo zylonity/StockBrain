@@ -27,7 +27,12 @@ from stockbrain.db.models.research import LlmCall, ResearchRun, Thesis
 from stockbrain.db.models.sources import Event, EventSourceLink, Source
 from stockbrain.db.session import Database
 from stockbrain.enums import EventStatus, JobType, ProviderStatus, ResearchStatus, ResolutionStatus
-from stockbrain.errors import InstrumentResolutionError, ProviderError
+from stockbrain.errors import (
+    InstrumentResolutionError,
+    ProviderError,
+    ProviderRateLimited,
+    ProviderUnavailable,
+)
 from stockbrain.intelligence.memory import MemoryService
 from stockbrain.intelligence.research import (
     PROMPT_VERSION,
@@ -49,6 +54,14 @@ from stockbrain.jobs.queue import JobQueue
 from stockbrain.llm.budget import BudgetGuard, WorkPriority
 from stockbrain.llm.telemetry import LlmCallRecord, LlmTelemetry
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
+
+#: A research job gets this many attempts. Only a capacity failure retries --
+#: every other failure marks the run FAILED on its first attempt, and a later
+#: attempt finds nothing PENDING to claim.
+RESEARCH_JOB_MAX_ATTEMPTS = 3
+
+#: Failures that mean the provider could not answer *now*, not that the run is bad.
+RETRYABLE_RESEARCH_ERRORS: tuple[type[Exception], ...] = (ProviderRateLimited, ProviderUnavailable)
 
 
 class ResearchService:
@@ -302,7 +315,7 @@ class ResearchService:
             payload={"run_id": str(run_id)},
             dedupe_key=f"research:{run_id}",
             priority=40,
-            max_attempts=1,
+            max_attempts=RESEARCH_JOB_MAX_ATTEMPTS,
         )
         return run_id
 
@@ -312,7 +325,19 @@ class ResearchService:
         if not decision.allowed:
             raise ResearchBudgetBlockedError(decision.reason or "LLM budget blocked")
 
-    async def run(self, run_id: uuid.UUID, *, job_id: uuid.UUID | None = None) -> None:
+    async def run(
+        self,
+        run_id: uuid.UUID,
+        *,
+        job_id: uuid.UUID | None = None,
+        final_attempt: bool = True,
+    ) -> None:
+        """Run one research packet.
+
+        A capacity failure (rate limit, provider unavailable) on a non-final
+        attempt returns the run to ``PENDING`` rather than ``FAILED``, so the
+        job's retry can claim it again instead of the candidate being dropped.
+        """
         # Budget-blocked pending work is swept later; nothing was spent or claimed.
         try:
             await self.check_budget()
@@ -469,6 +494,8 @@ class ResearchService:
                 if isinstance(exc, asyncio.CancelledError)
                 else ResearchStatus.TIMED_OUT
                 if isinstance(exc, TimeoutError)
+                else ResearchStatus.PENDING
+                if isinstance(exc, RETRYABLE_RESEARCH_ERRORS) and not final_attempt
                 else ResearchStatus.FAILED
             )
             async with self.database.transaction() as session:
@@ -477,7 +504,7 @@ class ResearchService:
                     .where(ResearchRun.id == run_id, ResearchRun.lease_token == lease)
                     .values(
                         status=status,
-                        completed_at=sa.func.now(),
+                        completed_at=None if status == ResearchStatus.PENDING else sa.func.now(),
                         error_class=type(exc).__name__,
                         error=f"Research stopped: {type(exc).__name__}",
                         lease_token=None,
@@ -612,7 +639,7 @@ class ResearchService:
                     JobType.RUN_RESEARCH,
                     payload={"run_id": str(run_id)},
                     dedupe_key=f"research:{run_id}",
-                    max_attempts=1,
+                    max_attempts=RESEARCH_JOB_MAX_ATTEMPTS,
                     priority=40,
                 )
 

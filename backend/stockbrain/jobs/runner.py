@@ -25,6 +25,8 @@ from stockbrain.observability.metrics import METRICS
 
 __all__ = ["JobRunner"]
 
+from stockbrain.errors import ProviderRateLimited
+
 log = get_logger(__name__)
 
 
@@ -118,7 +120,9 @@ class JobRunner:
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             async with self._database.transaction() as session:
-                retrying = await self._queue.fail(session, context.job_id, message)
+                retrying = await self._queue.fail(
+                    session, context.job_id, message, **_retry_backoff(exc)
+                )
             METRICS.inc(
                 "stockbrain_jobs_processed_total",
                 labels={"job_type": context.job_type, "outcome": "retry" if retrying else "failed"},
@@ -156,3 +160,15 @@ class JobRunner:
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("job_reaper_error", error=str(exc))
             await asyncio.sleep(30.0)
+
+
+def _retry_backoff(exc: BaseException) -> dict[str, float]:
+    """A rate limit needs minutes to clear, not the default seconds.
+
+    Retrying a 429 five seconds later mostly earns another 429; honouring the
+    provider's hint (or starting at a minute) lets the window actually reset.
+    """
+    if isinstance(exc, ProviderRateLimited):
+        hint = exc.retry_after_seconds or 0.0
+        return {"retry_base_seconds": max(60.0, hint), "retry_max_seconds": 900.0}
+    return {}
