@@ -612,7 +612,7 @@ async def test_a_superseded_thesis_exit_survives_the_precondition_sweep(
 async def test_an_exit_under_automatic_policy_is_still_notified(
     clean_tables: Database,
 ) -> None:
-    """An exit is never auto-authorized until a per-kind policy exists.
+    """An exit is not auto-authorized unless EXECUTION_AUTO_AUTHORIZE_EXITS opts in.
 
     ``generate_exit`` never runs the automatic-authorization tail, so under
     ``ExecutionPolicy.AUTOMATIC`` the proposal is created READY and never
@@ -648,6 +648,42 @@ async def test_an_exit_under_automatic_policy_is_still_notified(
         and job.payload["event"] == NotificationEvent.PROPOSAL_MANUAL.value
         for job in jobs
     )
+
+
+async def test_an_exit_is_auto_authorized_when_exits_are_opted_in(
+    clean_tables: Database,
+) -> None:
+    database = clean_tables
+    await _seed_executed_buy(database, broker_ticker="AAPL_US_EQ")
+    resolved = ph.settings(execution_policy="automatic", execution_auto_authorize_exits=True)
+    assert resolved.automatic_authorization_permitted, resolved.automation_blockers
+    service = ph.service_with(database, resolved)
+
+    result = await service.generate_exit(
+        "AAPL_US_EQ",
+        ExitSignal(
+            rule_id="hard_stop",
+            action=ThesisAction.SELL,
+            reason="the position is -9.00% against average cost",
+            rule=_rule("hard_stop"),
+        ),
+    )
+    assert result.created, result.reason
+    assert result.authorized
+
+    async with database.session() as session:
+        proposal = await session.get(TradeProposal, result.proposal_id)
+        jobs = list(
+            (
+                await session.execute(
+                    sa.select(Job).where(Job.job_type == JobType.SEND_NOTIFICATION.value)
+                )
+            ).scalars()
+        )
+    assert proposal is not None and proposal.approved_by == "system:automatic"
+    events = {job.payload["event"] for job in jobs}
+    assert NotificationEvent.PROPOSAL_AUTO_AUTHORIZED.value in events
+    assert NotificationEvent.PROPOSAL_MANUAL.value not in events
 
 
 async def test_the_sweep_isolates_one_positions_failure(

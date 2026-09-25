@@ -555,43 +555,7 @@ class ProposalService:
             reason="proposal generated",
         )
 
-        if (
-            self.execution_policy is ExecutionPolicy.AUTOMATIC
-            and self.settings.automatic_authorization_permitted
-        ):
-            try:
-                await self.authorize(
-                    proposal_id,
-                    source=AuthorizationSource.SYSTEM_AUTOMATIC,
-                    actor="system:automatic",
-                )
-                result.authorized = True
-                async with self.database.transaction() as session:
-                    await self._notify(
-                        session, proposal_id, NotificationEvent.PROPOSAL_AUTO_AUTHORIZED
-                    )
-            except (
-                RiskBlocked,
-                ProposalExpired,
-                ProposalInvalidated,
-                ProposalAlreadyConsumed,
-                AuthorizationNotPermitted,
-            ) as exc:
-                # Fail closed and visibly: the proposal stays unauthorized (or
-                # invalidated) and an operator can see exactly why.
-                log.warning(
-                    "automatic_authorization_refused",
-                    proposal_id=str(proposal_id),
-                    error_type=type(exc).__name__,
-                    reason=str(exc)[:300],
-                )
-                async with self.database.transaction() as session:
-                    await self._notify(
-                        session,
-                        proposal_id,
-                        NotificationEvent.AUTHORIZATION_REFUSED,
-                        detail=str(exc),
-                    )
+        await self._try_automatic_authorization(proposal_id, result)
         return result
 
     async def generate_exit(
@@ -772,9 +736,12 @@ class ProposalService:
                     },
                 )
             )
-            # An exit is never auto-authorized until a per-kind policy exists, so
-            # under either execution policy a human must see it.
-            await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_MANUAL)
+            # An exit is auto-authorized only when EXECUTION_AUTO_AUTHORIZE_EXITS
+            # says so; otherwise, under either execution policy, a human must
+            # see it.
+            auto_exit = self._auto_authorizes_exits
+            if not auto_exit:
+                await self._notify(session, proposal.id, NotificationEvent.PROPOSAL_MANUAL)
             proposal_id = proposal.id
             evaluation_id = evaluation.id
 
@@ -788,7 +755,7 @@ class ProposalService:
             side=proposal.side.value,
             quantity=str(proposal.proposed_quantity),
         )
-        return GenerationResult(
+        result = GenerationResult(
             thesis_id=thesis_id,
             created=True,
             proposal_id=proposal_id,
@@ -796,6 +763,59 @@ class ProposalService:
             outcome=decision.outcome,
             reason=signal.reason,
         )
+        if auto_exit:
+            await self._try_automatic_authorization(proposal_id, result)
+        return result
+
+    @property
+    def _auto_authorizes_exits(self) -> bool:
+        return (
+            self.settings.execution_auto_authorize_exits
+            and self.execution_policy is ExecutionPolicy.AUTOMATIC
+            and self.settings.automatic_authorization_permitted
+        )
+
+    async def _try_automatic_authorization(
+        self, proposal_id: uuid.UUID, result: GenerationResult
+    ) -> None:
+        """Authorize without a human when the AUTOMATIC policy permits it."""
+        if (
+            self.execution_policy is ExecutionPolicy.AUTOMATIC
+            and self.settings.automatic_authorization_permitted
+        ):
+            try:
+                await self.authorize(
+                    proposal_id,
+                    source=AuthorizationSource.SYSTEM_AUTOMATIC,
+                    actor="system:automatic",
+                )
+                result.authorized = True
+                async with self.database.transaction() as session:
+                    await self._notify(
+                        session, proposal_id, NotificationEvent.PROPOSAL_AUTO_AUTHORIZED
+                    )
+            except (
+                RiskBlocked,
+                ProposalExpired,
+                ProposalInvalidated,
+                ProposalAlreadyConsumed,
+                AuthorizationNotPermitted,
+            ) as exc:
+                # Fail closed and visibly: the proposal stays unauthorized (or
+                # invalidated) and an operator can see exactly why.
+                log.warning(
+                    "automatic_authorization_refused",
+                    proposal_id=str(proposal_id),
+                    error_type=type(exc).__name__,
+                    reason=str(exc)[:300],
+                )
+                async with self.database.transaction() as session:
+                    await self._notify(
+                        session,
+                        proposal_id,
+                        NotificationEvent.AUTHORIZATION_REFUSED,
+                        detail=str(exc),
+                    )
 
     # ------------------------------------------------------------------
     # Authorization
