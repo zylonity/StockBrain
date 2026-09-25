@@ -54,6 +54,8 @@ __all__ = [
     "register_ingestion_handlers",
 ]
 
+from stockbrain.intelligence.research_service import RETRYABLE_RESEARCH_ERRORS
+
 log = get_logger(__name__)
 
 
@@ -1135,15 +1137,26 @@ async def handle_run_research(context: HandlerContext) -> None:
         raise RuntimeError("research is not configured")
     run_id = uuid.UUID(str(context.payload["run_id"]))
 
-    await _announce_stage(context, run_id, PipelineEvent.RESEARCH_STARTED)
+    final_attempt = context.attempt >= context.max_attempts
+    if context.attempt == 1:
+        await _announce_stage(context, run_id, PipelineEvent.RESEARCH_STARTED)
     try:
-        await context.services.research.run(run_id, job_id=context.job_id)
-    finally:
-        # In a ``finally`` on purpose: a run that raised still finished, and its
-        # failure is exactly the outcome an operator wants to hear about. The
-        # notifier reads the run's recorded status, so the message says what
-        # happened rather than assuming success.
+        await context.services.research.run(
+            run_id, job_id=context.job_id, final_attempt=final_attempt
+        )
+    except RETRYABLE_RESEARCH_ERRORS:
+        # The run went back to PENDING and the job will retry; announcing
+        # completion now would report a run that has not finished.
+        if final_attempt:
+            await _announce_stage(context, run_id, PipelineEvent.RESEARCH_COMPLETED)
+        raise
+    except BaseException:
+        # A run that raised still finished, and its failure is exactly the
+        # outcome an operator wants to hear about. The notifier reads the run's
+        # recorded status, so the message says what happened.
         await _announce_stage(context, run_id, PipelineEvent.RESEARCH_COMPLETED)
+        raise
+    await _announce_stage(context, run_id, PipelineEvent.RESEARCH_COMPLETED)
 
     # The pipeline continues: a published thesis becomes a proposal candidate.
     # The dedupe key means a redelivered research job cannot queue a second

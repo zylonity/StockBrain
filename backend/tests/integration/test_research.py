@@ -28,7 +28,12 @@ from stockbrain.enums import (
     ResolutionStatus,
     SourceProvider,
 )
-from stockbrain.errors import InstrumentResolutionError, ProviderAuthError, ProviderUnavailable
+from stockbrain.errors import (
+    InstrumentResolutionError,
+    ProviderAuthError,
+    ProviderRateLimited,
+    ProviderUnavailable,
+)
 from stockbrain.intelligence.research import (
     PROMPT_VERSION,
     ROLES,
@@ -339,6 +344,40 @@ async def test_failed_paid_run_is_not_automatically_replayed(clean_tables: Datab
         row = await session.get(ResearchRun, run_id)
         assert row and row.error_class == "ProviderAuthError" and "SECRET" not in str(row.error)
         assert row.estimated_cost_usd == Decimal(".001")
+
+
+async def test_rate_limited_run_returns_to_pending_until_the_final_attempt(
+    clean_tables: Database,
+) -> None:
+    value = await seed(clean_tables)
+    engine = Engine()
+    engine.error = ProviderRateLimited("429")
+    research = service(clean_tables, engine)
+    run_id = await request(clean_tables, research, value)
+    with pytest.raises(ProviderRateLimited):
+        await research.run(run_id, final_attempt=False)
+    async with clean_tables.session() as session:
+        row = await session.get(ResearchRun, run_id)
+        assert row and row.status == ResearchStatus.PENDING
+    engine.error = None
+    await research.run(run_id)
+    assert engine.calls == 2
+    async with clean_tables.session() as session:
+        row = await session.get(ResearchRun, run_id)
+        assert row and row.status == ResearchStatus.SUCCEEDED
+
+
+async def test_rate_limited_final_attempt_fails_the_run(clean_tables: Database) -> None:
+    value = await seed(clean_tables)
+    engine = Engine()
+    engine.error = ProviderRateLimited("429")
+    research = service(clean_tables, engine)
+    run_id = await request(clean_tables, research, value)
+    with pytest.raises(ProviderRateLimited):
+        await research.run(run_id, final_attempt=True)
+    async with clean_tables.session() as session:
+        row = await session.get(ResearchRun, run_id)
+        assert row and row.status == ResearchStatus.FAILED
 
 
 async def test_stalled_run_terminal_recovery_does_not_repeat_spend(clean_tables: Database) -> None:
