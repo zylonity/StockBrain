@@ -348,6 +348,25 @@ class Settings(BaseSettings):
     which is correct whenever they are the same model."""
 
     # ------------------------------------------------------------------
+    # Fallback LLM backend (optional)
+    #
+    # Used only when the primary backend rate-limits us or is unavailable after
+    # its own retries. Every call it answers is recorded in ``llm_calls`` under
+    # the fallback's own provider name, so the audit trail stays unambiguous
+    # and its spend still counts against the same daily and monthly caps.
+    # Leaving LLM_FALLBACK_PROVIDER empty disables it.
+    # ------------------------------------------------------------------
+    llm_fallback_provider: str = ""
+    llm_fallback_api_key: SecretStr = SecretStr("")
+    llm_fallback_base_url: str = ""
+    llm_fallback_model: str = ""
+    llm_fallback_deep_model: str = ""
+    """Empty means "same as ``llm_fallback_model``"."""
+    llm_fallback_input_usd_per_mtok: Decimal | None = None
+    llm_fallback_cached_input_usd_per_mtok: Decimal | None = None
+    llm_fallback_output_usd_per_mtok: Decimal | None = None
+
+    # ------------------------------------------------------------------
     # Classification thresholds
     #
     # Model scores are ranking features, not calibrated probabilities. These
@@ -1441,6 +1460,22 @@ class Settings(BaseSettings):
             return self.deepseek_max_attempts
         return self.llm_max_attempts
 
+    @property
+    def llm_fallback_enabled(self) -> bool:
+        return bool(self.llm_fallback_provider.strip())
+
+    @property
+    def llm_fallback_profile(self) -> ProviderProfile:
+        return profile_for(self.llm_fallback_provider)
+
+    @property
+    def active_llm_fallback_base_url(self) -> str:
+        return self.llm_fallback_base_url or self.llm_fallback_profile.base_url
+
+    @property
+    def active_llm_fallback_deep_model(self) -> str:
+        return self.llm_fallback_deep_model or self.llm_fallback_model
+
     def llm_model_rates(self) -> dict[str, ModelRates]:
         """Configured rates, keyed by the model they apply to.
 
@@ -1481,6 +1516,24 @@ class Settings(BaseSettings):
                     else self.llm_deep_input_usd_per_mtok
                 ),
             )
+        fallback_input = self.llm_fallback_input_usd_per_mtok
+        if self.llm_fallback_enabled and fallback_input is not None:
+            fallback_rates = ModelRates(
+                cache_hit_input=(
+                    self.llm_fallback_cached_input_usd_per_mtok
+                    if self.llm_fallback_cached_input_usd_per_mtok is not None
+                    else fallback_input
+                ),
+                cache_miss_input=fallback_input,
+                output=(
+                    self.llm_fallback_output_usd_per_mtok
+                    if self.llm_fallback_output_usd_per_mtok is not None
+                    else fallback_input
+                ),
+            )
+            for model in {self.llm_fallback_model, self.active_llm_fallback_deep_model}:
+                if model:
+                    rates[model] = fallback_rates
         return rates
 
     @field_validator(
@@ -1490,6 +1543,9 @@ class Settings(BaseSettings):
         "llm_deep_input_usd_per_mtok",
         "llm_deep_cached_input_usd_per_mtok",
         "llm_deep_output_usd_per_mtok",
+        "llm_fallback_input_usd_per_mtok",
+        "llm_fallback_cached_input_usd_per_mtok",
+        "llm_fallback_output_usd_per_mtok",
         mode="before",
     )
     @classmethod
@@ -1554,6 +1610,36 @@ class Settings(BaseSettings):
                 "Without rates the model's spend is not counted against "
                 "LLM_DAILY_HARD_USD or LLM_MONTHLY_HARD_USD"
             )
+
+        if self.llm_fallback_enabled:
+            profile_for(self.llm_fallback_provider)  # raises on an unknown provider name
+            missing = [
+                name
+                for name, value in (
+                    ("LLM_FALLBACK_API_KEY", self.llm_fallback_api_key.get_secret_value()),
+                    ("LLM_FALLBACK_MODEL", self.llm_fallback_model),
+                    ("LLM_FALLBACK_BASE_URL", self.active_llm_fallback_base_url),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    f"LLM_FALLBACK_PROVIDER={self.llm_fallback_provider!r} also needs "
+                    + ", ".join(missing)
+                )
+            fallback_unpriced = sorted(
+                {
+                    model
+                    for model in (self.llm_fallback_model, self.active_llm_fallback_deep_model)
+                    if pricing.rates_for(model) is None
+                }
+            )
+            if fallback_unpriced:
+                raise ValueError(
+                    "no price is configured for fallback LLM model(s) "
+                    f"{', '.join(fallback_unpriced)}; set LLM_FALLBACK_INPUT_USD_PER_MTOK, "
+                    "LLM_FALLBACK_CACHED_INPUT_USD_PER_MTOK and LLM_FALLBACK_OUTPUT_USD_PER_MTOK"
+                )
 
         return self
 

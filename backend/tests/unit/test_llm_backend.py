@@ -6,7 +6,8 @@ endpoint" safe rather than merely possible:
 1. one provider's dialect never appears in another provider's request
 2. a provider whose spend cannot be priced is refused at startup, because the
    budget guard sums estimates and an unpriced model estimates ``None``
-3. selecting a provider selects exactly that provider, with no fallback
+3. selecting a provider selects exactly that provider; the optional fallback
+   (``test_llm_fallback.py``) is only ever explicit configuration
 
 The DeepSeek regression suite in ``test_deepseek_client.py`` is unchanged and
 still covers the DeepSeek dialect specifically.

@@ -110,6 +110,11 @@ class CompletionResult:
 
     raw_response_excerpt: str | None = None
 
+    provider: str | None = None
+    """Set only when a fallback backend answered, naming it for telemetry.
+
+    ``None`` means the configured primary provider answered."""
+
 
 @runtime_checkable
 class LlmProvider(Protocol):
