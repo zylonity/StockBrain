@@ -45,8 +45,8 @@ class _Fake:
 
 def _client(primary: _Fake, fallback: _Fake) -> FallbackLlmClient:
     return FallbackLlmClient(
-        primary,  # type: ignore[arg-type]
-        fallback,  # type: ignore[arg-type]
+        primary,
+        fallback,
         fallback_provider="openai",
         primary_deep_model="p-deep",
         fallback_model="f-quick",

@@ -32,6 +32,7 @@ _CAPACITY_RULES = {
     "active_proposal_exposure",
     "min_cash_reserve",
     "max_active_proposals",
+    "target_fill",
 }
 
 

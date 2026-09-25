@@ -102,6 +102,28 @@ class RiskConfig:
     max_aggregate_exposure_pct: Decimal = Decimal("0.60")
     min_cash_reserve_pct: Decimal = Decimal("0.10")
     min_trade_notional: Decimal = Decimal("20")
+
+    sizing_mode: str = "cap"
+    """``cap`` (the original): a buy is the smallest cap, times the confidence
+    factor.  ``conviction``: a buy tops the holding up to a *target value* that
+    moves with the whole account and with conviction:
+
+        target = total_value / target_positions * weight(confidence)
+
+    where ``weight`` rises linearly from ``conviction_min_weight`` at the
+    confidence floor to ``conviction_max_weight`` at
+    ``conviction_full_confidence``.  The target replaces the per-trade
+    percentage cap and the confidence reduction (conviction is already in it);
+    every other cap still applies.  A buy the remaining capacity cannot fund to
+    at least ``min_fill_fraction`` of its target is blocked as a capacity block
+    rather than placed as a scrap -- which is what lets portfolio rotation sell
+    a weaker holding to make room for it."""
+    target_positions: int = 8
+    conviction_full_confidence: Decimal = Decimal("0.90")
+    conviction_min_weight: Decimal = Decimal("0.75")
+    conviction_max_weight: Decimal = Decimal("2.0")
+    min_fill_fraction: Decimal = Decimal("0.5")
+
     allow_fractional_quantity: bool = False
     """Trading 212 supports fractional shares but documents **no** minimum
     quantity and no step, so nothing here may invent one.  Whole shares rounded
@@ -258,6 +280,12 @@ def risk_config_from_settings(settings: Settings) -> RiskConfig:
         max_aggregate_exposure_pct=settings.risk_max_aggregate_exposure_pct,
         min_cash_reserve_pct=settings.risk_min_cash_reserve_pct,
         min_trade_notional=settings.risk_min_trade_notional,
+        sizing_mode=settings.risk_sizing_mode,
+        target_positions=settings.risk_target_positions,
+        conviction_full_confidence=settings.risk_conviction_full_confidence,
+        conviction_min_weight=settings.risk_conviction_min_weight,
+        conviction_max_weight=settings.risk_conviction_max_weight,
+        min_fill_fraction=settings.risk_min_fill_fraction,
         allow_fractional_quantity=settings.risk_allow_fractional_quantity,
         default_quantity_precision=settings.risk_default_quantity_precision,
         max_active_proposals=settings.risk_max_active_proposals,
