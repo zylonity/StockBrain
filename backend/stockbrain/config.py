@@ -915,6 +915,7 @@ class Settings(BaseSettings):
     risk_max_active_proposal_exposure_pct: Decimal = Decimal("0.10")
     risk_proposal_ttl_minutes: int = 30
     risk_max_reference_price_drift_pct: Decimal = Decimal("0.01")
+    risk_max_exit_price_drift_pct: Decimal = Decimal("0.05")
 
     risk_min_research_confidence: Decimal = Decimal("0.70")
     risk_confidence_modulates_size: bool = True
@@ -1246,6 +1247,7 @@ class Settings(BaseSettings):
             "RISK_MIN_CASH_RESERVE_PCT": self.risk_min_cash_reserve_pct,
             "RISK_MAX_ACTIVE_PROPOSAL_EXPOSURE_PCT": self.risk_max_active_proposal_exposure_pct,
             "RISK_MAX_REFERENCE_PRICE_DRIFT_PCT": self.risk_max_reference_price_drift_pct,
+            "RISK_MAX_EXIT_PRICE_DRIFT_PCT": self.risk_max_exit_price_drift_pct,
             "RISK_MIN_RESEARCH_CONFIDENCE": self.risk_min_research_confidence,
             "RISK_MIN_CONFIDENCE_SIZE_FACTOR": self.risk_min_confidence_size_factor,
             "RISK_WIDE_SPREAD_SIZE_FACTOR": self.risk_wide_spread_size_factor,

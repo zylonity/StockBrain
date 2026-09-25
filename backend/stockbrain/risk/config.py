@@ -141,6 +141,9 @@ class RiskConfig:
     max_active_proposal_exposure_pct: Decimal = Decimal("0.10")
     proposal_ttl_minutes: int = 30
     max_reference_price_drift_pct: Decimal = Decimal("0.01")
+    max_exit_price_drift_pct: Decimal = Decimal("0.05")
+    """The same limit for a SELL.  Wider because an exit's job is to get out:
+    cancelling it over a few percent of movement leaves the risk on."""
     """How far the market may move from the reference price before the sizing
     stops describing the trade the proposal says it is."""
 
@@ -292,6 +295,7 @@ def risk_config_from_settings(settings: Settings) -> RiskConfig:
         max_active_proposal_exposure_pct=settings.risk_max_active_proposal_exposure_pct,
         proposal_ttl_minutes=settings.risk_proposal_ttl_minutes,
         max_reference_price_drift_pct=settings.risk_max_reference_price_drift_pct,
+        max_exit_price_drift_pct=settings.risk_max_exit_price_drift_pct,
         min_research_confidence=settings.risk_min_research_confidence,
         confidence_modulates_size=settings.risk_confidence_modulates_size,
         min_confidence_size_factor=settings.risk_min_confidence_size_factor,
