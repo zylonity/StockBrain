@@ -240,6 +240,31 @@ class Settings(BaseSettings):
     debate: one story fanned out to 45 runs, another to 42.  0 disables the cap.
     """
 
+    research_company_cooldown_hours: float = Field(default=6.0, ge=0.0)
+    """No new research on a company within this many hours of its last run.
+
+    Measured over a week, one company not held was researched 51 times -- one
+    full debate per headline that mentioned it -- and the verdicts flipped
+    between BUY, REDUCE and HOLD without ever clearing the confidence floor.
+    Stories skipped during the cooldown are picked up by the backlog sweep once
+    it lapses, so at most one run per company per window reads them. 0 disables.
+    """
+
+    research_cooldown_bypass_importance: float = Field(default=0.85, ge=0.0, le=1.0)
+    """An event at or above this importance is researched even inside the cooldown."""
+
+    research_skip_event_types: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["MACRO", "MARKET_ROUNDUP", "MARKET_SUMMARY"]
+    )
+    """Event types never researched per company.
+
+    Market-wide stories name a company in passing; they are context for a
+    thesis, not a reason to write one. Comma-separated in the environment.
+    """
+
+    research_max_event_age_hours: float = Field(default=24.0, gt=0.0)
+    """The backlog sweep ignores events older than this; stale news is not researched."""
+
     research_evidence_chars: int = Field(default=12000, ge=500, le=20000)
     """How much of each evidence document reaches the researcher.
 
@@ -1083,6 +1108,7 @@ class Settings(BaseSettings):
         "cors_allow_origins",
         "risk_allowed_instrument_types",
         "risk_allowed_sessions",
+        "research_skip_event_types",
         "brave_result_filter",
         "globenewswire_countries",
         mode="before",
