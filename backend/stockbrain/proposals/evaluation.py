@@ -423,10 +423,21 @@ class ProposalEvaluator:
         return rules
 
     def _price_drift(self, proposal: TradeProposal, quote: QuoteSnapshot | None) -> RuleResult:
+        # An exit is worth taking at a slightly worse price; a buy is not.
+        # Holding a SELL to the buy tolerance cancelled 39 exits of one volatile
+        # position in a week while the loss it was closing kept growing.
+        limit = (
+            max(
+                self.config.max_reference_price_drift_pct,
+                self.config.max_exit_price_drift_pct,
+            )
+            if proposal.side is OrderSide.SELL
+            else self.config.max_reference_price_drift_pct
+        )
         return reference_price_drift(
             proposal.reference_price,
             quote.mid if quote else None,
-            max_drift_pct=self.config.max_reference_price_drift_pct,
+            max_drift_pct=limit,
         )
 
     def _fx_drift(self, proposal: TradeProposal, fx: FxSnapshot | None) -> RuleResult:
