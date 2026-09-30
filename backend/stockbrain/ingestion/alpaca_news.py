@@ -180,6 +180,8 @@ class AlpacaNewsClient:
             rate_limiter=TokenBucket(rate_per_second=1.5, burst=5),
         )
         self.last_message_at: dt.datetime | None = None
+        self.last_backfill_requests = 0
+        self.last_backfill_truncated = False
 
     @staticmethod
     def _auth_headers(settings: Settings) -> dict[str, str]:
@@ -202,6 +204,7 @@ class AlpacaNewsClient:
         *,
         limit: int | None = None,
         symbols: Sequence[str] | None = None,
+        max_pages: int | None = None,
     ) -> list[RawSourceDocument]:
         """Fetch news in a window, following pagination.
 
@@ -211,8 +214,13 @@ class AlpacaNewsClient:
         collected: list[RawSourceDocument] = []
         page_token: str | None = None
         budget = limit if limit is not None else 500
+        self.last_backfill_requests = 0
+        self.last_backfill_truncated = False
 
         while len(collected) < budget:
+            if max_pages is not None and self.last_backfill_requests >= max_pages:
+                self.last_backfill_truncated = True
+                break
             params: dict[str, Any] = {
                 "start": start.astimezone(dt.UTC).isoformat().replace("+00:00", "Z"),
                 "end": end.astimezone(dt.UTC).isoformat().replace("+00:00", "Z"),
@@ -227,6 +235,7 @@ class AlpacaNewsClient:
                 params["page_token"] = page_token
 
             payload = await self._http.get_json(ALPACA_NEWS_REST_PATH, params=params)
+            self.last_backfill_requests += 1
             if not isinstance(payload, dict):
                 raise ProviderResponseError("alpaca: news response was not a JSON object")
 

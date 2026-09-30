@@ -220,6 +220,33 @@ async def test_bars_parse_and_record_the_feed_used() -> None:
     assert bars[0].feed == "iex"
 
 
+async def test_bars_respect_an_http_page_cap_with_sparse_pages() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={**BARS_BODY, "next_page_token": f"page-{calls}"},
+        )
+
+    client = _client(httpx.MockTransport(handler))
+    bars = await client.bars(
+        "AAPL",
+        BarTimeframe.MIN_1,
+        dt.datetime(2026, 9, 4, 13, tzinfo=dt.UTC),
+        dt.datetime(2026, 9, 4, 15, tzinfo=dt.UTC),
+        limit=1000,
+        max_pages=2,
+    )
+    await client.aclose()
+    assert calls == 2
+    assert len(bars) == 2
+    assert client.last_bars_requests == 2
+    assert client.last_bars_truncated is True
+
+
 async def test_a_malformed_quote_is_rejected_not_coerced() -> None:
     client = _client(
         httpx.MockTransport(lambda _: httpx.Response(200, json={"symbol": "AAPL", "quote": None}))

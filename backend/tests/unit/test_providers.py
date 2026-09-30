@@ -8,6 +8,7 @@ encodes the documented behaviour and says so.
 from __future__ import annotations
 
 import datetime as dt
+from typing import Any, cast
 
 import pytest
 
@@ -106,6 +107,27 @@ def test_alpaca_stream_errors_are_classified(code: int, expected: type[Exception
     """Credential and entitlement failures must not be retried forever."""
     with pytest.raises(expected):
         AlpacaNewsClient._raise_for_stream_error({"T": "error", "code": code, "msg": "x"})
+
+
+async def test_alpaca_news_backfill_caps_actual_sparse_pages() -> None:
+    class SparsePages:
+        calls = 0
+
+        async def get_json(self, _path: str, *, params: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "news": [{**ALPACA_ARTICLE, "id": self.calls}],
+                "next_page_token": f"next-{self.calls}",
+            }
+
+    http = SparsePages()
+    client = AlpacaNewsClient(Settings(app_env="test"), http=cast(Any, http))
+    start = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    documents = await client.backfill(start, start + dt.timedelta(days=1), limit=50, max_pages=2)
+    assert len(documents) == 2
+    assert http.calls == 2
+    assert client.last_backfill_requests == 2
+    assert client.last_backfill_truncated is True
 
 
 # ---------------------------------------------------------------------------

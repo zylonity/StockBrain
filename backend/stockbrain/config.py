@@ -966,6 +966,8 @@ class Settings(BaseSettings):
     """Whether research packets carry the memory section (standing thesis,
     position, calibration).  This is the behavioural change; off until the
     operator turns it on."""
+    news_outcome_packet_enabled: bool = False
+    """Attach cached descriptive news outcomes to research only after operator opt-in."""
     memory_grade_interval_seconds: float = 21600.0
     memory_benchmark_symbol: str = "SPY"
     memory_standing_thesis_max_age_days: int = 14

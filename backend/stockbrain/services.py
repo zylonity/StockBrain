@@ -79,6 +79,7 @@ from stockbrain.ingestion.web_search import WebDiscoveryProvider
 from stockbrain.instruments.service import ResolutionService
 from stockbrain.intelligence.classifier import EventClassifier
 from stockbrain.intelligence.memory import MemoryService
+from stockbrain.intelligence.news_outcome_research import NewsOutcomeResearchProvider
 from stockbrain.intelligence.research_data import (
     AlpacaResearchProvider,
     FredMacroProvider,
@@ -644,6 +645,9 @@ class ServiceContainer:
                         )
                     )
                     if settings.polymarket_enabled
+                    else None,
+                    outcomes=NewsOutcomeResearchProvider(self.database)
+                    if settings.news_outcome_packet_enabled
                     else None,
                     min_impact_materiality=settings.research_min_impact_materiality,
                     max_impacts_per_event=settings.research_max_impacts_per_event,

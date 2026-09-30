@@ -286,8 +286,13 @@ class AlpacaMarketDataClient:
         end: dt.datetime,
         *,
         limit: int | None = None,
+        max_pages: int | None = None,
     ) -> Sequence[Bar]:
         """Historical aggregates, oldest first, following pagination."""
+        if max_pages is not None and max_pages < 1:
+            raise ValueError("max_pages must be positive")
+        self.last_bars_requests = 0
+        self.last_bars_truncated = False
         ticker = symbol.strip().upper()
         feed = self.historical_feed()
         collected: list[Bar] = []
@@ -295,6 +300,9 @@ class AlpacaMarketDataClient:
         budget = limit if limit is not None else 1000
 
         while len(collected) < budget:
+            if max_pages is not None and self.last_bars_requests >= max_pages:
+                self.last_bars_truncated = True
+                break
             params: dict[str, Any] = {
                 "timeframe": timeframe.value,
                 "start": _iso(start),
@@ -308,6 +316,7 @@ class AlpacaMarketDataClient:
                 params["page_token"] = page_token
 
             payload = await self._http.get_json(f"/v2/stocks/{ticker}/bars", params=params)
+            self.last_bars_requests += 1
             body = self._expect_object(payload, "bars")
             rows = body.get("bars")
             if rows is None:

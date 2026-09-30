@@ -14,6 +14,14 @@ from stockbrain.db.models.companies import (
     EventCompanyImpact,
 )
 from stockbrain.db.models.memory import ThesisOutcome, ThesisOutcomeGrade
+from stockbrain.db.models.news_history import (
+    DATASET_CANDLES,
+    DATASET_NEWS,
+    NewsHistoryArticle,
+    NewsHistoryBackfillRun,
+    NewsHistoryCandle,
+    NewsHistoryCoverage,
+)
 from stockbrain.db.models.portfolio import BrokerOrder, PortfolioSnapshot, Position
 from stockbrain.db.models.proposals import (
     ACTIVE_PROPOSAL_STATUSES,
@@ -38,6 +46,8 @@ from stockbrain.db.models.system import (
 
 __all__ = [
     "ACTIVE_PROPOSAL_STATUSES",
+    "DATASET_CANDLES",
+    "DATASET_NEWS",
     "AppSetting",
     "ApprovalAction",
     "AuditLog",
@@ -56,6 +66,10 @@ __all__ = [
     "ExecutionAttempt",
     "Job",
     "LlmCall",
+    "NewsHistoryArticle",
+    "NewsHistoryBackfillRun",
+    "NewsHistoryCandle",
+    "NewsHistoryCoverage",
     "Notification",
     "PortfolioSnapshot",
     "Position",

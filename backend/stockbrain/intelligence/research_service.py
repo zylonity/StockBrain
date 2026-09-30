@@ -88,6 +88,7 @@ class ResearchService:
         expectations: SupplementalResearchProvider | None = None,
         targets: SupplementalResearchProvider | None = None,
         macro_markets: MacroDataProvider | None = None,
+        outcomes: SupplementalResearchProvider | None = None,
         memory: MemoryService | None = None,
         memory_packet_enabled: bool = False,
     ) -> None:
@@ -113,6 +114,7 @@ class ResearchService:
         self.expectations = expectations
         self.targets = targets
         self.macro_markets = macro_markets
+        self.outcomes = outcomes
         self.memory = memory
         self.memory_packet_enabled = memory_packet_enabled
         self.queue = JobQueue()
@@ -133,6 +135,7 @@ class ResearchService:
                 "finnhub" if expectations else "no_expectations_provider",
                 "yfinance" if targets else "no_targets_provider",
                 "polymarket" if macro_markets else "no_macro_markets_provider",
+                "news_outcomes" if outcomes else "no_news_outcomes_provider",
             ],
             "tools": ["read_research_context"],
             "debate_rounds": getattr(engine, "debate_rounds", 1),
@@ -561,6 +564,7 @@ class ResearchService:
             ("finnhub", self.expectations, lambda: self.expectations.context(packet)),  # type: ignore[union-attr]
             ("yfinance", self.targets, lambda: self.targets.context(packet)),  # type: ignore[union-attr]
             ("polymarket", self.macro_markets, lambda: self.macro_markets.context(packet.as_of)),  # type: ignore[union-attr]
+            ("news_outcomes", self.outcomes, lambda: self.outcomes.context(packet)),  # type: ignore[union-attr]
         )
         for name, provider, fetch in sources:
             if provider is None:
