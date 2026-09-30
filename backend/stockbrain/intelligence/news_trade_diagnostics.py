@@ -354,10 +354,15 @@ async def build_news_trade_diagnostics(
         if delay < dt.timedelta(0):  # unreachable given the guard; kept explicit
             missing["negative_delay"] += 1
             continue
-        sample.with_delay += 1
         delay_basis_counts[f.fill_source] += 1
-        f.delay_bucket = _delay_bucket(delay)
-        delay_counts[f.delay_bucket] += 1
+        if f.fill_source == "broker_raw_fill":
+            sample.with_delay += 1
+            f.delay_bucket = _delay_bucket(delay)
+            delay_counts[f.delay_bucket] += 1
+        else:
+            # Submission is an observable event, but the execution instant may
+            # be later. Never put this proxy in an actual-fill delay cohort.
+            missing["actual_fill_delay_unknown_submission_proxy"] += 1
 
     if cached_bars is None:
         instrument_ids = {
@@ -613,7 +618,7 @@ def _raw_fill_timestamp(raw: object) -> dt.datetime | None:
         return None
     for key in _RAW_FILL_TIMESTAMP_KEYS:
         parsed = _parse_timestamp(raw.get(key))
-        if parsed is not None:
+        if parsed is not None and parsed.tzinfo is not None and parsed.utcoffset() is not None:
             return parsed
     return None
 

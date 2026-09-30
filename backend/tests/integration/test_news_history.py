@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 
-from stockbrain.db.models.companies import Company
+from stockbrain.db.models.companies import Company, EventCompanyImpact
 from stockbrain.db.models.news_history import (
     DATASET_CANDLES,
     DATASET_NEWS,
@@ -26,9 +26,12 @@ from stockbrain.db.models.news_history import (
     NewsHistoryCandle,
     NewsHistoryCoverage,
 )
+from stockbrain.db.models.portfolio import BrokerOrder
+from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.models.sources import Event, EventSourceLink, Source
+from stockbrain.db.models.system import Job, Notification
 from stockbrain.db.session import Database
-from stockbrain.enums import BarTimeframe, SourceProvider
+from stockbrain.enums import BarTimeframe, EventStatus, SourceProvider
 from stockbrain.ingestion.base import RawSourceDocument
 from stockbrain.intelligence.news_history import (
     GLOBAL_SCOPE,
@@ -39,7 +42,9 @@ from stockbrain.intelligence.news_history import (
     CandleInput,
     NewsHistoryCache,
 )
+from stockbrain.jobs.queue import JobQueue
 from stockbrain.market_data.base import Bar
+from stockbrain.services import ServiceContainer
 
 pytestmark = pytest.mark.integration
 
@@ -182,10 +187,18 @@ async def test_recording_the_same_article_twice_writes_one_row(clean_tables: Dat
     assert second.written == 0
     assert second.duplicates == 1
     assert await _count(clean_tables, NewsHistoryArticle) == 1
-    # The canonical graph is written once too, not once per attempt.
+    # Only an inert grouping event is written; no live source or link exists.
     assert await _count(clean_tables, Event) == 1
-    assert await _count(clean_tables, Source) == 1
-    assert await _count(clean_tables, EventSourceLink) == 1
+    assert await _count(clean_tables, Source) == 0
+    assert await _count(clean_tables, EventSourceLink) == 0
+    # Invoke the same sweep used by the running service. Only its database and
+    # queue are needed; constructing external providers would obscure isolation.
+    sweep = object.__new__(ServiceContainer)
+    sweep.database = clean_tables
+    sweep.queue = JobQueue()
+    await sweep._enqueue_pending_classifications()
+    for model in (Job, EventCompanyImpact, TradeProposal, Notification, BrokerOrder):
+        assert await _count(clean_tables, model) == 0
 
 
 async def test_candles_are_idempotent_and_as_of_filtered(clean_tables: Database) -> None:
@@ -302,7 +315,7 @@ async def test_syndicated_articles_group_onto_one_event(clean_tables: Database) 
     assert group.event_id is not None
     assert group.duplicate_count == 1
     assert await _count(clean_tables, Event) == 1
-    assert await _count(clean_tables, EventSourceLink) == 2
+    assert await _count(clean_tables, EventSourceLink) == 0
 
 
 async def test_symbol_filter_groups_only_matching_articles(clean_tables: Database) -> None:
@@ -450,6 +463,63 @@ async def test_backfill_news_clamps_window_and_records_partial_coverage(
     assert run is not None
     assert run.status == RUN_STATUS_PARTIAL
     assert run.bounded is True
+
+
+async def test_public_backfill_is_inert_and_resolves_unambiguous_company(
+    clean_tables: Database,
+) -> None:
+    """A real backfill call must never seed the live classification sweep."""
+    company_id = await _create_company(clean_tables)
+    publication = NOW - dt.timedelta(days=2)
+    cache = NewsHistoryCache(clean_tables)
+    client = _FakeNewsClient(
+        [
+            RawSourceDocument(
+                provider=SourceProvider.ALPACA,
+                provider_item_id="historical-1",
+                headline="Apple quarterly results",
+                symbols=["AAPL"],
+                published_at=publication,
+            ),
+            RawSourceDocument(
+                provider=SourceProvider.ALPACA,
+                provider_item_id="historical-2",
+                headline="Apple quarterly results",
+                symbols=["AAPL"],
+                published_at=publication + dt.timedelta(minutes=1),
+            ),
+        ]
+    )
+
+    await cache.backfill_news(
+        start=publication - dt.timedelta(hours=1),
+        end=publication + dt.timedelta(hours=1),
+        limits=BackfillLimits(max_days=1, max_articles=10, max_requests=2),
+        client=client,
+        now=NOW,
+    )
+
+    result = await cache.query_articles(as_of=NOW, company_id=company_id)
+    assert result.event_count == 1
+    assert result.article_count == 2
+    assert all(article.ingested_at == NOW for article in result.articles)
+    assert all(
+        article.published_at is not None and article.published_at < article.ingested_at
+        for article in result.articles
+    )
+    assert all(article.source_id is None for article in result.articles)
+    async with clean_tables.session() as session:
+        events = (await session.execute(sa.select(Event))).scalars().all()
+        live_candidates = (
+            (await session.execute(sa.select(Event.id).where(Event.status == EventStatus.NEW)))
+            .scalars()
+            .all()
+        )
+    assert len(events) == 1
+    assert events[0].status is EventStatus.ARCHIVED
+    assert not live_candidates
+    assert await _count(clean_tables, Source) == 0
+    assert await _count(clean_tables, EventSourceLink) == 0
 
 
 async def test_backfill_news_stops_at_the_article_cap(clean_tables: Database) -> None:
@@ -642,3 +712,51 @@ async def test_a_read_never_starts_a_backfill(clean_tables: Database) -> None:
 
     assert result.article_count == 1
     assert await _count(clean_tables, NewsHistoryBackfillRun) == runs_before == 1
+
+
+class _DenseBars:
+    """A consolidated-feed day: 1,000 one-minute bars per requested chunk."""
+
+    name = "dense_fixture"
+    last_bars_requests = 1
+    last_bars_truncated = False
+
+    async def bars(
+        self,
+        symbol: str,
+        timeframe: BarTimeframe,
+        start: dt.datetime,
+        end: dt.datetime,
+        *,
+        limit: int | None = None,
+        max_pages: int | None = None,
+    ) -> list[Bar]:
+        price = Decimal("100")
+        return [
+            Bar(
+                symbol=symbol,
+                timestamp=start + dt.timedelta(minutes=minute),
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=1,
+                feed="sip",
+            )
+            for minute in range(1000)
+        ]
+
+
+async def test_a_dense_week_of_candles_is_written_in_batches(clean_tables: Database) -> None:
+    """Three dense days exceed PostgreSQL's per-statement bind-parameter limit."""
+    start = NOW - dt.timedelta(days=5)
+    report = await NewsHistoryCache(clean_tables).backfill_candles(
+        symbol="AAPL",
+        start=start,
+        end=start + dt.timedelta(days=3),
+        limits=BackfillLimits(max_days=7, max_bar_pages=5, max_requests=5),
+        provider=_DenseBars(),
+        now=NOW,
+    )
+    assert report.status == "SUCCEEDED"
+    assert await _count(clean_tables, NewsHistoryCandle) == 3000

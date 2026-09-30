@@ -25,6 +25,7 @@ from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument, Company, EventCompanyImpact
 from stockbrain.db.models.research import LlmCall, ResearchRun, Thesis
 from stockbrain.db.models.sources import Event, EventSourceLink, Source
+from stockbrain.db.models.system import Job
 from stockbrain.db.session import Database
 from stockbrain.enums import EventStatus, JobType, ProviderStatus, ResearchStatus, ResolutionStatus
 from stockbrain.errors import (
@@ -53,6 +54,7 @@ from stockbrain.intelligence.research import (
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.llm.budget import BudgetGuard, WorkPriority
 from stockbrain.llm.telemetry import LlmCallRecord, LlmTelemetry
+from stockbrain.logging import get_logger
 from stockbrain.observability.health import ProviderHealthRegistry, ProviderName
 
 #: A research job gets this many attempts. Only a capacity failure retries --
@@ -62,6 +64,27 @@ RESEARCH_JOB_MAX_ATTEMPTS = 3
 
 #: Failures that mean the provider could not answer *now*, not that the run is bad.
 RETRYABLE_RESEARCH_ERRORS: tuple[type[Exception], ...] = (ProviderRateLimited, ProviderUnavailable)
+NEWS_OUTCOME_BACKFILL_JOB = "NEWS_OUTCOME_BACKFILL"
+NEWS_OUTCOME_REASSESSMENT_VERSION = "news-cache-v1"
+#: Research rerun after a cache backfill, before any order executed: its verdict
+#: supersedes the pending proposal and takes the ordinary proposal path.
+NEWS_CACHE_REASSESSMENT_TRIGGER = "NEWS_CACHE_REASSESSMENT"
+#: The same rerun once the BUY had filled. Advisory only: a completed backfill
+#: is never on its own a reason to reverse a position.
+NEWS_CACHE_POSITION_TRIGGER = "NEWS_CACHE_POSITION_REASSESSMENT"
+#: Review at a news-driven BUY's catalyst deadline. Advisory unless
+#: ``news_catalyst_exit_proposals_enabled``.
+CATALYST_REVIEW_TRIGGER = "CATALYST_DEADLINE_POSITION_REASSESSMENT"
+
+
+def advisory_triggers(catalyst_exit_proposals_enabled: bool) -> frozenset[str]:
+    """Research triggers whose verdict must not create or drive an exit."""
+    if catalyst_exit_proposals_enabled:
+        return frozenset({NEWS_CACHE_POSITION_TRIGGER})
+    return frozenset({NEWS_CACHE_POSITION_TRIGGER, CATALYST_REVIEW_TRIGGER})
+
+
+log = get_logger(__name__)
 
 
 class ResearchService:
@@ -494,6 +517,17 @@ class ResearchService:
                             else None,
                         )
                     )
+                if packet.previous_thesis_id is None:
+                    for datum in packet.market_context:
+                        if datum.provider == "news_outcomes":
+                            try:
+                                await self._enqueue_missing_outcomes(packet, (datum,), run_id)
+                            except Exception as exc:
+                                log.warning(
+                                    "news_outcome_backfill_enqueue_failed",
+                                    run_id=str(run_id),
+                                    error_type=type(exc).__name__,
+                                )
                 self.health.record(
                     ProviderName.TRADINGAGENTS,
                     ProviderStatus.DEGRADED if result.degradation else ProviderStatus.HEALTHY,
@@ -606,6 +640,64 @@ class ResearchService:
         return ResearchPacket.model_validate(
             {**packet.model_dump(), "market_context": tuple(data), "degradation": tuple(degraded)}
         )
+
+    async def _enqueue_missing_outcomes(
+        self, packet: ResearchPacket, context: tuple[Any, ...], run_id: uuid.UUID
+    ) -> None:
+        """Schedule one bounded cache refresh, never a provider call in research."""
+        if not context:
+            return
+        try:
+            payload = json.loads(context[0].text)
+        except (AttributeError, ValueError, TypeError):
+            return
+        if (
+            payload.get("candidate_events") != 0
+            and payload.get("summary", {}).get("1h", {}).get("n", 0) > 0
+        ):
+            return
+        # Fixed UTC calendar windows make a cache miss durable across articles
+        # arriving close together. Finished jobs also suppress repeat requests.
+        anchor_text = payload.get("missing_window_anchor")
+        if anchor_text:
+            anchor = dt.datetime.fromisoformat(anchor_text)
+            window_start = anchor - dt.timedelta(days=1)
+            window_end = min(anchor + dt.timedelta(days=12), packet.as_of)
+        else:
+            end = min(packet.event_time, packet.as_of).astimezone(dt.UTC)
+            window_end = end.replace(hour=0, minute=0, second=0, microsecond=0)
+            if window_end >= end:
+                window_end -= dt.timedelta(days=1)
+            window_start = window_end - dt.timedelta(days=14)
+        key = (
+            f"news-outcome-backfill:{packet.company.symbol}:"
+            f"{window_start.date()}:{window_end.date()}"
+        )
+        async with self.database.transaction() as session:
+            prior = await session.scalar(
+                sa.select(Job).where(Job.dedupe_key == key).with_for_update()
+            )
+            if prior is not None:
+                affected = list(prior.payload.get("affected_run_ids", []))
+                if str(run_id) not in affected and prior.status.value in ("PENDING", "RUNNING"):
+                    affected.append(str(run_id))
+                    prior.payload = {**prior.payload, "affected_run_ids": affected[:25]}
+                return
+            await self.queue.enqueue(
+                session,
+                NEWS_OUTCOME_BACKFILL_JOB,
+                payload={
+                    "symbol": packet.company.symbol,
+                    "company_id": str(packet.company.company_id),
+                    "start": window_start.isoformat(),
+                    "end": window_end.isoformat(),
+                    "version": NEWS_OUTCOME_REASSESSMENT_VERSION,
+                    "affected_run_ids": [str(run_id)],
+                },
+                dedupe_key=key,
+                priority=90,
+                max_attempts=2,
+            )
 
     async def sweep(self) -> None:
         async with self.database.transaction() as session:

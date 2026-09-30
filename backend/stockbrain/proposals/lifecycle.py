@@ -32,6 +32,7 @@ from stockbrain.enums import (
 )
 from stockbrain.errors import ProposalAlreadyConsumed
 from stockbrain.fx.base import normalize_currency
+from stockbrain.intelligence.research_service import advisory_triggers
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
 from stockbrain.market_data.sessions import session_from_us_clock
@@ -441,6 +442,11 @@ class ProposalLifecycle:
                         .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
                         .where(
                             ResearchRun.status == ResearchStatus.SUCCEEDED,
+                            ResearchRun.trigger.not_in(
+                                advisory_triggers(
+                                    self._service.settings.news_catalyst_exit_proposals_enabled
+                                )
+                            ),
                             ~sa.exists(
                                 sa.select(TradeProposal.id).where(
                                     TradeProposal.thesis_id == Thesis.id

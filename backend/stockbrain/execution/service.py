@@ -74,6 +74,7 @@ from stockbrain.execution.preflight import ExecutionPreflight
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
 from stockbrain.observability.metrics import METRICS
+from stockbrain.proposals.lifecycle import thesis_is_superseded
 from stockbrain.proposals.service import ProposalService, Revalidation
 from stockbrain.proposals.state_machine import (
     EXECUTABLE_STATUSES,
@@ -299,6 +300,16 @@ class ExecutionService:
             if locked.status not in EXECUTABLE_STATUSES or locked.expires_at <= now:
                 return None
             if await self._sent_attempt(session, proposal_id) is not None:
+                return None
+            if (
+                locked.side.value == "BUY"
+                and locked.thesis_id is not None
+                and await thesis_is_superseded(session, locked.thesis_id)
+            ):
+                log.info(
+                    "execution_claim_refused_superseded_thesis",
+                    proposal_id=str(proposal_id),
+                )
                 return None
 
             # The last kill/pause check, from the database, inside the same

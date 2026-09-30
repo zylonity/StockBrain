@@ -82,6 +82,7 @@ from stockbrain.errors import (
 )
 from stockbrain.fx.service import FxService
 from stockbrain.intelligence.memory import MemoryService
+from stockbrain.intelligence.research_service import advisory_triggers
 from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
 from stockbrain.market_data.base import MarketDataProvider
@@ -307,6 +308,15 @@ class ProposalService:
         if candidate is None:
             return GenerationResult(
                 thesis_id=thesis_id, created=False, reason="thesis or research run not found"
+            )
+        if candidate.run.trigger in advisory_triggers(
+            self.settings.news_catalyst_exit_proposals_enabled
+        ):
+            # Backstop for the handler and backlog filters: an advisory review
+            # (history backfill, or a catalyst deadline before its exits are
+            # enabled) informs the operator but never becomes an order.
+            return GenerationResult(
+                thesis_id=thesis_id, created=False, reason="advisory position review"
             )
 
         # A HOLD is a conclusion, not an order. Refuse it before spending a

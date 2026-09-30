@@ -432,8 +432,25 @@ async def test_submission_timing_is_labelled_as_proxy_when_fill_time_is_absent(
 
     report = await run_news_trade_diagnostics(clean_tables, as_of=AS_OF)
     assert report.delay_basis_counts == {"order_submitted_at_proxy": 1}
-    assert report.samples.with_delay == 1
+    assert report.samples.with_delay == 0
+    assert sum(report.delay_buckets.values()) == 0
+    assert report.missing["actual_fill_delay_unknown_submission_proxy"] == 1
     assert any("actual fill timestamp" in caveat for caveat in report.caveats)
+
+
+async def test_naive_broker_fill_time_is_not_treated_as_an_actual_instant(
+    clean_tables: Database,
+) -> None:
+    async with clean_tables.transaction() as session:
+        world = await _seed(session, suffix="naive", raw={"filledAt": "2026-09-30T14:00:00"})
+        order = await session.get(BrokerOrder, world.order_id)
+        assert order is not None
+        order.last_synced_at = T0
+
+    report = await run_news_trade_diagnostics(clean_tables, as_of=AS_OF)
+    assert report.delay_basis_counts == {"order_submitted_at_proxy": 1}
+    assert report.samples.with_delay == 0
+    assert report.missing["actual_fill_delay_unknown_submission_proxy"] == 1
 
 
 async def test_observations_after_as_of_are_excluded(clean_tables: Database) -> None:
@@ -617,7 +634,9 @@ async def test_prefill_move_uses_only_injected_cached_bars(clean_tables: Databas
     async with clean_tables.transaction() as session:
         for name, ticker in tickers.items():
             await _seed(
-                session, suffix=name, ticker=ticker,
+                session,
+                suffix=name,
+                ticker=ticker,
                 options=_SeedOptions(
                     with_outcome=name in {"up", "down"},
                     closed_at=T0 + dt.timedelta(hours=1),

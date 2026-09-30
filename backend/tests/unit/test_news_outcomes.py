@@ -159,6 +159,25 @@ def test_a_configured_latency_shifts_the_entry_bar() -> None:
     assert outcome.entry.price == Decimal("104")
 
 
+def test_mid_minute_publication_uses_only_completed_stock_and_benchmark_closes() -> None:
+    publication = _at(FRIDAY, 14, 0) + dt.timedelta(seconds=30)
+    stock = _session("AAPL", FRIDAY, jumps=[(840, "110")])
+    benchmark = _session("SPY", FRIDAY, base="400", jumps=[(840, "440")])
+
+    outcome = compute_news_outcome(
+        _inputs(published_at=publication, stock=stock, benchmark=benchmark)
+    )
+
+    move = outcome.publication_to_entry
+    assert move.status is OutcomeStatus.OK
+    assert move.reference is not None
+    assert move.benchmark_reference is not None
+    assert move.reference.timestamp == _at(FRIDAY, 13, 59)
+    assert move.reference.price == Decimal("100")
+    assert move.benchmark_reference.timestamp == _at(FRIDAY, 13, 59)
+    assert move.benchmark_reference.price == Decimal("400")
+
+
 def test_a_saturday_publication_enters_the_next_session_open() -> None:
     publication = SATURDAY + dt.timedelta(hours=12)
     stock = _session("AAPL", FRIDAY) + _session("AAPL", MONDAY)
@@ -187,9 +206,7 @@ def test_a_saturday_publication_enters_the_next_session_open() -> None:
 
 def test_an_after_close_publication_enters_the_next_session_open() -> None:
     stock = _session("AAPL", FRIDAY) + _session("AAPL", MONDAY)
-    benchmark = _session("SPY", FRIDAY, base="400") + _session(
-        "SPY", MONDAY, base="400"
-    )
+    benchmark = _session("SPY", FRIDAY, base="400") + _session("SPY", MONDAY, base="400")
     outcome = compute_news_outcome(
         _inputs(
             published_at=_at(FRIDAY, 21),  # 17:00 ET
@@ -206,9 +223,7 @@ def test_an_after_close_publication_enters_the_next_session_open() -> None:
 
 def test_last_minutes_publication_enters_next_session_after_latency() -> None:
     stock = _session("AAPL", FRIDAY) + _session("AAPL", MONDAY)
-    benchmark = _session("SPY", FRIDAY, base="400") + _session(
-        "SPY", MONDAY, base="400"
-    )
+    benchmark = _session("SPY", FRIDAY, base="400") + _session("SPY", MONDAY, base="400")
     outcome = compute_news_outcome(
         _inputs(
             published_at=_at(FRIDAY, 19, 55),  # 15:55 ET; latency ends at close
@@ -292,12 +307,12 @@ def test_one_trading_day_is_the_next_session_close() -> None:
 
 def test_a_truncated_target_session_is_not_called_its_close() -> None:
     stock = _session("AAPL", FRIDAY) + _session("AAPL", MONDAY, count=300)
-    benchmark = _session("SPY", FRIDAY, base="400") + _session(
-        "SPY", MONDAY, base="400", count=300
-    )
+    benchmark = _session("SPY", FRIDAY, base="400") + _session("SPY", MONDAY, base="400", count=300)
     outcome = compute_news_outcome(
         _inputs(
-            as_of=_at(TUESDAY, 12), stock=stock, benchmark=benchmark,
+            as_of=_at(TUESDAY, 12),
+            stock=stock,
+            benchmark=benchmark,
             expected_close_time=dt.time(16, 0),
         )
     )
@@ -446,6 +461,25 @@ def test_a_currency_mismatch_without_fx_bars_is_unavailable() -> None:
         )
     )
 
+    assert outcome.publication_to_entry.status is OutcomeStatus.MISSING_FX
+    day = outcome.horizon(HORIZON_DAY_1)
+    assert day is not None
+    assert day.status is OutcomeStatus.MISSING_FX
+
+
+def test_future_fx_bar_cannot_set_the_entry_conversion_rate() -> None:
+    stock = _session("AAPL", FRIDAY) + _session("AAPL", MONDAY, base="110")
+    benchmark = _session("SPY", FRIDAY, base="400") + _session("SPY", MONDAY, base="416")
+    outcome = compute_news_outcome(
+        _inputs(
+            as_of=_at(TUESDAY, 12),
+            stock=stock,
+            benchmark=benchmark,
+            instrument_currency="EUR",
+            benchmark_currency="USD",
+            fx_bars=[_bar("EURUSD", FRIDAY, 900, "1.10", "1.10")],
+        )
+    )
     assert outcome.publication_to_entry.status is OutcomeStatus.MISSING_FX
     day = outcome.horizon(HORIZON_DAY_1)
     assert day is not None

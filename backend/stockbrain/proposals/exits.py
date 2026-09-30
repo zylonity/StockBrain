@@ -28,6 +28,7 @@ from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.session import Database
 from stockbrain.enums import ResearchStatus, ThesisAction
+from stockbrain.intelligence.research_service import advisory_triggers
 from stockbrain.logging import get_logger
 from stockbrain.proposals.service import ProposalService
 from stockbrain.proposals.state_machine import ACTIVE_STATUSES
@@ -314,6 +315,12 @@ class ExitSweepService:
                     Thesis.original_thesis_id == thesis_id,
                 ),
                 ResearchRun.status == ResearchStatus.SUCCEEDED,
+                # An advisory review (a completed history backfill, or a
+                # catalyst deadline before its exits are enabled) never drives
+                # an exit, not even through this thesis-invalidation rule.
+                ResearchRun.trigger.not_in(
+                    advisory_triggers(self._settings.news_catalyst_exit_proposals_enabled)
+                ),
             )
             .order_by(Thesis.created_at.desc())
             .limit(1)

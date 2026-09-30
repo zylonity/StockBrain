@@ -79,6 +79,7 @@ from stockbrain.ingestion.web_search import WebDiscoveryProvider
 from stockbrain.instruments.service import ResolutionService
 from stockbrain.intelligence.classifier import EventClassifier
 from stockbrain.intelligence.memory import MemoryService
+from stockbrain.intelligence.news_catalyst_monitor import CatalystMonitor
 from stockbrain.intelligence.news_outcome_research import NewsOutcomeResearchProvider
 from stockbrain.intelligence.research_data import (
     AlpacaResearchProvider,
@@ -193,6 +194,7 @@ class ServiceContainer:
     position_reviews: PositionReviewService | None = field(default=None, init=False)
     rebalance: RebalanceService | None = field(default=None, init=False)
     volatility: VolatilityRefreshService | None = field(default=None, init=False)
+    catalysts: CatalystMonitor | None = field(default=None, init=False)
     memory: MemoryService | None = field(default=None, init=False)
     risk_config: RiskConfig = field(init=False)
     resolution: ResolutionService | None = field(default=None, init=False)
@@ -646,7 +648,10 @@ class ServiceContainer:
                     )
                     if settings.polymarket_enabled
                     else None,
-                    outcomes=NewsOutcomeResearchProvider(self.database)
+                    outcomes=NewsOutcomeResearchProvider(
+                        self.database,
+                        deadline_buffer_sessions=settings.news_catalyst_deadline_buffer_sessions,
+                    )
                     if settings.news_outcome_packet_enabled
                     else None,
                     min_impact_materiality=settings.research_min_impact_materiality,
@@ -661,6 +666,12 @@ class ServiceContainer:
                     memory=self.memory,
                     memory_packet_enabled=settings.memory_packet_enabled,
                 )
+                if settings.news_outcome_packet_enabled:
+                    # Records each news-driven BUY's fixed catalyst expectation
+                    # and requests one review at its deadline. It never proposes.
+                    self.catalysts = CatalystMonitor(
+                        self.database, self.research, bars=self.market_data
+                    )
                 self.health.record(
                     ProviderName.TRADINGAGENTS,
                     ProviderStatus.HEALTHY,
@@ -975,6 +986,16 @@ class ServiceContainer:
                     interval_seconds=self.settings.exit_sweep_interval_seconds,
                     run=self._exit_sweep,
                     initial_delay_seconds=100.0,
+                    jitter_ratio=0.1,
+                )
+            )
+        if self.catalysts is not None:
+            scheduler.add(
+                ScheduledTask(
+                    name="news_catalyst_deadlines",
+                    interval_seconds=900.0,
+                    run=self._catalyst_tick,
+                    initial_delay_seconds=150.0,
                     jitter_ratio=0.1,
                 )
             )
@@ -1378,6 +1399,10 @@ class ServiceContainer:
     async def _exit_sweep(self) -> None:
         if self.exits is not None:
             await self.exits.sweep()
+
+    async def _catalyst_tick(self) -> None:
+        if self.catalysts is not None:
+            await self.catalysts.tick()
 
     async def _rotation_sweep(self) -> None:
         if self.rotation is not None:

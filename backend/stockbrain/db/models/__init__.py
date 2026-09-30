@@ -14,6 +14,7 @@ from stockbrain.db.models.companies import (
     EventCompanyImpact,
 )
 from stockbrain.db.models.memory import ThesisOutcome, ThesisOutcomeGrade
+from stockbrain.db.models.news_catalyst import NewsCatalystDeadline
 from stockbrain.db.models.news_history import (
     DATASET_CANDLES,
     DATASET_NEWS,
@@ -66,6 +67,7 @@ __all__ = [
     "ExecutionAttempt",
     "Job",
     "LlmCall",
+    "NewsCatalystDeadline",
     "NewsHistoryArticle",
     "NewsHistoryBackfillRun",
     "NewsHistoryCandle",

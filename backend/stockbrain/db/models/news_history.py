@@ -12,12 +12,10 @@ Four tables carry that:
 
 * :class:`NewsHistoryArticle` -- one backfilled article, stamped with
   ``observed_at`` (when the world could have known it) and ``ingested_at`` (when
-  the cache learned it).  Articles that describe the same real-world event share
-  an ``event_id``, which is the grouping key for duplicate suppression.  Where
-  possible the row points at the existing :class:`~stockbrain.db.models.sources.Event`,
-  :class:`~stockbrain.db.models.sources.Source` and their
-  :class:`~stockbrain.db.models.sources.EventSourceLink`, so this cache extends
-  the canonical event graph rather than inventing a parallel one.
+  the cache learned it). Actual live receipt is unknown. Articles describing
+  the same occurrence share an archived ``event_id`` for duplicate suppression.
+  Historical imports create no live Source or EventSourceLink and cannot enter
+  the classification sweep.
 
 * :class:`NewsHistoryCandle` -- one per-symbol minute (or other timeframe) bar,
   with the feed it came from.  The identity is
@@ -86,10 +84,10 @@ class NewsHistoryArticle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     observable to anyone, and it is stored rather than recomputed so the
     boundary cannot drift when a provider re-stamps an article.
 
-    ``ingested_at`` is when *we* wrote the row. The general cache query can
-    reconstruct publicly observable history from ``observed_at``. A research
-    packet applies the stricter ``ingested_at <= as_of`` boundary so it only
-    uses data StockBrain had actually cached at that time.
+    ``ingested_at`` is when *we* imported the row into this historical cache.
+    It is not actual live receipt. The general cache query can reconstruct
+    publicly observable history from ``observed_at``. A research packet applies
+    ``ingested_at <= as_of`` so it only uses data actually cached then.
     """
 
     __tablename__ = "news_history_articles"
@@ -98,9 +96,7 @@ class NewsHistoryArticle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         pg_enum(SourceProvider, "source_provider"), nullable=False
     )
     provider_item_id: Mapped[str | None] = mapped_column(sa.Text)
-    feed: Mapped[str] = mapped_column(
-        sa.Text, nullable=False, server_default="unknown"
-    )
+    feed: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="unknown")
     """Which transport produced this row: ``alpaca:backfill``, ``alpaca:stream``.
 
     The provider says who; the feed says how.  Two rows can share a provider and
@@ -125,23 +121,16 @@ class NewsHistoryArticle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     event_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("events.id", ondelete="SET NULL")
     )
-    """The canonical event this article evidences.
-
-    Preferring the existing event graph means duplicate articles group by
-    ``event_id`` and the classifier, research links and company impacts already
-    hanging off that event stay reachable.  It is nullable because a cache row
-    can be written before its event is resolved."""
+    """Archived event used only for historical duplicate grouping. Nullable
+    when the article has no usable headline."""
 
     source_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("sources.id", ondelete="SET NULL")
     )
-    """The :class:`~stockbrain.db.models.sources.Source` row created for this
-    article, when one was created."""
+    """Legacy link to a Source; new historical imports leave this NULL."""
 
     published_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
-    observed_at: Mapped[dt.datetime] = mapped_column(
-        sa.DateTime(timezone=True), nullable=False
-    )
+    observed_at: Mapped[dt.datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
     ingested_at: Mapped[dt.datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )
@@ -183,20 +172,12 @@ class NewsHistoryCandle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "news_history_candles"
 
     symbol: Mapped[str] = mapped_column(sa.Text, nullable=False)
-    timeframe: Mapped[str] = mapped_column(
-        sa.Text, nullable=False, server_default="1Min"
-    )
-    provider: Mapped[str] = mapped_column(
-        sa.Text, nullable=False, server_default="unknown"
-    )
+    timeframe: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="1Min")
+    provider: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="unknown")
     feed: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="unknown")
 
-    bar_start: Mapped[dt.datetime] = mapped_column(
-        sa.DateTime(timezone=True), nullable=False
-    )
-    observed_at: Mapped[dt.datetime] = mapped_column(
-        sa.DateTime(timezone=True), nullable=False
-    )
+    bar_start: Mapped[dt.datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    observed_at: Mapped[dt.datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
     ingested_at: Mapped[dt.datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )
@@ -258,9 +239,7 @@ class NewsHistoryCoverage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     bar_count: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
     request_count: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
 
-    is_partial: Mapped[bool] = mapped_column(
-        sa.Boolean, nullable=False, server_default=sa.false()
-    )
+    is_partial: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
     detail: Mapped[str | None] = mapped_column(sa.Text)
 
     __table_args__ = (
@@ -282,15 +261,11 @@ class NewsHistoryBackfillRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     dataset: Mapped[str] = mapped_column(sa.Text, nullable=False)
     scope_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
-    status: Mapped[str] = mapped_column(
-        sa.Text, nullable=False, server_default=RUN_STATUS_RUNNING
-    )
+    status: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default=RUN_STATUS_RUNNING)
 
     requested_start: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     requested_end: Mapped[dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
-    limits: Mapped[JSONDict] = mapped_column(
-        nullable=False, server_default=sa.text("'{}'::jsonb")
-    )
+    limits: Mapped[JSONDict] = mapped_column(nullable=False, server_default=sa.text("'{}'::jsonb"))
 
     articles_fetched: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
     bars_fetched: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")

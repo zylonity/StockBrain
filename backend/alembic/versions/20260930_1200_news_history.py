@@ -126,9 +126,7 @@ def upgrade() -> None:
         "news_history_articles",
         ["company_id", "event_type", "observed_at"],
     )
-    op.create_index(
-        "ix_news_history_articles_event_id", "news_history_articles", ["event_id"]
-    )
+    op.create_index("ix_news_history_articles_event_id", "news_history_articles", ["event_id"])
     op.create_index(
         "ix_news_history_articles_content_hash", "news_history_articles", ["content_hash"]
     )
@@ -187,9 +185,7 @@ def upgrade() -> None:
         "news_history_candles",
         ["symbol", "timeframe", "bar_start"],
     )
-    op.create_index(
-        "ix_news_history_candles_observed_at", "news_history_candles", ["observed_at"]
-    )
+    op.create_index("ix_news_history_candles_observed_at", "news_history_candles", ["observed_at"])
 
     op.create_table(
         "news_history_coverage",
@@ -204,9 +200,7 @@ def upgrade() -> None:
         sa.Column("article_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("bar_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("request_count", sa.Integer(), server_default="0", nullable=False),
-        sa.Column(
-            "is_partial", sa.Boolean(), server_default=sa.false(), nullable=False
-        ),
+        sa.Column("is_partial", sa.Boolean(), server_default=sa.false(), nullable=False),
         sa.Column("detail", sa.Text(), nullable=True),
         sa.Column(
             "created_at",
@@ -221,13 +215,9 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_news_history_coverage")),
-        sa.UniqueConstraint(
-            "dataset", "scope_key", name="uq_news_history_coverage_scope"
-        ),
+        sa.UniqueConstraint("dataset", "scope_key", name="uq_news_history_coverage_scope"),
     )
-    op.create_index(
-        "ix_news_history_coverage_dataset", "news_history_coverage", ["dataset"]
-    )
+    op.create_index("ix_news_history_coverage_dataset", "news_history_coverage", ["dataset"])
 
     op.create_table(
         "news_history_backfill_runs",
@@ -283,9 +273,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_news_history_backfill_runs_status", table_name="news_history_backfill_runs"
-    )
+    op.drop_index("ix_news_history_backfill_runs_status", table_name="news_history_backfill_runs")
     op.drop_index(
         "ix_news_history_backfill_runs_dataset_started",
         table_name="news_history_backfill_runs",
@@ -308,7 +296,5 @@ def downgrade() -> None:
         table_name="news_history_articles",
     )
     op.drop_index("ix_news_history_articles_observed_at", table_name="news_history_articles")
-    op.drop_index(
-        "uq_news_history_articles_provider_item", table_name="news_history_articles"
-    )
+    op.drop_index("uq_news_history_articles_provider_item", table_name="news_history_articles")
     op.drop_table("news_history_articles")

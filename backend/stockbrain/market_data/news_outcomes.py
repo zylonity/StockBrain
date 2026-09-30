@@ -537,10 +537,13 @@ def _first_at_or_after(bars: Sequence[Bar], moment: dt.datetime) -> Bar | None:
     return None
 
 
-def _last_at_or_before(bars: Sequence[Bar], moment: dt.datetime) -> Bar | None:
+def _last_completed_at_or_before(
+    bars: Sequence[Bar], moment: dt.datetime, interval: dt.timedelta
+) -> Bar | None:
+    """Find the last close knowable at ``moment``; bar timestamps are starts."""
     candidate: Bar | None = None
     for bar in bars:
-        if bar.timestamp <= moment:
+        if bar.timestamp + interval <= moment:
             candidate = bar
         else:
             break
@@ -626,9 +629,8 @@ class _Context:
 def _fx_rate_at(context: _Context, instant: dt.datetime) -> Decimal | None:
     """The alignment FX rate for an instant, or None when there is none.
 
-    The nearest FX bar at or before the instant is preferred; a bar just after
-    it is an acceptable substitute.  A bar further than ``max_fx_gap`` away is
-    treated as absent rather than stretched across the gap.
+    Only an FX bar at or before the instant is eligible. A later quote would
+    leak future information into the simulated entry or exit conversion.
     """
     if not context.needs_fx:
         return Decimal(1)
@@ -639,10 +641,8 @@ def _fx_rate_at(context: _Context, instant: dt.datetime) -> Decimal | None:
         else:
             break
     if chosen is None:
-        chosen = _first_at_or_after(context.fx, instant)
-    if chosen is None:
         return None
-    if abs((chosen.timestamp - instant).total_seconds()) > context.max_fx_gap.total_seconds():
+    if instant - chosen.timestamp > context.max_fx_gap:
         return None
     return chosen.close
 
@@ -1327,25 +1327,30 @@ def compute_news_outcome(inputs: NewsOutcomeInputs) -> EventOutcome:
     entry_was_session_gap = entry_date != target_date or entry_delay > inputs.max_intraday_gap
     reasons: list[str] = []
 
-    reference_bar = _last_at_or_before(stock, inputs.published_at)
+    reference_bar = _last_completed_at_or_before(stock, inputs.published_at, inputs.bar_interval)
     if reference_bar is None:
         publication_to_entry = _unavailable_move(
             OutcomeStatus.NO_REFERENCE_BAR,
             ("no completed instrument bar exists at or before publication",),
             entry=entry,
         )
-    elif inputs.published_at - reference_bar.timestamp > inputs.max_reference_staleness:
+    elif (
+        inputs.published_at - (reference_bar.timestamp + inputs.bar_interval)
+        > inputs.max_reference_staleness
+    ):
         publication_to_entry = _unavailable_move(
             OutcomeStatus.STALE_BAR,
             (
                 f"the last bar before publication is "
-                f"{inputs.published_at - reference_bar.timestamp} old",
+                f"{inputs.published_at - (reference_bar.timestamp + inputs.bar_interval)} old",
             ),
             entry=entry,
         )
     else:
         reference = PricePoint(reference_bar.timestamp, reference_bar.close, "close")
-        benchmark_reference_bar = _last_at_or_before(benchmark, inputs.published_at)
+        benchmark_reference_bar = _last_completed_at_or_before(
+            benchmark, inputs.published_at, inputs.bar_interval
+        )
         benchmark_entry_bar = _first_at_or_after(benchmark, target)
         if benchmark_reference_bar is None or benchmark_entry_bar is None:
             publication_to_entry = _unavailable_move(

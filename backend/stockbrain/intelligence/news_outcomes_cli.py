@@ -12,6 +12,10 @@ from stockbrain.config import Settings
 from stockbrain.db.session import Database
 from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
 from stockbrain.intelligence.news_history import BackfillLimits, NewsHistoryCache
+from stockbrain.intelligence.news_outcome_coverage import (
+    backfill_universe,
+    run_validation_coverage,
+)
 from stockbrain.intelligence.news_trade_diagnostics import (
     render_news_trade_diagnostics,
     run_news_trade_diagnostics,
@@ -35,6 +39,33 @@ async def _run(args: argparse.Namespace) -> None:
         if args.mode == "report":
             report = await run_news_trade_diagnostics(database, as_of=args.as_of)
             print(render_news_trade_diagnostics(report))  # noqa: T201
+            return
+        if args.mode == "validation":
+            coverage_report = await run_validation_coverage(database, as_of=args.as_of)
+            print(json.dumps(coverage_report, indent=2, default=str))  # noqa: T201
+            return
+        if args.mode == "universe":
+            news = AlpacaNewsClient(settings)
+            bars = AlpacaMarketDataClient(settings)
+            try:
+                counts = await backfill_universe(
+                    database,
+                    as_of=args.as_of,
+                    news=news,
+                    bars=bars,
+                    progress=lambda report: print(  # noqa: T201
+                        report.dataset,
+                        report.scope_key,
+                        report.effective_start,
+                        report.status,
+                        report.wrote_rows,
+                        flush=True,
+                    ),
+                )
+                print(json.dumps(counts))  # noqa: T201
+            finally:
+                await news.aclose()
+                await bars.aclose()
             return
         cache = NewsHistoryCache(database)
         limits = BackfillLimits()  # Fixed caps; repeat an invocation for another window.
@@ -71,16 +102,16 @@ async def _run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("news", "candles", "report"))
+    parser.add_argument("mode", choices=("news", "candles", "report", "validation", "universe"))
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--start", type=_aware)
     parser.add_argument("--end", type=_aware)
     parser.add_argument("--as-of", type=_aware)
     parser.add_argument("--symbol", dest="symbols", action="append", default=[])
     args = parser.parse_args()
-    if args.mode == "report":
+    if args.mode in {"report", "validation", "universe"}:
         if args.as_of is None:
-            parser.error("report requires --as-of")
+            parser.error(f"{args.mode} requires --as-of")
     elif args.start is None or args.end is None or not args.symbols:
         parser.error("backfill requires --start, --end and at least one --symbol")
     if len(args.symbols) > 5:

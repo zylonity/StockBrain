@@ -968,6 +968,14 @@ class Settings(BaseSettings):
     operator turns it on."""
     news_outcome_packet_enabled: bool = False
     """Attach cached descriptive news outcomes to research only after operator opt-in."""
+    news_catalyst_deadline_buffer_sessions: int = Field(default=1, ge=0, le=10)
+    """Extra observed trading sessions after an evidence-supported catalyst response window."""
+    news_catalyst_exit_proposals_enabled: bool = False
+    """Let a catalyst-deadline review's SELL/REDUCE verdict reach the normal proposal path.
+
+    Off by default: the verdict is advisory (recorded, notified, ignored by the
+    exit sweep) until the offline deadline-exit-versus-hold comparison supports
+    automatic exits. Even when on, every risk and authorization check applies."""
     memory_grade_interval_seconds: float = 21600.0
     memory_benchmark_symbol: str = "SPY"
     memory_standing_thesis_max_age_days: int = 14

@@ -21,6 +21,7 @@ from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import BrokerInstrument
 from stockbrain.db.models.portfolio import BrokerOrder
 from stockbrain.db.models.proposals import ExecutionAttempt, TradeProposal
+from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.models.system import AuditLog, Job
 from stockbrain.db.session import Database
 from stockbrain.enums import (
@@ -32,7 +33,9 @@ from stockbrain.enums import (
     NotificationEvent,
     OrderSide,
     ProposalStatus,
+    ResearchStatus,
     ThesisAction,
+    TimeHorizon,
 )
 from stockbrain.errors import (
     AmbiguousTransportFailure,
@@ -105,6 +108,40 @@ async def test_an_authorized_proposal_transmits_exactly_once(
     # A working order keeps the proposal EXECUTING, which keeps its exposure
     # reserved: an unfilled order is committed cash the snapshot cannot see yet.
     assert await status_of(clean_tables, proposal_id) is ProposalStatus.EXECUTING
+
+
+async def test_a_superseding_research_verdict_blocks_an_old_approved_buy(
+    clean_tables: Database,
+) -> None:
+    settings = execution_settings()
+    _, execution, provider, proposal_id = await authorized(clean_tables, settings)
+    async with clean_tables.transaction() as session:
+        proposal = await session.get(TradeProposal, proposal_id)
+        assert proposal is not None and proposal.thesis_id is not None
+        run = ResearchRun(
+            id=uuid.uuid4(),
+            event_id=proposal.event_id,
+            company_id=proposal.company_id,
+            broker_instrument_id=proposal.broker_instrument_id,
+            status=ResearchStatus.SUCCEEDED,
+            completed_at=utcnow(),
+        )
+        session.add(run)
+        await session.flush()
+        session.add(
+            Thesis(
+                research_run_id=run.id,
+                action=ThesisAction.NO_ACTION,
+                confidence=0.7,
+                time_horizon=TimeHorizon.DAYS,
+                supersedes_thesis_id=proposal.thesis_id,
+            )
+        )
+
+    result = await execution.execute(proposal_id)
+    assert not result.transmitted
+    assert provider.submitted == 0
+    assert await attempts_of(clean_tables, proposal_id) == []
 
 
 async def test_the_command_is_built_from_the_proposal_row_alone(

@@ -17,10 +17,10 @@ early records ``PARTIAL`` coverage with the cap that bit -- the incompleteness i
 a fact in the database, not an inference from missing rows.
 
 Point-in-time correctness is the reason ``observed_at`` exists as a column rather
-than being derived.  ``as_of`` filters on it, so an article published on Monday
-and backfilled on Friday is visible to a query "as of Tuesday" but a bar that had
-not closed yet is not. Research packets additionally require ``ingested_at <=
-as_of`` to represent what StockBrain had cached at that time.
+than being derived. An article published on Monday and backfilled on Friday is
+publicly observable on Tuesday, but StockBrain did not receive it on Monday.
+``ingested_at`` records the Friday cache import; actual live receipt is unknown.
+Research packets require both ``observed_at`` and ``ingested_at <= as_of``.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.db.base import utcnow
+from stockbrain.db.models.companies import Company
 from stockbrain.db.models.news_history import (
     DATASET_CANDLES,
     DATASET_NEWS,
@@ -50,11 +51,10 @@ from stockbrain.db.models.news_history import (
     NewsHistoryCandle,
     NewsHistoryCoverage,
 )
-from stockbrain.db.models.sources import Event, EventSourceLink, Source
+from stockbrain.db.models.sources import Event
 from stockbrain.db.session import Database
 from stockbrain.enums import (
     BarTimeframe,
-    EventSourceRelationship,
     EventStatus,
     SourceCategory,
     SourceProvider,
@@ -117,6 +117,10 @@ def _clamp_positive(value: int, label: str) -> int:
     if value < 1:
         raise ValueError(f"{label} must be >= 1, got {value}")
     return value
+
+
+#: Rows per candle INSERT; 16 columns each stays well under PostgreSQL's limit.
+CANDLE_INSERT_BATCH = 1000
 
 
 @dataclass(slots=True, frozen=True)
@@ -467,36 +471,40 @@ class NewsHistoryCache:
         partial = stop_reason is not None
 
         written: _WriteOutcome | None = None
-        async with self._database.transaction() as session:
-            if inputs:
-                written = await self._write_articles(session, inputs, ingested_at=started)
-            watermark = written.watermark_at if written else None
-            await self._touch_coverage(
-                session,
-                dataset=DATASET_NEWS,
-                scope_key=scope_key,
-                watermark_at=watermark,
-                article_delta=written.written if written else 0,
-                request_delta=pages,
-                attempted_at=started,
-                is_partial=partial,
-                detail=stop_reason,
-                window_start=window_start if inputs else None,
-                window_end=window_end if inputs else None,
-            )
-            await self._finish_run(
-                session,
-                run_id,
-                status=RUN_STATUS_PARTIAL if partial else RUN_STATUS_SUCCEEDED,
-                articles_fetched=written.written if written else 0,
-                bars_fetched=0,
-                pages_fetched=pages,
-                requests_made=pages,
-                bounded=partial,
-                stop_reason=stop_reason,
-                watermark_at=watermark,
-                finished_at=started,
-            )
+        try:
+            async with self._database.transaction() as session:
+                if inputs:
+                    written = await self._write_articles(session, inputs, ingested_at=started)
+                watermark = written.watermark_at if written else None
+                await self._touch_coverage(
+                    session,
+                    dataset=DATASET_NEWS,
+                    scope_key=scope_key,
+                    watermark_at=watermark,
+                    article_delta=written.written if written else 0,
+                    request_delta=pages,
+                    attempted_at=started,
+                    is_partial=partial,
+                    detail=stop_reason,
+                    window_start=window_start if inputs else None,
+                    window_end=window_end if inputs else None,
+                )
+                await self._finish_run(
+                    session,
+                    run_id,
+                    status=RUN_STATUS_PARTIAL if partial else RUN_STATUS_SUCCEEDED,
+                    articles_fetched=written.written if written else 0,
+                    bars_fetched=0,
+                    pages_fetched=pages,
+                    requests_made=pages,
+                    bounded=partial,
+                    stop_reason=stop_reason,
+                    watermark_at=watermark,
+                    finished_at=started,
+                )
+        except Exception as exc:
+            await self._fail_run(run_id, f"{type(exc).__name__}: {exc}", started)
+            raise
 
         return BackfillReport(
             dataset=DATASET_NEWS,
@@ -601,43 +609,46 @@ class NewsHistoryCache:
             stop_reason = label if stop_reason is None else f"{stop_reason}+{label}"
         if hit_page_cap:
             stop_reason = (
-                "provider_page_cap"
-                if stop_reason is None
-                else f"{stop_reason}+provider_page_cap"
+                "provider_page_cap" if stop_reason is None else f"{stop_reason}+provider_page_cap"
             )
         partial = stop_reason is not None
 
         written: _WriteOutcome | None = None
-        async with self._database.transaction() as session:
-            if collected:
-                written = await self._write_candles(session, collected, ingested_at=started)
-            watermark = written.watermark_at if written else None
-            await self._touch_coverage(
-                session,
-                dataset=DATASET_CANDLES,
-                scope_key=ticker,
-                watermark_at=watermark,
-                bar_delta=written.written if written else 0,
-                request_delta=requests_made,
-                attempted_at=started,
-                is_partial=partial,
-                detail=stop_reason,
-                window_start=window_start if collected else None,
-                window_end=window_end if collected else None,
-            )
-            await self._finish_run(
-                session,
-                run_id,
-                status=RUN_STATUS_PARTIAL if partial else RUN_STATUS_SUCCEEDED,
-                articles_fetched=0,
-                bars_fetched=written.written if written else 0,
-                pages_fetched=requests_made,
-                requests_made=requests_made,
-                bounded=partial,
-                stop_reason=stop_reason,
-                watermark_at=watermark,
-                finished_at=started,
-            )
+        try:
+            async with self._database.transaction() as session:
+                if collected:
+                    written = await self._write_candles(session, collected, ingested_at=started)
+                watermark = written.watermark_at if written else None
+                await self._touch_coverage(
+                    session,
+                    dataset=DATASET_CANDLES,
+                    scope_key=ticker,
+                    watermark_at=watermark,
+                    bar_delta=written.written if written else 0,
+                    request_delta=requests_made,
+                    attempted_at=started,
+                    is_partial=partial,
+                    detail=stop_reason,
+                    window_start=window_start if collected else None,
+                    window_end=window_end if collected else None,
+                )
+                await self._finish_run(
+                    session,
+                    run_id,
+                    status=RUN_STATUS_PARTIAL if partial else RUN_STATUS_SUCCEEDED,
+                    articles_fetched=0,
+                    bars_fetched=written.written if written else 0,
+                    pages_fetched=requests_made,
+                    requests_made=requests_made,
+                    bounded=partial,
+                    stop_reason=stop_reason,
+                    watermark_at=watermark,
+                    finished_at=started,
+                )
+        except Exception as exc:
+            # A failed write must leave an auditable FAILED run, not RUNNING.
+            await self._fail_run(run_id, f"{type(exc).__name__}: {exc}", started)
+            raise
 
         return BackfillReport(
             dataset=DATASET_CANDLES,
@@ -822,9 +833,11 @@ class NewsHistoryCache:
                 duplicates += 1
                 continue
 
-            source, _ = await self._ensure_source(session, item, published, ingested_at)
-            event, event_created = await self._ensure_event(session, item, observed, ingested_at)
-            await self._ensure_event_link(session, event, source, event_created)
+            # Historical imports never enter the live discovery graph. A Source
+            # would claim an actual live receipt at import time, and a NEW event
+            # would be picked up by the classification sweep.
+            event = await self._ensure_event(session, item, observed, ingested_at)
+            company_id = item.company_id or await self._resolve_company(session, item.symbols)
 
             session.add(
                 NewsHistoryArticle(
@@ -834,9 +847,9 @@ class NewsHistoryCache:
                     headline=item.headline,
                     symbols=list(item.symbols),
                     event_type=item.event_type or (event.event_type if event else None),
-                    company_id=item.company_id,
+                    company_id=company_id,
                     event_id=event.id if event else None,
-                    source_id=source.id,
+                    source_id=None,
                     published_at=published,
                     observed_at=observed,
                     ingested_at=ingested_at,
@@ -864,44 +877,29 @@ class NewsHistoryCache:
             )
         return (await session.execute(stmt.limit(1))).scalar_one_or_none()
 
-    async def _ensure_source(
-        self,
-        session: AsyncSession,
-        item: ArticleInput,
-        published: dt.datetime | None,
-        ingested_at: dt.datetime,
-    ) -> tuple[Source, bool]:
-        digest = item.resolved_content_hash
-        if item.provider_item_id is not None:
-            stmt = sa.select(Source).where(
-                Source.provider == item.provider,
-                Source.provider_item_id == item.provider_item_id,
-            )
-        else:
-            stmt = sa.select(Source).where(
-                Source.provider == item.provider, Source.content_hash == digest
-            )
-        existing = (await session.execute(stmt.limit(1))).scalar_one_or_none()
-        if existing is not None:
-            return existing, False
+    async def _resolve_company(
+        self, session: AsyncSession, symbols: Sequence[str]
+    ) -> uuid.UUID | None:
+        """Associate one unambiguous provider symbol with a known company.
 
-        source = Source(
-            provider=item.provider,
-            provider_item_id=item.provider_item_id,
-            canonical_url=item.url,
-            original_url=item.url,
-            source_name=item.source_name,
-            source_category=item.source_category,
-            headline=item.headline,
-            published_at=published,
-            received_at=ingested_at,
-            raw_content=item.body,
-            content_hash=digest,
-            provider_metadata={"feed": item.feed},
+        Ticker hints are historical context only; they never create a broker
+        instrument or an executable EventCompanyImpact.
+        """
+        normalized = {symbol.strip().upper() for symbol in symbols if symbol.strip()}
+        if len(normalized) != 1:
+            return None
+        matches = (
+            (
+                await session.execute(
+                    sa.select(Company.id)
+                    .where(sa.func.upper(Company.primary_symbol) == next(iter(normalized)))
+                    .limit(2)
+                )
+            )
+            .scalars()
+            .all()
         )
-        session.add(source)
-        await session.flush()
-        return source, True
+        return matches[0] if len(matches) == 1 else None
 
     async def _ensure_event(
         self,
@@ -909,10 +907,10 @@ class NewsHistoryCache:
         item: ArticleInput,
         observed: dt.datetime,
         ingested_at: dt.datetime,
-    ) -> tuple[Event | None, bool]:
+    ) -> Event | None:
         digest = title_hash(item.headline)
         if not item.headline or not item.headline.strip():
-            return None, False
+            return None
         event_time = sa.func.coalesce(Event.event_time, Event.first_seen_at)
         cutoff = observed - DEFAULT_EVENT_MATCH_WINDOW
         horizon = observed + DEFAULT_EVENT_MATCH_WINDOW
@@ -921,7 +919,12 @@ class NewsHistoryCache:
                 sa.select(Event)
                 .where(
                     Event.title_hash == digest,
-                    Event.status != EventStatus.ARCHIVED,
+                    Event.status == EventStatus.ARCHIVED,
+                    sa.exists(
+                        sa.select(NewsHistoryArticle.id).where(
+                            NewsHistoryArticle.event_id == Event.id
+                        )
+                    ),
                     event_time >= cutoff,
                     event_time <= horizon,
                 )
@@ -933,7 +936,7 @@ class NewsHistoryCache:
             if item.event_type and not existing.event_type:
                 existing.event_type = item.event_type
                 session.add(existing)
-            return existing, False
+            return existing
 
         event = Event(
             title=item.headline,
@@ -941,45 +944,13 @@ class NewsHistoryCache:
             summary=None,
             first_seen_at=ingested_at,
             event_time=item.published_at or observed,
-            status=EventStatus.NEW,
+            status=EventStatus.ARCHIVED,
             event_type=item.event_type,
             topics=[],
         )
         session.add(event)
         await session.flush()
-        return event, True
-
-    async def _ensure_event_link(
-        self,
-        session: AsyncSession,
-        event: Event | None,
-        source: Source,
-        event_created: bool,
-    ) -> None:
-        if event is None:
-            return
-        existing = (
-            await session.execute(
-                sa.select(EventSourceLink).where(
-                    EventSourceLink.event_id == event.id,
-                    EventSourceLink.source_id == source.id,
-                )
-            )
-        ).scalar_one_or_none()
-        if existing is not None:
-            return
-        session.add(
-            EventSourceLink(
-                event_id=event.id,
-                source_id=source.id,
-                relationship_type=(
-                    EventSourceRelationship.PRIMARY
-                    if event_created
-                    else EventSourceRelationship.CORROBORATING
-                ),
-            )
-        )
-        await session.flush()
+        return event
 
     async def _write_candles(
         self,
@@ -1021,13 +992,17 @@ class NewsHistoryCache:
                 }
             )
 
-        statement = (
-            pg_insert(NewsHistoryCandle)
-            .values(rows)
-            .on_conflict_do_nothing(index_elements=["symbol", "timeframe", "bar_start", "feed"])
-        )
-        result = await session.execute(statement)
-        written = int(cast("CursorResult[Any]", result).rowcount or 0)
+        # PostgreSQL caps one statement at 32,767 bind parameters; a week of
+        # consolidated-feed minute bars exceeds that in a single VALUES list.
+        written = 0
+        for offset in range(0, len(rows), CANDLE_INSERT_BATCH):
+            statement = (
+                pg_insert(NewsHistoryCandle)
+                .values(rows[offset : offset + CANDLE_INSERT_BATCH])
+                .on_conflict_do_nothing(index_elements=["symbol", "timeframe", "bar_start", "feed"])
+            )
+            result = await session.execute(statement)
+            written += int(cast("CursorResult[Any]", result).rowcount or 0)
         return _WriteOutcome(
             written=written,
             duplicates=len(rows) - written,

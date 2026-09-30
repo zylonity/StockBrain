@@ -18,8 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from stockbrain.db.models.portfolio import Position
 from stockbrain.db.models.proposals import TradeProposal
-from stockbrain.db.models.research import Thesis
+from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.enums import Broker, OrderSide, ProposalStatus, ThesisAction
+from stockbrain.intelligence.research_service import advisory_triggers
 from stockbrain.risk.config import RiskConfig
 from stockbrain.risk.rules import conviction_weight
 
@@ -79,7 +80,12 @@ async def load_holding_beliefs(
         latest = (
             await session.scalar(
                 sa.select(Thesis)
-                .where(sa.or_(Thesis.id == origin, Thesis.original_thesis_id == origin))
+                .join(ResearchRun, ResearchRun.id == Thesis.research_run_id)
+                .where(
+                    sa.or_(Thesis.id == origin, Thesis.original_thesis_id == origin),
+                    # Advisory reviews never set conviction or trigger a top-up.
+                    ResearchRun.trigger.not_in(advisory_triggers(False)),
+                )
                 .order_by(Thesis.created_at.desc())
                 .limit(1)
             )

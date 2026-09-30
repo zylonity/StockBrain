@@ -16,16 +16,21 @@ import sqlalchemy as sa
 from stockbrain.config import Settings
 from stockbrain.db.base import utcnow
 from stockbrain.db.models.companies import Company
+from stockbrain.db.models.news_history import NewsHistoryArticle
+from stockbrain.db.models.proposals import TradeProposal
+from stockbrain.db.models.research import ResearchRun, Thesis
 from stockbrain.db.models.sources import Source
-from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic, Notification
+from stockbrain.db.models.system import DiscoveryQuery, DiscoveryTopic, Job, Notification
 from stockbrain.enums import (
     EventStatus,
     ExtractionMethod,
     JobType,
     NotificationEvent,
     NotificationStatus,
+    ProposalStatus,
     ProviderCallKind,
     ProviderStatus,
+    ResearchStatus,
     WebDiscoveryKind,
     WebDiscoveryProviderName,
 )
@@ -40,6 +45,12 @@ from stockbrain.extraction.base import ExtractionFailure, ExtractionResult
 from stockbrain.ingestion.provider_budget import estimate_firecrawl_scrape_credits
 from stockbrain.ingestion.service import IngestionOutcome
 from stockbrain.ingestion.web_search import WebSearchQuery, to_raw_document
+from stockbrain.intelligence.news_history import (
+    BackfillLimits,
+    BarsProvider,
+    NewsBackfillClient,
+    NewsHistoryCache,
+)
 from stockbrain.jobs.notifications import enqueue_pipeline_notification
 from stockbrain.jobs.registry import HandlerContext, JobRegistry
 from stockbrain.logging import get_logger
@@ -54,7 +65,137 @@ __all__ = [
     "register_ingestion_handlers",
 ]
 
-from stockbrain.intelligence.research_service import RETRYABLE_RESEARCH_ERRORS
+from stockbrain.intelligence.research_service import (
+    NEWS_CACHE_POSITION_TRIGGER,
+    NEWS_CACHE_REASSESSMENT_TRIGGER,
+    NEWS_OUTCOME_BACKFILL_JOB,
+    NEWS_OUTCOME_REASSESSMENT_VERSION,
+    RETRYABLE_RESEARCH_ERRORS,
+    advisory_triggers,
+)
+
+
+async def handle_news_outcome_backfill(context: HandlerContext) -> None:
+    """Fill one bounded historical window, then request one versioned reassessment."""
+    from stockbrain.ingestion.alpaca_news import AlpacaNewsClient
+    from stockbrain.market_data.alpaca import AlpacaMarketDataClient
+
+    news = AlpacaNewsClient(context.services.settings)
+    bars = AlpacaMarketDataClient(context.services.settings)
+    try:
+        await run_news_outcome_backfill(context, news=news, bars=bars)
+    finally:
+        await news.aclose()
+        await bars.aclose()
+
+
+async def run_news_outcome_backfill(
+    context: HandlerContext, *, news: NewsBackfillClient, bars: BarsProvider
+) -> None:
+    """The provider-agnostic body of :func:`handle_news_outcome_backfill`."""
+    symbol = str(context.payload["symbol"]).upper()
+    company_id = uuid.UUID(str(context.payload["company_id"]))
+    start = dt.datetime.fromisoformat(str(context.payload["start"]))
+    end = dt.datetime.fromisoformat(str(context.payload["end"]))
+    if (
+        start.tzinfo is None
+        or end.tzinfo is None
+        or end <= start
+        or end - start > dt.timedelta(days=14)
+    ):
+        raise ValueError("news outcome backfill window must be aware and at most 14 days")
+    if context.payload.get("version") != NEWS_OUTCOME_REASSESSMENT_VERSION:
+        raise ValueError("unknown news outcome backfill version")
+    async with context.database.session() as session:
+        company = await session.get(Company, company_id)
+        if company is None or company.primary_symbol != symbol:
+            raise ValueError("historical backfill company/symbol identity changed")
+
+    cache = NewsHistoryCache(context.database)
+    limits = BackfillLimits(max_days=14, max_articles=500, max_bar_pages=15, max_requests=15)
+    article_report = await cache.backfill_news(
+        start=start, end=end, symbols=(symbol,), limits=limits, client=news
+    )
+    stock_report = await cache.backfill_candles(
+        symbol=symbol, start=start, end=end, limits=limits, provider=bars
+    )
+    benchmark_report = await cache.backfill_candles(
+        symbol="SPY", start=start, end=end, limits=limits, provider=bars
+    )
+    if any(report.partial for report in (article_report, stock_report, benchmark_report)):
+        log.warning("news_outcome_backfill_partial", symbol=symbol, start=start.isoformat())
+        raise RuntimeError("news outcome backfill incomplete; inspect auditable coverage")
+    async with context.database.session() as session:
+        has_articles = await session.scalar(
+            sa.select(NewsHistoryArticle.id)
+            .where(
+                NewsHistoryArticle.company_id == company_id,
+                NewsHistoryArticle.published_at >= start,
+                NewsHistoryArticle.published_at <= end,
+            )
+            .limit(1)
+        )
+    if has_articles is None:
+        return
+    research = context.services.research
+    if research is None:
+        return
+    # Multiple live articles may have arrived while one company/window job was
+    # pending. Each prior thesis gets at most one deterministic versioned rerun.
+    async with context.database.transaction() as session:
+        job = await session.get(Job, context.job_id, with_for_update=True)
+        latest_payload = job.payload if job is not None else context.payload
+        affected_ids = [
+            uuid.UUID(str(value)) for value in latest_payload.get("affected_run_ids", [])
+        ]
+        rows = (
+            await session.execute(
+                sa.select(ResearchRun, Thesis)
+                .join(Thesis, Thesis.research_run_id == ResearchRun.id)
+                .where(
+                    ResearchRun.id.in_(affected_ids),
+                    ResearchRun.company_id == company_id,
+                    ResearchRun.status == ResearchStatus.SUCCEEDED,
+                    ResearchRun.trigger == "EVENT",
+                    ResearchRun.impact_id.is_not(None),
+                )
+            )
+        ).all()
+        for previous_run, thesis in rows:
+            rerun_id = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{NEWS_OUTCOME_REASSESSMENT_VERSION}:{previous_run.id}:{start.isoformat()}:{end.isoformat()}",
+            )
+            filled = bool(
+                await session.scalar(
+                    sa.select(TradeProposal.id)
+                    .where(
+                        TradeProposal.thesis_id == thesis.id,
+                        TradeProposal.status.in_(
+                            (
+                                ProposalStatus.EXECUTED,
+                                ProposalStatus.EXECUTING,
+                                ProposalStatus.EXECUTION_AMBIGUOUS,
+                            )
+                        ),
+                    )
+                    .limit(1)
+                )
+            )
+            assert previous_run.impact_id is not None
+            new_id = await research.request(
+                session,
+                previous_run.impact_id,
+                rerun_id=rerun_id,
+                as_of=utcnow(),
+                previous_thesis_id=thesis.id,
+            )
+            new_run = await session.get(ResearchRun, new_id)
+            if new_run is not None:
+                new_run.trigger = (
+                    NEWS_CACHE_POSITION_TRIGGER if filled else NEWS_CACHE_REASSESSMENT_TRIGGER
+                )
+
 
 log = get_logger(__name__)
 
@@ -1106,6 +1247,8 @@ def register_ingestion_handlers(
     registry.register(JobType.CONTENT_EXTRACT.value, handle_content_extract)
     registry.register(JobType.SEC_REFRESH.value, handle_sec_refresh)
     registry.register("ALPACA_NEWS_BACKFILL", handle_alpaca_backfill)
+    if research_available:
+        registry.register(NEWS_OUTCOME_BACKFILL_JOB, handle_news_outcome_backfill)
     if classifier_available:
         registry.register(JobType.CLASSIFY_EVENT.value, handle_classify_event)
     if instrument_sync_available:
@@ -1164,4 +1307,22 @@ async def handle_run_research(context: HandlerContext) -> None:
     # dying worker.
     proposals = getattr(context.services, "proposals", None)
     if proposals is not None:
+        async with context.database.session() as session:
+            row = await session.get(ResearchRun, run_id)
+            trigger = row.trigger if row else None
+            succeeded = bool(row and row.status == ResearchStatus.SUCCEEDED)
+        exits_enabled = bool(
+            getattr(
+                getattr(context.services, "settings", None),
+                "news_catalyst_exit_proposals_enabled",
+                False,
+            )
+        )
+        if not succeeded or trigger in advisory_triggers(exits_enabled):
+            return
+        if trigger == NEWS_CACHE_REASSESSMENT_TRIGGER:
+            # The new thesis supersedes the pending proposal before another
+            # proposal is created. Market revalidation and normal risk checks
+            # remain in ProposalService's existing flow.
+            await proposals.sweep()
         await proposals.enqueue_for_run(run_id)
