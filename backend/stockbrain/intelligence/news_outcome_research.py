@@ -24,6 +24,7 @@ from stockbrain.db.models.proposals import TradeProposal
 from stockbrain.db.models.sources import Event, EventSourceLink, Source
 from stockbrain.db.session import Database
 from stockbrain.intelligence.news_outcome_validation import (
+    SESSION_ZONE,
     DeadlineEvidence,
     HistoricalEvent,
     assess_failed_reaction,
@@ -31,13 +32,21 @@ from stockbrain.intelligence.news_outcome_validation import (
 )
 from stockbrain.intelligence.research import ResearchDatum, ResearchPacket
 from stockbrain.market_data.base import Bar
-from stockbrain.market_data.news_outcomes import NewsOutcomeInputs, compute_news_outcome
+from stockbrain.market_data.news_outcomes import (
+    ConfoundingPolicy,
+    NewsOutcomeInputs,
+    compute_news_outcome,
+    regular_session_bars,
+)
 
 MAX_CANDIDATES = 24
 MAX_EXAMPLES = 8
 MIN_SUMMARY_SAMPLES = 10
 BENCHMARK_SYMBOL = "SPY"
 MAX_BARS_PER_SERIES = 20_000
+#: Cached candidates must be at least this old, so 1d/5d outcomes can exist;
+#: otherwise a busy name's 24 most recent stories are all still unresolved.
+COMPLETED_WINDOW_LOOKBACK = dt.timedelta(days=8)
 
 
 def _bar(row: NewsHistoryCandle) -> Bar:
@@ -128,7 +137,7 @@ class NewsOutcomeResearchProvider:
         ).all()
         if len(rows) > MAX_BARS_PER_SERIES:
             raise ValueError("candle_window_truncated")
-        return [_bar(row) for row in rows]
+        return regular_session_bars([_bar(row) for row in rows])
 
     async def context(self, packet: ResearchPacket) -> tuple[ResearchDatum, ...]:
         data = await self._cohort_context(packet)
@@ -233,7 +242,9 @@ class NewsOutcomeResearchProvider:
                         NewsHistoryArticle.event_id.is_not(None),
                         NewsHistoryArticle.event_id != packet.event_id,
                         NewsHistoryArticle.published_at.is_not(None),
-                        NewsHistoryArticle.published_at < packet.event_time,
+                        # Old enough for the five-session window to have closed.
+                        NewsHistoryArticle.published_at
+                        < packet.event_time - COMPLETED_WINDOW_LOOKBACK,
                         NewsHistoryArticle.observed_at <= packet.as_of,
                         NewsHistoryArticle.ingested_at <= packet.as_of,
                         NewsHistoryArticle.event_type == event_type,
@@ -252,7 +263,9 @@ class NewsOutcomeResearchProvider:
                             NewsHistoryArticle.event_id.is_not(None),
                             NewsHistoryArticle.event_id != packet.event_id,
                             NewsHistoryArticle.published_at.is_not(None),
-                            NewsHistoryArticle.published_at < packet.event_time,
+                            # Old enough for the five-session window to have closed.
+                            NewsHistoryArticle.published_at
+                            < packet.event_time - COMPLETED_WINDOW_LOOKBACK,
                             NewsHistoryArticle.observed_at <= packet.as_of,
                             NewsHistoryArticle.ingested_at <= packet.as_of,
                         )
@@ -350,6 +363,10 @@ class NewsOutcomeResearchProvider:
             missing_anchor: dt.datetime | None = None
             stats: dict[str, list[Decimal]] = {"pre_entry_alpha": [], "1h": [], "1d": [], "5d": []}
             excluded: Counter[str] = Counter()
+            confounded: Counter[str] = Counter()
+            # Stories entering on the same session share one market path, so
+            # they are not independent observations.
+            sessions: dict[str, set[dt.date | None]] = {name: set() for name in stats}
             candidate_rows: list[tuple[Event, list[NewsHistoryArticle] | None]] = []
             for event_id, articles in cached_candidates:
                 event = await session.get(Event, event_id)
@@ -475,6 +492,10 @@ class NewsOutcomeResearchProvider:
                         instrument_currency=packet.company.currency,
                         benchmark_currency="USD",
                         spread_bps=Decimal("10"),
+                        # Measured and counted rather than dropped: a busy
+                        # name has later company news inside almost every
+                        # daily window, and excluding it would leave nothing.
+                        confounding_policy=ConfoundingPolicy.FLAG,
                         confounding_publications=tuple(
                             moment
                             for moment in (*confounding, *cached_confounding)
@@ -501,8 +522,14 @@ class NewsOutcomeResearchProvider:
                 if outcome.status.value != "OK":
                     excluded[f"outcome_{outcome.status.value.lower()}"] += 1
                 move = outcome.publication_to_entry.market_relative_return
+                entry_session = (
+                    outcome.entry.timestamp.astimezone(SESSION_ZONE).date()
+                    if outcome.entry is not None
+                    else None
+                )
                 if move is not None:
                     stats["pre_entry_alpha"].append(move)
+                    sessions["pre_entry_alpha"].add(entry_session)
                 values: dict[str, str | None] = {}
                 for name in ("1h", "1d", "5d"):
                     horizon = outcome.horizon(name)
@@ -511,6 +538,9 @@ class NewsOutcomeResearchProvider:
                         excluded[f"{name}_{horizon.status.value.lower()}"] += 1
                     if value is not None:
                         stats[name].append(value)
+                        sessions[name].add(entry_session)
+                        if horizon is not None and horizon.confounded:
+                            confounded[name] += 1
                     values[name] = str(value) if value is not None else None
                 if len(examples) < MAX_EXAMPLES:
                     examples.append(
@@ -544,19 +574,19 @@ class NewsOutcomeResearchProvider:
                         }
                     )
 
-        summary = {
-            name: {
-                "n": len(values),
-                "positive": sum(value > 0 for value in values),
-                "flat": sum(value == 0 for value in values),
-                "negative": sum(value < 0 for value in values),
-                "median": str(_median(values)) if len(values) >= MIN_SUMMARY_SAMPLES else None,
-                "mean": str(sum(values, Decimal(0)) / len(values))
-                if len(values) >= MIN_SUMMARY_SAMPLES
-                else None,
+        summary = {}
+        for name, found in stats.items():
+            independent = len(sessions[name]) >= MIN_SUMMARY_SAMPLES
+            summary[name] = {
+                "n": len(found),
+                "distinct_entry_sessions": len(sessions[name]),
+                "with_later_company_news": confounded[name],
+                "positive": sum(value > 0 for value in found),
+                "flat": sum(value == 0 for value in found),
+                "negative": sum(value < 0 for value in found),
+                "median": str(_median(found)) if independent else None,
+                "mean": str(sum(found, Decimal(0)) / len(found)) if independent else None,
             }
-            for name, values in stats.items()
-        }
         deadline = derive_catalyst_deadline(
             deadline_events,
             buffer_sessions=self.deadline_buffer_sessions,
@@ -569,7 +599,7 @@ class NewsOutcomeResearchProvider:
                     "status": "descriptive_only",
                     "as_of": packet.as_of.isoformat(),
                     "evidence_weight": "contextual"
-                    if len(stats["1d"]) >= MIN_SUMMARY_SAMPLES
+                    if len(sessions["1d"]) >= MIN_SUMMARY_SAMPLES
                     and match == "same_company_and_event_type"
                     else "sparse_or_loose_give_little_or_no_weight",
                     "match": match,
@@ -590,6 +620,7 @@ class NewsOutcomeResearchProvider:
                     "limitations": [
                         "selected_and_sparse_news_sample",
                         "SPY_is_not_sector_or_currency_matched",
+                        "later_company_news_can_drive_windows_see_with_later_company_news",
                         "not_a_trading_signal",
                     ],
                 },

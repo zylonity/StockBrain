@@ -51,9 +51,17 @@ def months_ago(moment: dt.datetime, count: int) -> dt.datetime:
     return moment.replace(year=year, month=month, day=day)
 
 
-async def run_validation_coverage(database: Database, *, as_of: dt.datetime) -> dict[str, Any]:
-    """Count cached rows and failed windows without implying performance results."""
+async def run_validation_coverage(
+    database: Database, *, as_of: dt.datetime, imported_by: dt.datetime | None = None
+) -> dict[str, Any]:
+    """Count cached rows and failed windows without implying performance results.
+
+    ``as_of`` fixes the 24-month window; ``imported_by`` (default ``as_of``)
+    bounds what the cache had imported. An offline report run after its window
+    passes the run time, since the history is necessarily imported later.
+    """
     start, split = months_ago(as_of, 24), months_ago(as_of, 6)
+    cutoff = imported_by or as_of
     rows: dict[str, dict[str, Any]] = {}
     async with database.session() as session:
         for symbol in (*REGISTERED_UNIVERSE, BENCHMARK):
@@ -67,7 +75,7 @@ async def run_validation_coverage(database: Database, *, as_of: dt.datetime) -> 
                         NewsHistoryArticle.symbols.contains([symbol]),
                         NewsHistoryArticle.published_at >= lower,
                         NewsHistoryArticle.published_at < upper,
-                        NewsHistoryArticle.ingested_at <= as_of,
+                        NewsHistoryArticle.ingested_at <= cutoff,
                     )
                 )
                 events = await session.scalar(
@@ -76,7 +84,7 @@ async def run_validation_coverage(database: Database, *, as_of: dt.datetime) -> 
                         NewsHistoryArticle.published_at >= lower,
                         NewsHistoryArticle.published_at < upper,
                         NewsHistoryArticle.event_id.is_not(None),
-                        NewsHistoryArticle.ingested_at <= as_of,
+                        NewsHistoryArticle.ingested_at <= cutoff,
                     )
                 )
                 candles = await session.scalar(
@@ -85,7 +93,7 @@ async def run_validation_coverage(database: Database, *, as_of: dt.datetime) -> 
                         NewsHistoryCandle.timeframe == "1Min",
                         NewsHistoryCandle.bar_start >= lower,
                         NewsHistoryCandle.bar_start < upper,
-                        NewsHistoryCandle.ingested_at <= as_of,
+                        NewsHistoryCandle.ingested_at <= cutoff,
                     )
                 )
                 periods[name] = {
@@ -96,7 +104,7 @@ async def run_validation_coverage(database: Database, *, as_of: dt.datetime) -> 
                 }
             coverage = await session.scalar(
                 sa.select(NewsHistoryCoverage).where(
-                    NewsHistoryCoverage.dataset == "candles",
+                    NewsHistoryCoverage.dataset == DATASET_CANDLES,
                     NewsHistoryCoverage.scope_key == symbol,
                 )
             )
@@ -104,7 +112,7 @@ async def run_validation_coverage(database: Database, *, as_of: dt.datetime) -> 
                 await session.scalars(
                     sa.select(NewsHistoryBackfillRun).where(
                         NewsHistoryBackfillRun.scope_key == symbol,
-                        NewsHistoryBackfillRun.started_at <= as_of,
+                        NewsHistoryBackfillRun.started_at <= cutoff,
                         NewsHistoryBackfillRun.status.in_(("FAILED", "PARTIAL")),
                     )
                 )
@@ -124,7 +132,7 @@ async def run_validation_coverage(database: Database, *, as_of: dt.datetime) -> 
                     }
                     if coverage is not None
                     and coverage.last_attempt_at
-                    and coverage.last_attempt_at <= as_of
+                    and coverage.last_attempt_at <= cutoff
                     else {"status": "unknown_at_as_of"}
                 ),
                 "failed_or_partial_runs": [

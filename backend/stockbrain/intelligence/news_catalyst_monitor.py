@@ -37,6 +37,7 @@ from stockbrain.intelligence.research_service import (
     ResearchService,
 )
 from stockbrain.logging import get_logger
+from stockbrain.market_data.news_outcomes import REGULAR_SESSION_CLOSE, REGULAR_SESSION_OPEN
 
 NY = ZoneInfo("America/New_York")
 FILL_KEYS = ("filledAt", "filled_at", "fillTimestamp", "fill_timestamp", "executionTime")
@@ -103,7 +104,13 @@ def _decimal(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
-def _completed_session_dates(bars: list[NewsHistoryCandle]) -> set[dt.date]:
+def _completed_session_dates(bars: list[NewsHistoryCandle], now: dt.datetime) -> set[dt.date]:
+    """Dates whose regular session has closed: a regular close bar, or a past day.
+
+    A past day counts even without a 16:00 bar, so an early-close session is
+    not silently skipped (which would extend the deadline).
+    """
+    today = now.astimezone(NY).date()
     latest: dict[dt.date, dt.datetime] = {}
     for bar in bars:
         local = bar.bar_start.astimezone(NY)
@@ -111,7 +118,9 @@ def _completed_session_dates(bars: list[NewsHistoryCandle]) -> set[dt.date]:
         finish = (bar.bar_start + dt.timedelta(minutes=1)).astimezone(NY)
         if date not in latest or finish > latest[date]:
             latest[date] = finish
-    return {date for date, finish in latest.items() if finish.time() >= dt.time(16, 0)}
+    return {
+        date for date, finish in latest.items() if date < today or finish.time() >= dt.time(16, 0)
+    }
 
 
 class CatalystMonitor:
@@ -294,8 +303,8 @@ class CatalystMonitor:
                     item.measurement_status = "deadline_data_stale"
                     continue
                 stock, market = await self._bars(session, item.market_symbol, item.entry_at, now)
-                stock_dates = _completed_session_dates(stock)
-                market_dates = _completed_session_dates(market)
+                stock_dates = _completed_session_dates(stock, now)
+                market_dates = _completed_session_dates(market, now)
                 entry_date = item.entry_at.astimezone(NY).date()
                 completed = sorted(date for date in stock_dates & market_dates if date > entry_date)
                 if len(completed) < item.deadline_sessions_after_entry:
@@ -373,7 +382,16 @@ class CatalystMonitor:
                     .limit(15_000)
                 )
             ).all()
-            result.append(list(rows))
+            # Regular session only: the close is 16:00, not a thin 19:59 print.
+            result.append(
+                [
+                    row
+                    for row in rows
+                    if REGULAR_SESSION_OPEN
+                    <= row.bar_start.astimezone(NY).time()
+                    < REGULAR_SESSION_CLOSE
+                ]
+            )
         return result[0], result[1]
 
     @staticmethod

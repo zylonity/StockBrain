@@ -1,0 +1,149 @@
+{
+  "current_headline": "NVIDIA's Jensen Huang Says Declaration Agreed At White House Has A Lot Of Teeth",
+  "event_time": "2026-09-29 21:16:50+00:00",
+  "as_of": "2026-09-30 22:32:02.056780+00:00",
+  "datum": {
+    "status": "descriptive_only",
+    "as_of": "2026-09-30T22:32:02.056780+00:00",
+    "evidence_weight": "sparse_or_loose_give_little_or_no_weight",
+    "match": "same_company_event_type_unverified_loose",
+    "candidate_events": 24,
+    "missing_window_anchor": null,
+    "excluded": {
+      "1h_session_gap": 1
+    },
+    "cache_coverage": {
+      "NVDA": {
+        "status": "recorded",
+        "covered_start": "2024-09-30T00:00:00+00:00",
+        "covered_end": "2026-09-30T00:00:00+00:00",
+        "detail": null
+      },
+      "SPY": {
+        "status": "recorded",
+        "covered_start": "2024-09-30T00:00:00+00:00",
+        "covered_end": "2026-09-30T00:00:00+00:00",
+        "detail": null
+      }
+    },
+    "summary": {
+      "pre_entry_alpha": {
+        "n": 24,
+        "distinct_entry_sessions": 6,
+        "with_later_company_news": 0,
+        "positive": 15,
+        "flat": 0,
+        "negative": 9,
+        "median": null,
+        "mean": null
+      },
+      "1h": {
+        "n": 23,
+        "distinct_entry_sessions": 6,
+        "with_later_company_news": 6,
+        "positive": 13,
+        "flat": 0,
+        "negative": 10,
+        "median": null,
+        "mean": null
+      },
+      "1d": {
+        "n": 24,
+        "distinct_entry_sessions": 6,
+        "with_later_company_news": 24,
+        "positive": 24,
+        "flat": 0,
+        "negative": 0,
+        "median": null,
+        "mean": null
+      },
+      "5d": {
+        "n": 24,
+        "distinct_entry_sessions": 6,
+        "with_later_company_news": 24,
+        "positive": 24,
+        "flat": 0,
+        "negative": 0,
+        "median": null,
+        "mean": null
+      }
+    },
+    "catalyst_deadline_evidence": {
+      "threshold": "0.01",
+      "sample_size": 0,
+      "responders": 0,
+      "nonresponses": 0,
+      "unknown": 0,
+      "response_quantile_sessions": null,
+      "buffer_sessions": 1,
+      "deadline_sessions_after_entry": null,
+      "reason": "sparse_comparable_history"
+    },
+    "examples": [
+      {
+        "date": "2026-09-21",
+        "event_type": null,
+        "headline": "Iambic Therapeutics Announces IPO Of Common Stock; Applies To List Common Stock On NASDAQ Global Select Market Under Sym",
+        "articles_grouped": 1,
+        "actual_live_received_at": null,
+        "cache_imported_at": "2026-09-30T22:15:36.638111+00:00",
+        "entry_timing": "simulated_publication_plus_5m",
+        "entry_delay_minutes": 1009.1,
+        "pre_entry_alpha": "-0.00224348",
+        "post_entry_alpha_net": {
+          "1h": "0.00550784",
+          "1d": "0.00103114",
+          "5d": "0.01346805"
+        },
+        "status": "OK",
+        "flags": []
+      },
+      {
+        "date": "2026-09-21",
+        "event_type": null,
+        "headline": "Nvidia To Acquire $1.5B Of SB Energy's Class N Common Shares; To Invest $3B In Total In SB Energy",
+        "articles_grouped": 1,
+        "actual_live_received_at": null,
+        "cache_imported_at": "2026-09-30T22:15:36.638111+00:00",
+        "entry_timing": "simulated_publication_plus_5m",
+        "entry_delay_minutes": 0.7,
+        "pre_entry_alpha": "0.00022280",
+        "post_entry_alpha_net": {
+          "1h": "0.00128676",
+          "1d": "0.00823613",
+          "5d": "0.01851262"
+        },
+        "status": "OK",
+        "flags": []
+      },
+      {
+        "date": "2026-09-21",
+        "event_type": null,
+        "headline": "Scott Bessent Says AI Companies Must Take Responsibility, Rejects Calls for Federal Liability Shield: \u2018It Is Humans Who ",
+        "articles_grouped": 1,
+        "actual_live_received_at": null,
+        "cache_imported_at": "2026-09-30T22:15:36.638111+00:00",
+        "entry_timing": "simulated_publication_plus_5m",
+        "entry_delay_minutes": 0.9,
+        "pre_entry_alpha": "-0.00199976",
+        "post_entry_alpha_net": {
+          "1h": "-0.00412457",
+          "1d": "0.01051634",
+          "5d": "0.02086247"
+        },
+        "status": "OK",
+        "flags": []
+      }
+    ],
+    "cost_assumptions": {
+      "stock_round_trip_spread_proxy_bps": "10",
+      "fx": "unavailable_without_historical_rates"
+    },
+    "limitations": [
+      "selected_and_sparse_news_sample",
+      "SPY_is_not_sector_or_currency_matched",
+      "later_company_news_can_drive_windows_see_with_later_company_news",
+      "not_a_trading_signal"
+    ]
+  }
+}

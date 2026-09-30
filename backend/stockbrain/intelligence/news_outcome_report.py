@@ -30,6 +30,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
 from statistics import median
@@ -52,7 +53,8 @@ from stockbrain.intelligence.news_outcome_validation import (
     THRESHOLDS,
     HistoricalEvent,
     compare_deadline_exit_to_hold,
-    derive_catalyst_deadline,
+    deadline_from_observations,
+    deadline_observation,
     threshold_timing,
 )
 from stockbrain.market_data.base import Bar
@@ -61,10 +63,12 @@ from stockbrain.market_data.news_outcomes import (
     NewsOutcomeInputs,
     OutcomeStatus,
     compute_news_outcome,
+    regular_session_bars,
 )
 
 DELAYS_MINUTES = (1, 5, 15, 60)
 PRIMARY_DELAY = 5
+DEADLINE_THRESHOLD = Decimal("0.01")
 HORIZONS = ("1h", "1d", "5d")
 SPREAD_BPS = Decimal("10")
 ROUND_TRIP_COST = SPREAD_BPS / Decimal(10_000)
@@ -137,10 +141,18 @@ def _wilson(positive: int, total: int) -> tuple[str, str] | None:
     return (f"{max(0.0, centre - margin):.3f}", f"{min(1.0, centre + margin):.3f}")
 
 
-def _distribution(values: Sequence[Decimal], unavailable: int) -> dict[str, Any]:
+def _distribution(
+    values: Sequence[Decimal], unavailable: int, sessions: int | None = None
+) -> dict[str, Any]:
+    """Counts always; statistics only with enough *independent* entry sessions.
+
+    Stories entering on the same session share one market path, so ``sessions``
+    (distinct entry sessions) rather than the story count gates the statistics.
+    """
     positive = sum(value > 0 for value in values)
     usable = len(values)
-    sparse = usable < MIN_COHORT
+    independent = usable if sessions is None else sessions
+    sparse = independent < MIN_COHORT
     ordered = sorted(values)
 
     def quantile(q: float) -> str | None:
@@ -154,6 +166,7 @@ def _distribution(values: Sequence[Decimal], unavailable: int) -> dict[str, Any]
 
     return {
         "usable": usable,
+        "distinct_entry_sessions": independent,
         "unavailable": unavailable,
         "positive": positive,
         "flat": sum(value == 0 for value in values),
@@ -206,6 +219,7 @@ async def _load_series(
         )
         for row in rows
     ]
+    bars = regular_session_bars(bars)
     return _Series(bars, [bar.timestamp for bar in bars])
 
 
@@ -287,12 +301,55 @@ def _relative_at_session_close(item: HistoricalEvent, sessions_after_entry: int)
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class _Measure:
+    """One event at one simulated arrival delay, reduced to what is aggregated."""
+
+    status: str
+    prior_move: Decimal | None
+    net: dict[str, Decimal | None]
+    confounded_1d: bool
+    entry_session: dt.date | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Row:
+    event_id: str
+    symbol: str
+    published_at: dt.datetime
+    kind: str
+    measures: dict[int, _Measure]
+    #: Primary delay only: threshold label -> (status, phase, clock s, trading s).
+    timing: dict[str, tuple[str, str, int | None, int | None]]
+    #: Primary delay only: +1% entry-basis response for deadline derivation.
+    deadline_observation: int | str
+    #: Primary delay only: market-relative return at the close of session k.
+    relative_at_close: tuple[Decimal | None, ...]
+
+
+def _measure(item: HistoricalEvent) -> _Measure:
+    net: dict[str, Decimal | None] = {}
+    confounded = False
+    for name in HORIZONS:
+        result = item.outcome.horizon(name)
+        ok = result is not None and result.status is OutcomeStatus.OK
+        net[name] = result.market_relative_return_net if ok and result is not None else None
+        if name == "1d" and ok and result is not None:
+            confounded = result.confounded
+    entry = item.outcome.entry
+    return _Measure(
+        item.outcome.status.value,
+        item.outcome.publication_to_entry.market_relative_return,
+        net,
+        confounded,
+        entry.timestamp.astimezone(SESSION_ZONE).date() if entry is not None else None,
+    )
+
+
 def _evaluate(
     events: list[_Event], stock: _Series, market: _Series, as_of: dt.datetime
-) -> dict[int, list[tuple[_Event, HistoricalEvent]]]:
-    results: dict[int, list[tuple[_Event, HistoricalEvent]]] = {
-        delay: [] for delay in DELAYS_MINUTES
-    }
+) -> list[_Row]:
+    rows: list[_Row] = []
     publications = [event.published_at for event in events]
     for event in events:
         start = event.published_at - dt.timedelta(days=4)
@@ -300,13 +357,14 @@ def _evaluate(
         stock_bars = stock.window(start, end)
         market_bars = market.window(start, end)
         confounders = tuple(
-            moment
-            for moment in publications[
+            publications[
                 bisect.bisect_right(publications, event.published_at) : bisect.bisect_right(
                     publications, end
                 )
             ]
         )
+        measures: dict[int, _Measure] = {}
+        primary: HistoricalEvent | None = None
         for delay in DELAYS_MINUTES:
             outcome = compute_news_outcome(
                 NewsOutcomeInputs(
@@ -323,70 +381,90 @@ def _evaluate(
                     confounding_policy=ConfoundingPolicy.FLAG,
                 )
             )
-            results[delay].append(
-                (
-                    event,
-                    HistoricalEvent(
-                        canonical_id=event.event_id,
-                        symbol=event.symbol,
-                        event_type=event.kind,
-                        published_at=event.published_at,
-                        # Simulated arrival, labelled as such in the report.
-                        live_received_at=event.published_at + dt.timedelta(minutes=delay),
-                        outcome=outcome,
-                        stock_bars=stock_bars,
-                        benchmark_bars=market_bars,
-                        article_count=event.articles,
-                    ),
-                )
+            item = HistoricalEvent(
+                canonical_id=event.event_id,
+                symbol=event.symbol,
+                event_type=event.kind,
+                published_at=event.published_at,
+                # Simulated arrival, labelled as such in the report.
+                live_received_at=event.published_at + dt.timedelta(minutes=delay),
+                outcome=outcome,
+                stock_bars=stock_bars,
+                benchmark_bars=market_bars,
+                article_count=event.articles,
             )
-    return results
+            measures[delay] = _measure(item)
+            if delay == PRIMARY_DELAY:
+                primary = item
+        assert primary is not None
+        timing = {}
+        for threshold in THRESHOLDS:
+            found = threshold_timing(primary, threshold, basis="publication")
+            timing[f"+{threshold * 100}%"] = (
+                found.status,
+                found.phase,
+                found.clock_seconds,
+                found.trading_seconds,
+            )
+        rows.append(
+            _Row(
+                event.event_id,
+                event.symbol,
+                event.published_at,
+                event.kind,
+                measures,
+                timing,
+                deadline_observation(primary, DEADLINE_THRESHOLD),
+                tuple(_relative_at_session_close(primary, k) for k in range(6)),
+            )
+        )
+    return rows
 
 
-def _period_report(rows: list[tuple[_Event, HistoricalEvent]]) -> dict[str, Any]:
+def _period_report(rows: Sequence[_Row], delay: int = PRIMARY_DELAY) -> dict[str, Any]:
     status: Counter[str] = Counter()
     confounded = 0
-    horizon_values: dict[str, list[Decimal]] = {name: [] for name in HORIZONS}
-    horizon_unavailable: Counter[str] = Counter()
-    for _event, item in rows:
-        status[item.outcome.status.value] += 1
+    values: dict[str, list[Decimal]] = {name: [] for name in HORIZONS}
+    sessions: dict[str, set[dt.date | None]] = {name: set() for name in HORIZONS}
+    unavailable: Counter[str] = Counter()
+    for row in rows:
+        measure = row.measures[delay]
+        status[measure.status] += 1
+        confounded += int(measure.confounded_1d)
         for name in HORIZONS:
-            result = item.outcome.horizon(name)
-            if (
-                result is None
-                or result.status is not OutcomeStatus.OK
-                or result.market_relative_return_net is None
-            ):
-                horizon_unavailable[name] += 1
+            value = measure.net[name]
+            if value is None:
+                unavailable[name] += 1
             else:
-                horizon_values[name].append(result.market_relative_return_net)
-                confounded += int(name == "1d" and result.confounded)
+                values[name].append(value)
+                sessions[name].add(measure.entry_session)
     return {
         "events": len(rows),
         "entry_status": dict(status),
         "one_day_windows_with_later_company_news": confounded,
         "net_market_relative": {
-            name: _distribution(values, horizon_unavailable[name])
-            for name, values in horizon_values.items()
+            name: _distribution(found, unavailable[name], len(sessions[name]))
+            for name, found in values.items()
         },
     }
 
 
-def _timing_report(rows: list[tuple[_Event, HistoricalEvent]]) -> dict[str, Any]:
+def _timing_report(rows: Sequence[_Row]) -> dict[str, Any]:
     report: dict[str, Any] = {}
     for threshold in THRESHOLDS:
-        phases: Counter[str] = Counter()
+        label = f"+{threshold * 100}%"
+        outcomes: Counter[str] = Counter()
         clock: list[int] = []
         trading: list[int] = []
-        for _event, item in rows:
-            timing = threshold_timing(item, threshold, basis="publication")
-            phases[timing.phase if timing.status == "crossed" else timing.status] += 1
-            if timing.clock_seconds is not None:
-                clock.append(timing.clock_seconds)
-            if timing.trading_seconds is not None:
-                trading.append(timing.trading_seconds)
-        report[f"+{threshold * 100}%"] = {
-            "outcomes": dict(phases),
+        for row in rows:
+            status, phase, clock_seconds, trading_seconds = row.timing[label]
+            outcomes[phase if status == "crossed" else status] += 1
+            if clock_seconds is not None:
+                clock.append(clock_seconds)
+            if trading_seconds is not None:
+                trading.append(trading_seconds)
+        report[label] = {
+            "outcomes": dict(outcomes),
             "median_clock_minutes_to_cross": round(median(clock) / 60, 1)
             if len(clock) >= MIN_COHORT
             else None,
@@ -398,17 +476,21 @@ def _timing_report(rows: list[tuple[_Event, HistoricalEvent]]) -> dict[str, Any]
     return report
 
 
-def _arrival_cohorts(rows: list[tuple[_Event, HistoricalEvent]]) -> dict[str, Any]:
+def _arrival_cohorts(rows: Sequence[_Row], delay: int) -> dict[str, Any]:
     """All events at this simulated arrival, bucketed by the move already made."""
     buckets: dict[str, dict[str, list[Decimal]]] = {
         label: {name: [] for name in HORIZONS} for label, _low, _high in PRIOR_MOVE_BUCKETS
     }
     unavailable: dict[str, Counter[str]] = {
-        label: Counter() for label, _l, _h in PRIOR_MOVE_BUCKETS
+        label: Counter() for label, _low, _high in PRIOR_MOVE_BUCKETS
+    }
+    sessions: dict[str, dict[str, set[dt.date | None]]] = {
+        label: {name: set() for name in HORIZONS} for label, _low, _high in PRIOR_MOVE_BUCKETS
     }
     unknown_prior = 0
-    for _event, item in rows:
-        move = item.outcome.publication_to_entry.market_relative_return
+    for row in rows:
+        measure = row.measures[delay]
+        move = measure.prior_move
         if move is None:
             unknown_prior += 1
             continue
@@ -418,20 +500,17 @@ def _arrival_cohorts(rows: list[tuple[_Event, HistoricalEvent]]) -> dict[str, An
             if (low is None or move > low) and (high is None or move <= high)
         )
         for name in HORIZONS:
-            result = item.outcome.horizon(name)
-            if (
-                result is None
-                or result.status is not OutcomeStatus.OK
-                or result.market_relative_return_net is None
-            ):
+            value = measure.net[name]
+            if value is None:
                 unavailable[label][name] += 1
             else:
-                buckets[label][name].append(result.market_relative_return_net)
+                buckets[label][name].append(value)
+                sessions[label][name].add(measure.entry_session)
     return {
         "prior_move_unknown": unknown_prior,
         "buckets": {
             label: {
-                name: _distribution(values, unavailable[label][name])
+                name: _distribution(values, unavailable[label][name], len(sessions[label][name]))
                 for name, values in horizons.items()
             }
             for label, horizons in buckets.items()
@@ -440,9 +519,7 @@ def _arrival_cohorts(rows: list[tuple[_Event, HistoricalEvent]]) -> dict[str, An
 
 
 def _deadline_exit_test(
-    exploration: list[tuple[_Event, HistoricalEvent]],
-    validation: list[tuple[_Event, HistoricalEvent]],
-    buffer_sessions: int,
+    exploration: Sequence[_Row], validation: Sequence[_Row], buffer_sessions: int
 ) -> dict[str, Any]:
     """Derive deadlines on exploration only; test exit-vs-hold on validation.
 
@@ -451,12 +528,13 @@ def _deadline_exit_test(
     threshold exits; otherwise it holds to five sessions. Both legs carry one
     round-trip cost.
     """
-    by_type: dict[str, list[HistoricalEvent]] = defaultdict(list)
-    for _event, item in exploration:
-        by_type[item.event_type].append(item)
     report: dict[str, Any] = {}
-    for kind in sorted({item.event_type for _e, item in validation} | set(by_type)):
-        evidence = derive_catalyst_deadline(by_type.get(kind, []), buffer_sessions=buffer_sessions)
+    for kind in sorted({row.kind for row in (*exploration, *validation)}):
+        evidence = deadline_from_observations(
+            [row.deadline_observation for row in exploration if row.kind == kind],
+            threshold=DEADLINE_THRESHOLD,
+            buffer_sessions=buffer_sessions,
+        )
         entry: dict[str, Any] = {
             "exploration_sample": evidence.sample_size,
             "exploration_responders": evidence.responders,
@@ -469,19 +547,23 @@ def _deadline_exit_test(
         if deadline is not None:
             pairs: list[tuple[Decimal, Decimal]] = []
             exits = 0
-            for _event, item in validation:
-                if item.event_type != kind:
+            for row in validation:
+                if row.kind != kind:
                     continue
-                hold = item.outcome.horizon("5d")
-                at_deadline = _relative_at_session_close(item, deadline)
-                if hold is None or hold.market_relative_return_net is None or at_deadline is None:
+                hold = row.measures[PRIMARY_DELAY].net["5d"]
+                at_deadline = (
+                    row.relative_at_close[deadline]
+                    if deadline < len(row.relative_at_close)
+                    else None
+                )
+                if hold is None or (deadline < 5 and at_deadline is None):
                     continue
-                if deadline >= 5 or at_deadline >= evidence.threshold:
-                    strategy = hold.market_relative_return_net
+                if deadline >= 5 or at_deadline is None or at_deadline >= evidence.threshold:
+                    strategy = hold
                 else:
                     strategy = at_deadline - ROUND_TRIP_COST
                     exits += 1
-                pairs.append((strategy, hold.market_relative_return_net))
+                pairs.append((strategy, hold))
             comparison = compare_deadline_exit_to_hold(pairs)
             entry["validation"] = {
                 "pairs": comparison.sample_size,
@@ -498,57 +580,82 @@ def _deadline_exit_test(
     return report
 
 
+def _symbol_worker(
+    database_url: str, symbol: str, start: dt.datetime, as_of: dt.datetime
+) -> tuple[list[_Row], dict[str, Any]]:
+    """Load and evaluate one symbol in its own process; returns compact rows."""
+
+    async def load() -> tuple[list[_Event], Counter[str], _Series, _Series]:
+        database = Database(Settings(database_url=database_url))
+        try:
+            events, excluded = await _load_events(database, symbol, start, as_of)
+            load_start = start - dt.timedelta(days=5)
+            stock = await _load_series(database, symbol, load_start, as_of)
+            market = await _load_series(database, BENCHMARK, load_start, as_of)
+        finally:
+            await database.dispose()
+        return events, excluded, stock, market
+
+    events, excluded, stock, market = asyncio.run(load())
+    rows = _evaluate(events, stock, market, as_of)
+    meta = {
+        "events": len(events),
+        "excluded": dict(excluded),
+        "minute_bars": len(stock.bars),
+        "first_bar": stock.bars[0].timestamp.isoformat() if stock.bars else None,
+        "last_bar": stock.bars[-1].timestamp.isoformat() if stock.bars else None,
+    }
+    return rows, meta
+
+
 async def build_report(
-    database: Database, *, as_of: dt.datetime, buffer_sessions: int = 1
+    database_url: str, *, as_of: dt.datetime, buffer_sessions: int = 1, workers: int = 10
 ) -> dict[str, Any]:
     start, split = months_ago(as_of, 24), months_ago(as_of, 6)
-    load_start = start - dt.timedelta(days=5)
-    market = await _load_series(database, BENCHMARK, load_start, as_of)
+    loop = asyncio.get_running_loop()
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        results = await asyncio.gather(
+            *(
+                loop.run_in_executor(pool, _symbol_worker, database_url, symbol, start, as_of)
+                for symbol in REGISTERED_UNIVERSE
+            )
+        )
     per_symbol: dict[str, Any] = {}
-    pooled: dict[str, dict[int, list[tuple[_Event, HistoricalEvent]]]] = {
-        "exploration": defaultdict(list),
-        "validation": defaultdict(list),
-    }
+    pooled: dict[str, list[_Row]] = {"exploration": [], "validation": []}
     pooled_ids: set[str] = set()
-    for symbol in REGISTERED_UNIVERSE:
-        events, excluded = await _load_events(database, symbol, start, as_of)
-        stock = await _load_series(database, symbol, load_start, as_of)
-        evaluated = _evaluate(events, stock, market, as_of)
-        primary = evaluated[PRIMARY_DELAY]
+    for symbol, (rows, meta) in zip(REGISTERED_UNIVERSE, results, strict=True):
         per_symbol[symbol] = {
-            "events": len(events),
-            "excluded": dict(excluded),
-            "minute_bars": len(stock.bars),
-            "first_bar": stock.bars[0].timestamp.isoformat() if stock.bars else None,
-            "last_bar": stock.bars[-1].timestamp.isoformat() if stock.bars else None,
-            "exploration": _period_report([row for row in primary if row[0].published_at < split]),
-            "validation": _period_report([row for row in primary if row[0].published_at >= split]),
+            **meta,
+            "exploration": _period_report([row for row in rows if row.published_at < split]),
+            "validation": _period_report([row for row in rows if row.published_at >= split]),
         }
         # An event tagged with two or three universe tickers is pooled once,
         # under the first symbol that reaches it; per-symbol sections keep it.
-        fresh = {event.event_id for event in events} - pooled_ids
-        pooled_ids.update(fresh)
-        for delay, rows in evaluated.items():
-            for row in rows:
-                if row[0].event_id not in fresh:
-                    continue
-                period = "exploration" if row[0].published_at < split else "validation"
-                pooled[period][delay].append(row)
+        for row in rows:
+            if row.event_id in pooled_ids:
+                continue
+            pooled_ids.add(row.event_id)
+            pooled["exploration" if row.published_at < split else "validation"].append(row)
     periods: dict[str, Any] = {}
-    for period, by_delay in pooled.items():
-        primary_rows = by_delay[PRIMARY_DELAY]
+    for period, rows in pooled.items():
         periods[period] = {
-            "overall": _period_report(primary_rows),
+            "overall": _period_report(rows),
             "by_headline_type": {
-                kind: _period_report([row for row in primary_rows if row[0].kind == kind])
-                for kind in sorted({row[0].kind for row in primary_rows})
+                kind: _period_report([row for row in rows if row.kind == kind])
+                for kind in sorted({row.kind for row in rows})
             },
-            "time_to_first_move_from_publication": _timing_report(primary_rows),
+            "time_to_first_move_from_publication": _timing_report(rows),
             "arrival_cohorts_by_delay_minutes": {
-                str(delay): _arrival_cohorts(rows) for delay, rows in sorted(by_delay.items())
+                str(delay): _arrival_cohorts(rows, delay) for delay in DELAYS_MINUTES
             },
         }
-    coverage = await run_validation_coverage(database, as_of=as_of)
+    database = Database(Settings(database_url=database_url))
+    try:
+        coverage = await run_validation_coverage(
+            database, as_of=as_of, imported_by=dt.datetime.now(dt.UTC)
+        )
+    finally:
+        await database.dispose()
     return {
         "as_of": as_of.isoformat(),
         "window_start": start.isoformat(),
@@ -565,12 +672,12 @@ async def build_report(
             "fx": "not applied; all instruments and benchmark are USD",
             "event_type": "headline keyword rule; not the live classifier",
             "min_cohort_for_statistics": MIN_COHORT,
+            "deadline_threshold": str(DEADLINE_THRESHOLD),
+            "deadline_buffer_sessions": buffer_sessions,
         },
         "periods": periods,
         "deadline_exit_vs_hold": _deadline_exit_test(
-            pooled["exploration"][PRIMARY_DELAY],
-            pooled["validation"][PRIMARY_DELAY],
-            buffer_sessions,
+            pooled["exploration"], pooled["validation"], buffer_sessions
         ),
         "per_symbol": per_symbol,
         "coverage": coverage["symbols"],
@@ -585,11 +692,7 @@ def _aware(value: str) -> dt.datetime:
 
 
 async def _main(args: argparse.Namespace) -> None:
-    database = Database(Settings(database_url=args.database_url))
-    try:
-        report = await build_report(database, as_of=args.as_of)
-    finally:
-        await database.dispose()
+    report = await build_report(args.database_url, as_of=args.as_of)
     print(json.dumps(report, indent=2, default=str))  # noqa: T201
 
 

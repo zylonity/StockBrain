@@ -663,3 +663,23 @@ def test_an_aggregate_remains_research_only_at_the_minimum_sample() -> None:
     assert day.samples == 1
     assert day.mean_market_relative_return_net == Decimal("0.06")
     assert day.hit_rate == Decimal("1")
+
+
+def test_regular_session_bars_drop_extended_hours() -> None:
+    from stockbrain.market_data.news_outcomes import regular_session_bars
+
+    day = dt.date(2026, 9, 29)  # New York is UTC-4.
+    stamps = [
+        dt.datetime.combine(day, time, dt.UTC)
+        for time in (
+            dt.time(8, 0),
+            dt.time(13, 29),
+            dt.time(13, 30),
+            dt.time(19, 59),
+            dt.time(20, 0),
+        )
+    ]
+    one = Decimal(1)
+    bars = [Bar("AAPL", stamp, one, one, one, one, 1) for stamp in stamps]
+    kept = [bar.timestamp.time() for bar in regular_session_bars(bars)]
+    assert kept == [dt.time(13, 30), dt.time(19, 59)]

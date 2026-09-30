@@ -56,3 +56,10 @@ def test_relative_move_at_a_later_session_close_uses_aligned_bars() -> None:
     )
     assert _relative_at_session_close(shifted, 1) == Decimal("0.02")
     assert _relative_at_session_close(shifted, 2) is None
+
+
+def test_same_session_stories_do_not_count_as_independent_evidence() -> None:
+    """Twenty stories entering on two sessions are two observations, not twenty."""
+    result = _distribution([Decimal("0.01")] * 20, unavailable=0, sessions=2)
+    assert result["usable"] == 20 and result["distinct_entry_sessions"] == 2
+    assert result["sparse"] is True and result["median_net"] is None

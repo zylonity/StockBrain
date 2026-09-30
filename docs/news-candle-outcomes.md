@@ -41,10 +41,8 @@ The offline validation functions live in
 `stockbrain.intelligence.news_outcome_validation`. They consume cached,
 deduplicated event outcomes and aligned bars only; they do not query a vendor,
 make a trading decision, or write to a live store. The held-out six months
-must be reported separately, including a zero-coverage result if the local
-test cache is empty. The current checkout has no verified 24-month cached
-dataset, so numerical performance claims remain unavailable pending a
-bounded local backfill.
+must be reported separately. The first full run is
+[`reports/news-outcomes-2026-09-30.md`](reports/news-outcomes-2026-09-30.md).
 
 This first version gives research a dated, descriptive cohort of earlier news for
 the same resolved company and event type. If no exact type match exists, it can
@@ -148,6 +146,19 @@ reference entry price, so they are not actual fill-to-sale P&L.
   depends on broker payload timestamps and coverage of closed outcomes.
 
 ## Live research with cached outcomes
+
+Measurement rules shared by the live packet and the offline report:
+
+- Only regular-session bars (09:30–16:00 ET) are used. Consolidated feeds
+  also carry thin 04:00–20:00 prints, which would make the "session close" a
+  post-market bar and trip the gap checks.
+- Cached candidates must be at least eight days older than the live story,
+  so 1d and 5d windows can have closed.
+- Later company news inside a window is measured and counted
+  (`with_later_company_news`), not dropped. A busy name has such news in
+  almost every daily window.
+- Medians, means and "contextual" weight require at least ten **distinct
+  entry sessions**, not ten stories. Same-day stories share one price path.
 
 With `NEWS_OUTCOME_PACKET_ENABLED=true` each research run reads the cache
 (database only, bounded to 24 candidates / 20,000 bars per series) and adds one

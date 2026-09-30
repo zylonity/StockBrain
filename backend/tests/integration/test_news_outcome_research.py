@@ -88,7 +88,8 @@ class _BackfillBars:
 
 async def test_public_backfill_reaches_packet_without_live_impacts(clean_tables: Database) -> None:
     value = await seed(clean_tables)
-    publication = dt.datetime(2026, 9, 1, 14, tzinfo=dt.UTC)
+    # Older than the eight-day completed-window lookback before the live event.
+    publication = dt.datetime(2026, 8, 20, 14, tzinfo=dt.UTC)
     import_time = dt.datetime(2026, 9, 30, 12, tzinfo=dt.UTC)
     async with clean_tables.transaction() as session:
         current = await session.get(Event, value.event_id)

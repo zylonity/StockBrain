@@ -261,44 +261,40 @@ def comparable_entry_cohort(
     )
 
 
-def derive_catalyst_deadline(
-    events: Sequence[HistoricalEvent],
+def deadline_observation(item: HistoricalEvent, threshold: Decimal) -> int | str:
+    """One event's response: sessions after entry to the crossing, or a status.
+
+    Returns ``"not_reached"`` for an observed nonresponse over a complete
+    five-session window and ``"unknown"`` when the window cannot say.
+    """
+    five_day = item.outcome.horizon("5d")
+    if five_day is None or five_day.status is not OutcomeStatus.OK:
+        return "unknown"
+    timing = threshold_timing(item, threshold, basis="entry")
+    if timing.status == "crossed" and timing.first_at and item.outcome.entry:
+        entry_date = item.outcome.entry.timestamp.astimezone(SESSION_ZONE).date()
+        crossing_date = timing.first_at.astimezone(SESSION_ZONE).date()
+        dates = {bar.timestamp.astimezone(SESSION_ZONE).date() for bar in item.stock_bars}
+        return sum(entry_date < date <= crossing_date for date in dates)
+    if timing.status == "not_reached":
+        return "not_reached"
+    return "unknown"
+
+
+def deadline_from_observations(
+    observations: Sequence[int | str],
     *,
     threshold: Decimal = Decimal("0.01"),
     buffer_sessions: int = 1,
     minimum_samples: int = MIN_COHORT,
     response_fraction: Decimal = Decimal("0.75"),
 ) -> DeadlineEvidence:
-    """Return a session count only when enough *all-event* evidence responds.
-
-    Nonresponses enter the denominator. An unknown observation cannot be
-    counted as a failure or as a response. The deadline is fixed at entry.
-    """
+    """Aggregate deduplicated :func:`deadline_observation` results."""
     if buffer_sessions < 0 or not Decimal(0) < response_fraction <= Decimal(1):
         raise ValueError("invalid deadline parameters")
-    seen: set[str] = set()
-    response_sessions: list[int] = []
-    nonresponses = unknown = 0
-    for item in events:
-        if item.canonical_id in seen:
-            continue
-        seen.add(item.canonical_id)
-        five_day = item.outcome.horizon("5d")
-        if five_day is None or five_day.status is not OutcomeStatus.OK:
-            unknown += 1
-            continue
-        timing = threshold_timing(item, threshold, basis="entry")
-        if timing.status == "crossed" and timing.first_at and item.outcome.entry:
-            entry_date = item.outcome.entry.timestamp.astimezone(SESSION_ZONE).date()
-            crossing_date = timing.first_at.astimezone(SESSION_ZONE).date()
-            dates = sorted(
-                {bar.timestamp.astimezone(SESSION_ZONE).date() for bar in item.stock_bars}
-            )
-            response_sessions.append(sum(entry_date < date <= crossing_date for date in dates))
-        elif timing.status == "not_reached":
-            nonresponses += 1
-        else:
-            unknown += 1
+    response_sessions = [value for value in observations if isinstance(value, int)]
+    nonresponses = sum(value == "not_reached" for value in observations)
+    unknown = len(observations) - len(response_sessions) - nonresponses
     sample_size = len(response_sessions) + nonresponses
     reason: str | None = None
     quantile: int | None = None
@@ -322,6 +318,37 @@ def derive_catalyst_deadline(
         buffer_sessions,
         quantile + buffer_sessions if quantile is not None else None,
         reason,
+    )
+
+
+def derive_catalyst_deadline(
+    events: Sequence[HistoricalEvent],
+    *,
+    threshold: Decimal = Decimal("0.01"),
+    buffer_sessions: int = 1,
+    minimum_samples: int = MIN_COHORT,
+    response_fraction: Decimal = Decimal("0.75"),
+) -> DeadlineEvidence:
+    """Return a session count only when enough *all-event* evidence responds.
+
+    Nonresponses enter the denominator. An unknown observation cannot be
+    counted as a failure or as a response. The deadline is fixed at entry.
+    """
+    if buffer_sessions < 0 or not Decimal(0) < response_fraction <= Decimal(1):
+        raise ValueError("invalid deadline parameters")
+    seen: set[str] = set()
+    observations: list[int | str] = []
+    for item in events:
+        if item.canonical_id in seen:
+            continue
+        seen.add(item.canonical_id)
+        observations.append(deadline_observation(item, threshold))
+    return deadline_from_observations(
+        observations,
+        threshold=threshold,
+        buffer_sessions=buffer_sessions,
+        minimum_samples=minimum_samples,
+        response_fraction=response_fraction,
     )
 
 

@@ -79,6 +79,8 @@ __all__ = [
     "HORIZON_DAY_5",
     "HORIZON_HOUR_1",
     "MIN_SIGNAL_SAMPLES",
+    "REGULAR_SESSION_CLOSE",
+    "REGULAR_SESSION_OPEN",
     "ConfoundingPolicy",
     "EventOutcome",
     "HorizonAggregate",
@@ -92,6 +94,7 @@ __all__ = [
     "aggregate_outcomes",
     "compute_news_outcome",
     "detect_split_discontinuities",
+    "regular_session_bars",
 ]
 
 #: The default publication-to-entry latency: how long after the news a trade
@@ -168,6 +171,26 @@ def _safe_return(entry: Decimal, exit_: Decimal) -> Decimal | None:
     if not entry.is_finite() or not exit_.is_finite() or entry <= 0 or exit_ <= 0:
         return None
     return _quantize(exit_ / entry - Decimal(1))
+
+
+REGULAR_SESSION_OPEN = dt.time(9, 30)
+REGULAR_SESSION_CLOSE = dt.time(16, 0)
+
+
+def regular_session_bars(bars: Sequence[Bar], tz: ZoneInfo | None = None) -> list[Bar]:
+    """Only bars that start inside the regular US session (09:30-16:00 local).
+
+    Consolidated feeds also carry 04:00-20:00 extended-hours bars. Those are
+    thin, gappy and not what a session close means, so outcome windows use the
+    regular session: pre-market news enters at the open, and the move already
+    made by then is reported as the publication-to-entry move.
+    """
+    zone = tz or ZoneInfo(DEFAULT_SESSION_TIMEZONE)
+    return [
+        bar
+        for bar in bars
+        if REGULAR_SESSION_OPEN <= bar.timestamp.astimezone(zone).time() < REGULAR_SESSION_CLOSE
+    ]
 
 
 def _require_aware(moment: dt.datetime, label: str) -> None:
@@ -589,6 +612,9 @@ def detect_split_discontinuities(
         if previous.close <= 0:
             continue
         ratio = current.open / previous.close
+        # Any factor match inside this band is rejected below, so skip the loop.
+        if Decimal(1) / min_ratio < ratio < min_ratio:
+            continue
         for factor in _SPLIT_FACTORS:
             if abs(ratio - factor) / factor > tolerance:
                 continue
@@ -624,6 +650,8 @@ class _Context:
     confounders: tuple[dt.datetime, ...]
     policy: ConfoundingPolicy
     calendar: tuple[dt.date, ...]
+    stock_sessions: dict[dt.date, list[Bar]]
+    benchmark_sessions: dict[dt.date, list[Bar]]
 
 
 def _fx_rate_at(context: _Context, instant: dt.datetime) -> Decimal | None:
@@ -695,8 +723,12 @@ def _has_gap(bars: Sequence[Bar], interval: dt.timedelta, max_gap: dt.timedelta)
     return False
 
 
-def _session_bars(bars: Sequence[Bar], date: dt.date, tz: ZoneInfo) -> list[Bar]:
-    return [bar for bar in bars if _session_date(bar.timestamp, tz) == date]
+def _sessions(bars: Sequence[Bar], tz: ZoneInfo) -> dict[dt.date, list[Bar]]:
+    """Bars grouped by session date, in input order; computed once per outcome."""
+    grouped: dict[dt.date, list[Bar]] = {}
+    for bar in bars:
+        grouped.setdefault(_session_date(bar.timestamp, tz), []).append(bar)
+    return grouped
 
 
 def _calendar(stock: Sequence[Bar], benchmark: Sequence[Bar], tz: ZoneInfo) -> tuple[dt.date, ...]:
@@ -959,8 +991,7 @@ def _compute_session_horizon(
     missing_sessions = [
         date
         for date in required
-        if not _session_bars(context.stock, date, context.tz)
-        or not _session_bars(context.benchmark, date, context.tz)
+        if not context.stock_sessions.get(date) or not context.benchmark_sessions.get(date)
     ]
     if missing_sessions:
         return _unavailable_horizon(
@@ -974,8 +1005,8 @@ def _compute_session_horizon(
             session_date=target_date,
         )
 
-    stock_session = _session_bars(context.stock, target_date, context.tz)
-    benchmark_session = _session_bars(context.benchmark, target_date, context.tz)
+    stock_session = context.stock_sessions.get(target_date, [])
+    benchmark_session = context.benchmark_sessions.get(target_date, [])
     if _has_gap(stock_session, context.interval, context.max_intraday_gap) or _has_gap(
         benchmark_session, context.interval, context.max_intraday_gap
     ):
@@ -1239,6 +1270,8 @@ def compute_news_outcome(inputs: NewsOutcomeInputs) -> EventOutcome:
         ),
         policy=inputs.confounding_policy,
         calendar=_calendar(stock, benchmark, tz),
+        stock_sessions=_sessions(stock, tz),
+        benchmark_sessions=_sessions(benchmark, tz),
     )
 
     if inputs.published_at > inputs.as_of:
