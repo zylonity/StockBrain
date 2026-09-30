@@ -104,6 +104,9 @@ async def test_concurrent_generators_cannot_oversubscribe_one_account_currency_b
     service, fx, _ = await setup(
         clean_tables, account, listing, cash=Decimal("1000"), cap=Decimal("800")
     )
+    # This case measures reservation arithmetic with the entire cash balance
+    # usable. Buy-cost headroom is covered separately by the risk-engine tests.
+    service.config = replace(service.config, buy_cash_buffer_pct=Decimal("0"))
     results = await asyncio.gather(service.generate(ph.THESIS_ID), service.generate(SECOND_THESIS))
     assert all(result.created for result in results), "both the full and remaining cash are usable"
     async with clean_tables.session() as session:
@@ -115,6 +118,24 @@ async def test_concurrent_generators_cannot_oversubscribe_one_account_currency_b
         == actual
     )
     assert fx.calls == (0 if account == listing else 2)
+
+
+async def test_pending_buy_counts_toward_open_position_limit(clean_tables: Database) -> None:
+    service, _, _ = await setup(
+        clean_tables, "USD", "USD", cash=Decimal("1000"), cap=Decimal("100")
+    )
+    service.config = replace(service.config, max_open_positions=1)
+    results = await asyncio.gather(service.generate(ph.THESIS_ID), service.generate(SECOND_THESIS))
+    assert sum(result.created for result in results) == 1
+    blocked = next(result for result in results if not result.created)
+    assert blocked.evaluation_id is not None
+    async with clean_tables.session() as session:
+        evaluation = await session.get(RiskEvaluation, blocked.evaluation_id)
+    assert evaluation is not None
+    assert any(
+        rule["rule_id"] == "max_open_positions" and rule["outcome"] == "BLOCK"
+        for rule in evaluation.rules
+    )
 
 
 @pytest.mark.parametrize("account,listing", [("USD", "GBP"), ("GBP", "USD")])

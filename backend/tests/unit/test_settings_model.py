@@ -25,6 +25,7 @@ _SETTINGS = Settings(
     stockbrain_secret_key="unit-test-signing-key",
     telegram_bot_token="1234:super-secret-bot-token",
     t212_api_key="t212-secret-key",
+    alpaca_api_key="",
     web_owner_password_hash="scrypt$1$2$3$deadbeef",
 )
 

@@ -18,6 +18,7 @@ from stockbrain.db.session import Database
 from stockbrain.enums import (
     Broker,
     OrderSide,
+    ProposalStatus,
     RiskOutcome,
     RuleOutcome,
     ThesisAction,
@@ -246,6 +247,41 @@ class ProposalEvaluator:
                 config=self.config,
                 exclude_ticker=context.identity.broker_ticker,
             )
+        recent_sell_at = None
+        if self.config.reentry_cooldown_hours and context.action in EXPOSURE_INCREASING_ACTIONS:
+            recent_sell_at = await session.scalar(
+                sa.select(sa.func.max(TradeProposal.executed_at)).where(
+                    TradeProposal.broker == self.broker,
+                    TradeProposal.account_id == context.account_id,
+                    TradeProposal.broker_environment == self.settings.t212_env.value,
+                    TradeProposal.broker_ticker == context.identity.broker_ticker,
+                    TradeProposal.side == OrderSide.SELL,
+                    TradeProposal.status == ProposalStatus.EXECUTED,
+                    TradeProposal.executed_at <= now,
+                )
+            )
+        pending_new_positions = 0
+        if self.config.max_open_positions and context.action in EXPOSURE_INCREASING_ACTIONS:
+            conditions = [
+                TradeProposal.broker == self.broker,
+                TradeProposal.account_id == context.account_id,
+                TradeProposal.broker_environment == self.settings.t212_env.value,
+                TradeProposal.side == OrderSide.BUY,
+                TradeProposal.status.in_(EXPOSURE_RESERVING_STATUSES),
+            ]
+            if proposal is not None:
+                conditions.append(TradeProposal.id != proposal.id)
+            pending_tickers = set(
+                await session.scalars(
+                    sa.select(TradeProposal.broker_ticker).where(*conditions).distinct()
+                )
+            )
+            held_tickers = {
+                ticker
+                for ticker, held in (facts.account.positions.items() if facts.account else ())
+                if held.quantity > ZERO
+            }
+            pending_new_positions = len(pending_tickers - held_tickers)
         reduce_fraction = context.reduce_fraction
         if proposal is not None and context.action is ThesisAction.REDUCE:
             # Re-evaluating an existing trim: the envelope a sell must fit is
@@ -268,6 +304,8 @@ class ProposalEvaluator:
                 quote_missing_reason=facts.quote_reason,
                 calibration=calibration,
                 other_holding_weights=other_weights,
+                recent_sell_at=recent_sell_at,
+                pending_new_positions=pending_new_positions,
                 reduce_fraction=reduce_fraction,
             ),
             now=now,

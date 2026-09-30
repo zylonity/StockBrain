@@ -16,11 +16,12 @@ import datetime as dt
 import pytest
 import sqlalchemy as sa
 
-from stockbrain.db.models.proposals import RiskEvaluation
+from stockbrain.db.models.proposals import RiskEvaluation, TradeProposal
 from stockbrain.db.models.research import Thesis
+from stockbrain.db.models.sources import Event
 from stockbrain.db.models.system import Job
 from stockbrain.db.session import Database
-from stockbrain.enums import ThesisAction
+from stockbrain.enums import OrderSide, ProposalStatus, ThesisAction
 from stockbrain.telegram.preferences import NotificationPreferences
 from tests import proposal_helpers as ph
 
@@ -38,6 +39,33 @@ async def test_a_closed_market_block_is_recorded_as_deferred(clean_tables: Datab
     async with clean_tables.session() as session:
         evaluation = (await session.execute(sa.select(RiskEvaluation))).scalar_one()
     assert evaluation.deferred is True
+
+
+async def test_recent_filled_sale_defers_a_new_buy_in_the_same_account(
+    clean_tables: Database,
+) -> None:
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.9)
+    await ph.fund(clean_tables)
+    service = ph.service(clean_tables, risk_reentry_cooldown_hours=24)
+    first = await service.generate(ph.THESIS_ID)
+    assert first.created
+    async with clean_tables.transaction() as session:
+        await session.execute(
+            sa.update(TradeProposal).values(
+                side=OrderSide.SELL,
+                status=ProposalStatus.EXECUTED,
+                executed_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=1),
+            )
+        )
+    retried = await service.generate(ph.THESIS_ID)
+    assert not retried.created and retried.evaluation_id is not None
+    async with clean_tables.session() as session:
+        evaluation = await session.get(RiskEvaluation, retried.evaluation_id)
+    assert evaluation is not None and evaluation.deferred
+    assert any(
+        rule["rule_id"] == "reentry_cooldown" and rule["outcome"] == "BLOCK"
+        for rule in evaluation.rules
+    )
 
 
 async def test_a_deferred_thesis_is_retried_after_the_ttl_and_not_before(
@@ -82,6 +110,63 @@ async def test_deferral_gives_up_after_the_age_limit(clean_tables: Database) -> 
     async with clean_tables.session() as session:
         evaluation = (await session.execute(sa.select(RiskEvaluation))).scalar_one()
     assert evaluation.deferred is False
+
+
+async def test_old_event_cannot_generate_a_new_buy(clean_tables: Database) -> None:
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.9)
+    await ph.fund(clean_tables)
+    async with clean_tables.transaction() as session:
+        await session.execute(
+            sa.update(Event)
+            .where(Event.id == ph.EVENT_ID)
+            .values(event_time=dt.datetime.now(dt.UTC) - dt.timedelta(hours=73))
+        )
+    market_data = ph.StubMarketData()
+    result = await ph.service(clean_tables, market_data=market_data).generate(ph.THESIS_ID)
+    assert not result.created and result.evaluation_id is not None
+    assert market_data.quote_calls == 0
+    async with clean_tables.session() as session:
+        evaluation = await session.get(RiskEvaluation, result.evaluation_id)
+    assert evaluation is not None and not evaluation.deferred
+    assert evaluation.rules[0]["rule_id"] == "entry_signal_age"
+    assert evaluation.rules[0]["outcome"] == "BLOCK"
+
+
+async def test_old_thesis_cannot_generate_a_new_buy(clean_tables: Database) -> None:
+    await ph.seed(clean_tables, action=ThesisAction.BUY, confidence=0.9)
+    await ph.fund(clean_tables)
+    async with clean_tables.transaction() as session:
+        await session.execute(
+            sa.update(Thesis)
+            .where(Thesis.id == ph.THESIS_ID)
+            .values(created_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=73))
+        )
+    result = await ph.service(clean_tables).generate(ph.THESIS_ID)
+    assert not result.created and result.evaluation_id is not None
+    async with clean_tables.session() as session:
+        evaluation = await session.get(RiskEvaluation, result.evaluation_id)
+    assert evaluation is not None
+    assert evaluation.rules[0]["rule_id"] == "entry_signal_age"
+
+
+async def test_old_event_does_not_block_a_sell(clean_tables: Database) -> None:
+    await ph.seed(clean_tables, action=ThesisAction.SELL, confidence=0.9)
+    await ph.fund(clean_tables)
+    async with clean_tables.transaction() as session:
+        await session.execute(
+            sa.update(Event)
+            .where(Event.id == ph.EVENT_ID)
+            .values(event_time=dt.datetime.now(dt.UTC) - dt.timedelta(hours=73))
+        )
+    result = await ph.service(clean_tables).generate(ph.THESIS_ID)
+    assert "BUY signal" not in result.reason
+    async with clean_tables.session() as session:
+        evaluations = list((await session.execute(sa.select(RiskEvaluation))).scalars())
+    assert all(
+        rule["rule_id"] != "entry_signal_age"
+        for evaluation in evaluations
+        for rule in evaluation.rules
+    )
 
 
 async def test_a_deferred_block_announces_deferred_and_not_blocked(

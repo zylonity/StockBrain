@@ -109,6 +109,8 @@ def gate_results(inputs: RiskInputs) -> list[RuleResult]:
         _fx_available(inputs),
         _fx_freshness(inputs),
         _current_position(inputs),
+        _max_open_positions(inputs),
+        _reentry_cooldown(inputs),
         _duplicate_or_conflicting_proposal(inputs),
         _max_active_proposals(inputs),
         _reservation_accounting(inputs),
@@ -665,6 +667,64 @@ def _current_position(inputs: RiskInputs) -> RuleResult:
     )
 
 
+def _max_open_positions(inputs: RiskInputs) -> RuleResult:
+    limit = inputs.config.max_open_positions
+    account = inputs.account
+    if inputs.action not in EXPOSURE_INCREASING_ACTIONS or limit == 0 or account is None:
+        return _skipped(
+            "max_open_positions",
+            1,
+            "position-count limit applies only to new buys when enabled",
+            threshold=str(limit),
+        )
+    ticker = inputs.identity.broker_ticker
+    held = account.position(ticker)
+    count = sum(position.quantity > ZERO for position in account.positions.values())
+    committed = count + inputs.pending_new_positions
+    blocked = (held is None or held.quantity <= ZERO) and committed >= limit
+    return RuleResult(
+        rule_id="max_open_positions",
+        rule_version=1,
+        outcome=RuleOutcome.BLOCK if blocked else RuleOutcome.PASS,
+        reason=(
+            f"{count} open and {inputs.pending_new_positions} pending new positions "
+            f"already reach the limit of {limit}; cannot open {ticker}"
+            if blocked
+            else f"{count} open and {inputs.pending_new_positions} pending new positions; "
+            f"this buy stays within the {limit}-position limit"
+        ),
+        observed=str(committed),
+        threshold=str(limit),
+    )
+
+
+def _reentry_cooldown(inputs: RiskInputs) -> RuleResult:
+    hours = inputs.config.reentry_cooldown_hours
+    sold_at = inputs.recent_sell_at
+    if inputs.action not in EXPOSURE_INCREASING_ACTIONS or hours == 0:
+        return _skipped(
+            "reentry_cooldown",
+            1,
+            "cooldown applies only to new buys when enabled",
+            threshold=f"{hours} hours",
+        )
+    elapsed = inputs.now - sold_at if sold_at is not None else None
+    blocked = elapsed is not None and elapsed.total_seconds() < hours * 3600
+    return RuleResult(
+        rule_id="reentry_cooldown",
+        rule_version=1,
+        outcome=RuleOutcome.BLOCK if blocked else RuleOutcome.PASS,
+        reason=(
+            f"last completed sale of {inputs.identity.broker_ticker} was at {sold_at.isoformat()}; "
+            f"wait {hours} hours before buying it again"
+            if blocked and sold_at is not None
+            else "no recent completed sale blocks this buy"
+        ),
+        observed=sold_at.isoformat() if sold_at is not None else None,
+        threshold=f"{hours} hours",
+    )
+
+
 def _duplicate_or_conflicting_proposal(inputs: RiskInputs) -> RuleResult:
     """One live proposal per listing, and never two that disagree.
 
@@ -911,18 +971,26 @@ def notional_caps(inputs: RiskInputs) -> list[NotionalCap]:
 
     # Cash, less the buffer and less what other proposals have already claimed.
     reserve = _pct(total, config.min_cash_reserve_pct)
-    spendable = account.cash_available - reserve - inputs.reserved.notional
+    spendable = account.cash_available - reserve
+    # A market buy may fill above the quote and a cross-currency order also
+    # consumes FX costs. Keep this buffer inside the cash cap so it is checked
+    # again at authorization and immediately before transmission.
+    buffered_spendable = max(
+        ZERO,
+        spendable / (Decimal(1) + config.buy_cash_buffer_pct) - inputs.reserved.notional,
+    )
     caps.append(
         NotionalCap(
             rule_id="min_cash_reserve",
             rule_version=1,
-            limit=max(ZERO, spendable),
+            limit=buffered_spendable,
             observed=str(account.cash_available),
             threshold=str(reserve),
             reason=(
                 f"{account.cash_available} cash available, keeping a {reserve} reserve "
                 f"({config.min_cash_reserve_pct} of portfolio) and honouring "
-                f"{inputs.reserved.notional} already reserved by live proposals"
+                f"{inputs.reserved.notional} already reserved by live proposals, "
+                f"with {config.buy_cash_buffer_pct} extra buy headroom"
             ),
         )
     )

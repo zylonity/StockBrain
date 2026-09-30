@@ -208,6 +208,25 @@ async def test_existing_proposal_constraints_are_shared_with_market_review(
     assert all(rule.outcome is not RuleOutcome.PASS for rule in verdict.blocked)
 
 
+async def test_evaluator_uses_completed_sale_from_database_for_buy_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = h.inputs(risk_config=h.config(reentry_cooldown_hours=24))
+    service = evaluator(inputs)
+    monkeypatch.setattr(service, "_reserved_exposure", AsyncMock(return_value=ReservedExposure()))
+    async with AsyncSession() as session:
+        recent_sale = AsyncMock(return_value=h.NOW - dt.timedelta(hours=2))
+        monkeypatch.setattr(session, "scalar", recent_sale)
+        verdict = await service.evaluate(
+            session,
+            EvaluationContext(inputs.action, inputs.confidence, inputs.identity, "12345"),
+            EvaluationFacts(inputs.account, inputs.quote, inputs.fx, None, None),
+            now=h.NOW,
+        )
+    assert "reentry_cooldown" in verdict.rule_ids
+    assert recent_sale.await_count == 1
+
+
 async def test_a_missing_listing_loads_account_then_fx_without_a_quote_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -478,6 +478,12 @@ class RiskInputs:
     self-adjusting conviction sizing, where a buy's target is its weight's share
     of the whole book rather than a fixed 1/N."""
 
+    recent_sell_at: dt.datetime | None = None
+    """Most recent completed sale of this listing in this account and environment."""
+
+    pending_new_positions: int = 0
+    """Distinct pending buys in listings this account does not yet hold."""
+
     reduce_fraction: Decimal | None = None
     """A REDUCE's fraction of the available position, overriding the configured
     default.  Set by rebalancing, which trims to a computed target."""

@@ -101,7 +101,10 @@ class RiskConfig:
     max_position_pct_of_portfolio: Decimal = Decimal("0.03")
     max_aggregate_exposure_pct: Decimal = Decimal("0.60")
     min_cash_reserve_pct: Decimal = Decimal("0.10")
+    buy_cash_buffer_pct: Decimal = Decimal("0.02")
     min_trade_notional: Decimal = Decimal("20")
+    reentry_cooldown_hours: int = 0
+    max_open_positions: int = 0
 
     sizing_mode: str = "cap"
     """``cap`` (the original): a buy is the smallest cap, times the confidence
@@ -282,7 +285,10 @@ def risk_config_from_settings(settings: Settings) -> RiskConfig:
         max_position_pct_of_portfolio=settings.risk_max_position_pct,
         max_aggregate_exposure_pct=settings.risk_max_aggregate_exposure_pct,
         min_cash_reserve_pct=settings.risk_min_cash_reserve_pct,
+        buy_cash_buffer_pct=settings.risk_buy_cash_buffer_pct,
         min_trade_notional=settings.risk_min_trade_notional,
+        reentry_cooldown_hours=settings.risk_reentry_cooldown_hours,
+        max_open_positions=settings.risk_max_open_positions,
         sizing_mode=settings.risk_sizing_mode,
         target_positions=settings.risk_target_positions,
         conviction_full_confidence=settings.risk_conviction_full_confidence,

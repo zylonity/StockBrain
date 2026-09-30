@@ -894,7 +894,13 @@ class Settings(BaseSettings):
     risk_max_position_pct: Decimal = Decimal("0.03")
     risk_max_aggregate_exposure_pct: Decimal = Decimal("0.60")
     risk_min_cash_reserve_pct: Decimal = Decimal("0.10")
+    risk_buy_cash_buffer_pct: Decimal = Decimal("0.02")
+    """Extra headroom on buys for price movement and currency conversion costs."""
     risk_min_trade_notional: Decimal = Decimal("20")
+    risk_reentry_cooldown_hours: int = Field(default=0, ge=0, le=720)
+    """Block a new buy for this many hours after a filled sale of the listing."""
+    risk_max_open_positions: int = Field(default=0, ge=0, le=1000)
+    """Maximum distinct open listings; zero disables the limit."""
     risk_sizing_mode: Literal["cap", "conviction"] = "cap"
     """``cap``: size each buy as the smallest cap times the confidence factor.
     ``conviction``: size each buy toward a target holding that scales with the
@@ -969,7 +975,7 @@ class Settings(BaseSettings):
     Bounded so the sweep cannot turn into an unmetered market-data spend."""
 
     proposal_deferral_max_hours: int = 72
-    """How long a thesis blocked only by market state keeps being retried.
+    """Maximum age for a new BUY signal and for market-state retries.
 
     A Friday-evening thesis has to survive the weekend, so the default spans
     three days.  Past this the deferral gives up and the block becomes terminal,
@@ -1253,6 +1259,7 @@ class Settings(BaseSettings):
             "RISK_MAX_POSITION_PCT": self.risk_max_position_pct,
             "RISK_MAX_AGGREGATE_EXPOSURE_PCT": self.risk_max_aggregate_exposure_pct,
             "RISK_MIN_CASH_RESERVE_PCT": self.risk_min_cash_reserve_pct,
+            "RISK_BUY_CASH_BUFFER_PCT": self.risk_buy_cash_buffer_pct,
             "RISK_MAX_ACTIVE_PROPOSAL_EXPOSURE_PCT": self.risk_max_active_proposal_exposure_pct,
             "RISK_MAX_REFERENCE_PRICE_DRIFT_PCT": self.risk_max_reference_price_drift_pct,
             "RISK_MAX_EXIT_PRICE_DRIFT_PCT": self.risk_max_exit_price_drift_pct,

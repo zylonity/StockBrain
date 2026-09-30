@@ -127,6 +127,10 @@ class RiskEngine:
                 "quote": inputs.quote.as_dict() if inputs.quote else None,
                 "fx": inputs.fx.as_dict() if inputs.fx else None,
                 "reserved": inputs.reserved.as_dict(),
+                "recent_sell_at": (
+                    inputs.recent_sell_at.isoformat() if inputs.recent_sell_at else None
+                ),
+                "pending_new_positions": inputs.pending_new_positions,
                 "config": inputs.config.as_dict(),
                 "now": inputs.now.isoformat(),
             },

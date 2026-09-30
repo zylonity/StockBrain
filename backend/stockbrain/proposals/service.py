@@ -171,6 +171,7 @@ class _Candidate:
     action: ThesisAction
     confidence: Decimal
     event_id: uuid.UUID | None = None
+    event_time: dt.datetime | None = None
     company_id: uuid.UUID | None = None
 
 
@@ -331,6 +332,52 @@ class ProposalService:
                 reason=action_rule.reason,
                 blocks=(action_rule.reason,),
             )
+
+        # A market-state retry is not the only way an old idea can reach here:
+        # rotation and policy changes can call generate() on an old BUY directly.
+        # Use the older of the event and thesis timestamps, so a recently
+        # researched article about an old event does not get a fresh clock.
+        # Exits remain possible regardless of the opening news's age.
+        if candidate.action is ThesisAction.BUY:
+            signal_at = min(
+                candidate.thesis.created_at,
+                candidate.event_time or candidate.thesis.created_at,
+            )
+            age_hours = max(0.0, (moment - signal_at).total_seconds() / 3600)
+            if age_hours > self.settings.proposal_deferral_max_hours:
+                age_rule = RuleResult(
+                    rule_id="entry_signal_age",
+                    rule_version=1,
+                    outcome=RuleOutcome.BLOCK,
+                    reason=(
+                        f"BUY signal is {age_hours:.1f} hours old; "
+                        f"limit is {self.settings.proposal_deferral_max_hours} hours"
+                    ),
+                    observed=f"{age_hours:.1f}",
+                    threshold=str(self.settings.proposal_deferral_max_hours),
+                )
+                evaluation_id = await self._record_evaluation(
+                    stage=STAGE_GENERATION,
+                    thesis_id=thesis_id,
+                    proposal_id=None,
+                    identity=candidate.identity,
+                    outcome=RiskOutcome.BLOCK,
+                    rules=(age_rule,),
+                    snapshot={
+                        "signal_at": signal_at.isoformat(),
+                        "signal_age_hours": round(age_hours, 1),
+                    },
+                    snapshot_hash=None,
+                    actor="system:generator",
+                    detail=age_rule.reason,
+                )
+                return GenerationResult(
+                    thesis_id=thesis_id,
+                    created=False,
+                    evaluation_id=evaluation_id,
+                    reason=age_rule.reason,
+                    blocks=(age_rule.reason,),
+                )
 
         evaluator = self._evaluator()
         facts = await evaluator.load(
@@ -1203,6 +1250,7 @@ class ProposalService:
         run = await session.get(ResearchRun, thesis.research_run_id)
         if run is None:
             return None
+        event = await session.get(Event, run.event_id) if run.event_id else None
         impact = await session.get(EventCompanyImpact, run.impact_id) if run.impact_id else None
         instrument_id = (
             impact.broker_instrument_id
@@ -1220,6 +1268,7 @@ class ProposalService:
             action=thesis.action,
             confidence=Decimal(str(thesis.confidence)),
             event_id=run.event_id,
+            event_time=event.event_time or event.first_seen_at if event else None,
             company_id=run.company_id,
         )
 

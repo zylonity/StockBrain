@@ -849,6 +849,7 @@ TRANSIENT_RULE_IDS: frozenset[str] = frozenset(
         "account_state_freshness",
         "fx_available",
         "fx_freshness",
+        "reentry_cooldown",
     }
 )
 

@@ -720,7 +720,10 @@ is re-evaluated no more often than `RISK_PROPOSAL_TTL_MINUTES`, and once it is
 older than `PROPOSAL_DEFERRAL_MAX_HOURS` (default `72`, 1–336) the refusal
 becomes final: the next evaluation is announced as `PROPOSAL_BLOCKED`. The
 default outlives a weekend, so a Friday-evening thesis is not discarded before
-Monday's open.
+Monday's open. The same ceiling also blocks a new BUY when the underlying
+event or thesis is already too old, even if risk would otherwise approve it
+(for example, a portfolio rotation that rediscovers an old thesis). It records
+an `entry_signal_age` evaluation; SELL and REDUCE remain unaffected.
 
 `TELEGRAM_DAILY_SUMMARY_TIME` (default `08:00`, UTC `HH:MM`) is when the digest
 is sent. Empty disables it. A restart after the time still sends that day's
@@ -829,6 +832,21 @@ Nothing here touches a broker, a reference price, or an LLM.
 Every threshold is `RESTART_REQUIRED`. There is no write route for settings —
 edit `.env` and restart the process. The values are validated at startup, so an
 impossible policy refuses to start rather than failing open later.
+
+Entry sizing also keeps `RISK_BUY_CASH_BUFFER_PCT` (default `0.02`) of each
+market buy's estimated cost available for price movement and currency
+conversion costs. The buffer covers all active buy proposals together; it is
+separate from `RISK_MIN_CASH_RESERVE_PCT`, which reserves a share of the whole
+portfolio. `RISK_REENTRY_COOLDOWN_HOURS` (default `0`, disabled) can defer a
+new buy after a completed sale of the same listing in the same account and
+broker environment. It never delays a sell. A deferred thesis is retried only
+within `PROPOSAL_DEFERRAL_MAX_HOURS`, so set that window longer than the desired
+cooldown if the same thesis should be reconsidered afterward.
+`RISK_MAX_OPEN_POSITIONS` (default `0`, disabled) blocks a buy in a new listing
+when the account already holds the configured number of names. It still allows
+top-ups in existing holdings and all exits; it does not liquidate positions
+that were open before the limit was lowered. Pending buys in new listings count
+toward the limit, so concurrent proposals cannot open more names than intended.
 
 | Variable | Default | What it means |
 |---|---|---|

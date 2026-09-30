@@ -9,6 +9,7 @@ missing fact fails closed rather than optimistically.
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -25,6 +26,7 @@ from stockbrain.enums import (
 from stockbrain.risk.config import SpreadPolicy
 from stockbrain.risk.engine import RiskEngine
 from stockbrain.risk.models import ReservedExposure
+from stockbrain.risk.rules import notional_caps
 from tests import risk_helpers as h
 
 ENGINE = RiskEngine()
@@ -102,6 +104,60 @@ def test_a_listing_with_no_market_symbol_blocks() -> None:
 def test_a_listing_with_no_company_blocks() -> None:
     decision = ENGINE.evaluate(h.inputs(instrument=h.identity(company_id=None)))
     assert "instrument_identity" in decision.block_rule_ids
+
+
+def test_recent_sale_blocks_reentry_until_cooldown_ends_but_never_blocks_an_exit() -> None:
+    config = h.config(reentry_cooldown_hours=24)
+    sold_at = h.NOW - dt.timedelta(hours=23)
+    recent = replace(h.inputs(risk_config=config), recent_sell_at=sold_at)
+    assert "reentry_cooldown" in ENGINE.evaluate(recent).block_rule_ids
+    assert (
+        "reentry_cooldown"
+        not in ENGINE.evaluate(replace(recent, now=h.NOW + dt.timedelta(hours=1))).block_rule_ids
+    )
+    assert (
+        "reentry_cooldown"
+        not in ENGINE.evaluate(replace(recent, action=ThesisAction.SELL)).block_rule_ids
+    )
+
+
+def test_cash_cap_keeps_extra_headroom_for_market_buy_costs() -> None:
+    inputs = h.inputs(
+        state=h.account(cash=Decimal("100"), total=Decimal("100"), invested=Decimal("0")),
+        risk_config=h.config(
+            min_cash_reserve_pct=Decimal("0"), buy_cash_buffer_pct=Decimal("0.02")
+        ),
+    )
+    cash_cap = next(cap for cap in notional_caps(inputs) if cap.rule_id == "min_cash_reserve")
+    assert cash_cap.limit == Decimal("100") / Decimal("1.02")
+    with_prior_proposal = replace(
+        inputs, reserved=ReservedExposure(count=1, notional=Decimal("50"))
+    )
+    next_cash_cap = next(
+        cap for cap in notional_caps(with_prior_proposal) if cap.rule_id == "min_cash_reserve"
+    )
+    assert next_cash_cap.limit == cash_cap.limit - Decimal("50")
+
+
+def test_position_limit_blocks_only_a_new_name() -> None:
+    config = h.config(max_open_positions=1)
+    other = h.position(ticker="MSFT_US_EQ")
+    new_name = h.inputs(
+        risk_config=config,
+        state=h.account(positions={"MSFT_US_EQ": other}),
+    )
+    assert "max_open_positions" in ENGINE.evaluate(new_name).block_rule_ids
+    held_name = replace(
+        new_name,
+        account=h.account(positions={"AAPL_US_EQ": h.position()}),
+    )
+    assert "max_open_positions" not in ENGINE.evaluate(held_name).block_rule_ids
+    assert (
+        "max_open_positions"
+        not in ENGINE.evaluate(replace(new_name, action=ThesisAction.SELL)).block_rule_ids
+    )
+    pending = replace(new_name, account=h.account(positions={}), pending_new_positions=1)
+    assert "max_open_positions" in ENGINE.evaluate(pending).block_rule_ids
 
 
 @pytest.mark.parametrize("kind", ["WARRANT", "FOREX", "CRYPTOCURRENCY", None])
@@ -583,7 +639,7 @@ def test_the_snapshot_hash_changes_when_any_input_changes() -> None:
     assert base != different
 
 
-def test_the_transient_rule_set_names_only_market_state_rules() -> None:
+def test_the_transient_rule_set_names_only_state_that_can_change() -> None:
     from stockbrain.risk.rules import TRANSIENT_RULE_IDS
 
     assert (
@@ -599,6 +655,7 @@ def test_the_transient_rule_set_names_only_market_state_rules() -> None:
                 "account_state_freshness",
                 "fx_available",
                 "fx_freshness",
+                "reentry_cooldown",
             }
         )
         == TRANSIENT_RULE_IDS

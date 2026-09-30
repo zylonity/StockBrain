@@ -862,11 +862,32 @@ CATALOGUE: tuple[_Group, ...] = (
                 "Cash that may never be spent.",
             ),
             _s(
+                "risk_buy_cash_buffer_pct",
+                "Buy cash buffer",
+                RESTART,
+                "Extra headroom for market price movement and conversion costs.",
+            ),
+            _s(
                 "risk_min_trade_notional",
                 "Minimum trade notional",
                 RESTART,
                 "Below this a trade is not worth its costs.",
                 unit="account currency",
+            ),
+            _s(
+                "risk_reentry_cooldown_hours",
+                "Reentry cooldown",
+                RESTART,
+                "Hours after a completed sale before the same listing may be bought again; "
+                "zero disables it.",
+                unit="hours",
+            ),
+            _s(
+                "risk_max_open_positions",
+                "Maximum open positions",
+                RESTART,
+                "Distinct held and pending new listings allowed; zero disables it.",
+                unit="positions",
             ),
             _s(
                 "risk_allow_fractional_quantity",
@@ -904,10 +925,10 @@ CATALOGUE: tuple[_Group, ...] = (
             ),
             _s(
                 "proposal_deferral_max_hours",
-                "Deferral ceiling",
+                "BUY signal age / deferral ceiling",
                 RESTART,
-                "How long a thesis refused only by market state is re-evaluated at "
-                "each open before the block becomes final.",
+                "Maximum age of the event or thesis for a new BUY; also how long "
+                "a market-state block may be retried. Sells are exempt.",
                 unit="hours",
             ),
             _s(
