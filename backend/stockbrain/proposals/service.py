@@ -43,6 +43,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, Decimal
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -62,6 +63,7 @@ from stockbrain.db.session import Database
 from stockbrain.enums import (
     ActorType,
     AuthorizationSource,
+    BarTimeframe,
     Broker,
     ExecutionPolicy,
     NotificationEvent,
@@ -87,6 +89,7 @@ from stockbrain.jobs.queue import JobQueue
 from stockbrain.logging import get_logger
 from stockbrain.market_data.base import MarketDataProvider
 from stockbrain.observability.metrics import METRICS
+from stockbrain.proposals.entry_quality import headline_entry_problem
 from stockbrain.proposals.evaluation import EvaluationContext, ProposalEvaluator, Revalidation
 from stockbrain.proposals.lifecycle import ProposalLifecycle
 from stockbrain.proposals.quotes import QuoteFetcher
@@ -120,6 +123,7 @@ if TYPE_CHECKING:
 __all__ = ["AuthorizationResult", "GenerationResult", "ProposalService", "Revalidation"]
 
 log = get_logger(__name__)
+_NEW_YORK = ZoneInfo("America/New_York")
 
 STAGE_GENERATION = "GENERATION"
 STAGE_AUTHORIZATION = "AUTHORIZATION"
@@ -174,6 +178,8 @@ class _Candidate:
     event_id: uuid.UUID | None = None
     event_time: dt.datetime | None = None
     company_id: uuid.UUID | None = None
+    event_title: str | None = None
+    event_title_hash: str | None = None
 
 
 class ProposalService:
@@ -199,6 +205,7 @@ class ProposalService:
         self.config = risk_config
         self.account_state = account_state
         self.quotes = QuoteFetcher(market_data)
+        self.market_data = market_data
         # Optional so a same-currency deployment (and a unit test) needs no FX
         # source at all. Absent, the evaluator reports "no provider" for a
         # cross-currency pair, which blocks -- it never falls back to parity.
@@ -389,11 +396,22 @@ class ProposalService:
                     blocks=(age_rule.reason,),
                 )
 
+        if candidate.action is ThesisAction.BUY:
+            async with self.database.session() as session:
+                story_rule = await self._entry_story_rule(session, candidate, moment)
+            if story_rule is not None:
+                return await self._refuse_buy(thesis_id, candidate, story_rule)
+
         evaluator = self._evaluator()
         facts = await evaluator.load(
             candidate.instrument, instrument_currency=candidate.identity.currency, now=moment
         )
         account, quote, fx = facts.account, facts.quote, facts.fx
+
+        if candidate.action is ThesisAction.BUY and quote is not None and quote.mid is not None:
+            move_rule = await self._day_move_rule(candidate, quote.mid, moment)
+            if move_rule is not None:
+                return await self._refuse_buy(thesis_id, candidate, move_rule)
 
         account_id = account.account_id if account else DEFAULT_ACCOUNT_ID
 
@@ -1251,6 +1269,124 @@ class ProposalService:
             )
         ).scalar_one_or_none()
 
+    async def _refuse_buy(
+        self, thesis_id: uuid.UUID, candidate: _Candidate, rule: RuleResult
+    ) -> GenerationResult:
+        """Record a terminal entry-quality BLOCK the way the signal-age block does."""
+        evaluation_id = await self._record_evaluation(
+            stage=STAGE_GENERATION,
+            thesis_id=thesis_id,
+            proposal_id=None,
+            identity=candidate.identity,
+            outcome=RiskOutcome.BLOCK,
+            rules=(rule,),
+            snapshot={"event_title": candidate.event_title, "observed": rule.observed},
+            snapshot_hash=None,
+            actor="system:generator",
+            detail=rule.reason,
+        )
+        return GenerationResult(
+            thesis_id=thesis_id,
+            created=False,
+            evaluation_id=evaluation_id,
+            reason=rule.reason,
+            blocks=(rule.reason,),
+        )
+
+    async def _entry_story_rule(
+        self, session: AsyncSession, candidate: _Candidate, moment: dt.datetime
+    ) -> RuleResult | None:
+        """A BUY trigger that reports an old move, or a story already traded."""
+        if self.settings.risk_block_reaction_headlines:
+            problem = headline_entry_problem(candidate.event_title)
+            if problem is not None:
+                return RuleResult(
+                    rule_id="entry_headline_quality",
+                    rule_version=1,
+                    outcome=RuleOutcome.BLOCK,
+                    reason=f"BUY trigger is not a fresh catalyst: {problem}",
+                    observed=(candidate.event_title or "")[:200],
+                    threshold="fresh catalyst headline",
+                )
+        days = self.settings.risk_same_story_rebuy_days
+        if days and (candidate.event_id is not None or candidate.event_title_hash):
+            same_story = []
+            if candidate.event_id is not None:
+                same_story.append(TradeProposal.event_id == candidate.event_id)
+            if candidate.event_title_hash:
+                same_story.append(Event.title_hash == candidate.event_title_hash)
+            prior = await session.scalar(
+                sa.select(TradeProposal.created_at)
+                .outerjoin(Event, Event.id == TradeProposal.event_id)
+                .where(
+                    TradeProposal.broker == self.broker,
+                    TradeProposal.broker_ticker == candidate.identity.broker_ticker,
+                    TradeProposal.side == OrderSide.BUY,
+                    TradeProposal.status.in_(
+                        (
+                            ProposalStatus.EXECUTED,
+                            ProposalStatus.EXECUTING,
+                            ProposalStatus.EXECUTION_AMBIGUOUS,
+                        )
+                    ),
+                    TradeProposal.created_at >= moment - dt.timedelta(days=days),
+                    sa.or_(*same_story),
+                )
+                .order_by(TradeProposal.created_at.desc())
+                .limit(1)
+            )
+            if prior is not None:
+                return RuleResult(
+                    rule_id="entry_same_story",
+                    rule_version=1,
+                    outcome=RuleOutcome.BLOCK,
+                    reason=(
+                        f"{candidate.identity.broker_ticker} was already bought on this story "
+                        f"within {days} days"
+                    ),
+                    observed=prior.isoformat(),
+                    threshold=f"{days} days",
+                )
+        return None
+
+    async def _day_move_rule(
+        self, candidate: _Candidate, price: Decimal, moment: dt.datetime
+    ) -> RuleResult | None:
+        """Refuse chasing: the price is already well above the previous close.
+
+        Fails open (no rule) when the previous close cannot be read; this is a
+        strategy filter, and every safety check still runs afterwards.
+        """
+        limit = self.settings.risk_max_buy_day_move_pct
+        symbol = candidate.identity.market_symbol
+        if not limit or self.market_data is None or not symbol:
+            return None
+        try:
+            bars = await self.market_data.bars(
+                symbol, BarTimeframe.DAY_1, moment - dt.timedelta(days=10), moment, limit=15
+            )
+        except Exception as exc:
+            log.warning("day_move_check_unavailable", symbol=symbol, error_type=type(exc).__name__)
+            return None
+        today = moment.astimezone(_NEW_YORK).date()
+        previous = [bar for bar in bars if bar.timestamp.astimezone(_NEW_YORK).date() < today]
+        if not previous or previous[-1].close <= 0:
+            return None
+        move = price / previous[-1].close - Decimal(1)
+        if move <= limit:
+            return None
+        return RuleResult(
+            rule_id="entry_day_move",
+            rule_version=1,
+            outcome=RuleOutcome.BLOCK,
+            reason=(
+                f"{symbol} is already {move:.2%} above its previous close; "
+                f"buying after a move above {limit:.2%} is refused"
+            ),
+            observed=f"{move:.4f}",
+            threshold=str(limit),
+        )
+
     async def _load_candidate(
         self, session: AsyncSession, thesis_id: uuid.UUID
     ) -> _Candidate | None:
@@ -1280,6 +1416,8 @@ class ProposalService:
             event_id=run.event_id,
             event_time=event.event_time or event.first_seen_at if event else None,
             company_id=run.company_id,
+            event_title=event.title if event else None,
+            event_title_hash=event.title_hash if event else None,
         )
 
     @staticmethod

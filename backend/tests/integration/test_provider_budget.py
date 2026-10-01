@@ -302,8 +302,11 @@ async def test_the_window_resets_on_the_utc_day_from_the_database_clock(
     state = await guard.state()
     assert state.today.searches == 0
     assert state.today.units == 0
-    # Still inside the month, so the monthly total remembers it.
-    assert state.month.units == 4
+    # The monthly total remembers it unless the backdated call fell into last
+    # month, which happens whenever this runs early on the 1st.
+    now = dt.datetime.now(dt.UTC)
+    same_month = (now - dt.timedelta(days=1, hours=1)).month == now.month
+    assert state.month.units == (4 if same_month else 0)
     assert await guard.reserve(ProviderCallKind.SEARCH, units_needed=2) is not None
 
 

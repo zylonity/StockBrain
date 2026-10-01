@@ -901,6 +901,15 @@ class Settings(BaseSettings):
     """Block a new buy for this many hours after a filled sale of the listing."""
     risk_max_open_positions: int = Field(default=0, ge=0, le=1000)
     """Maximum distinct open listings; zero disables the limit."""
+    risk_block_reaction_headlines: bool = False
+    """Refuse a BUY whose triggering headline reports a move that already happened
+    ("Why is X stock rising?") or is a recap/transcript. Exits are unaffected."""
+    risk_same_story_rebuy_days: int = Field(default=0, ge=0, le=60)
+    """Refuse a BUY of a listing already bought on the same story (same event or
+    identical headline) within this many days; zero disables it."""
+    risk_max_buy_day_move_pct: Decimal = Field(default=Decimal("0"), ge=0, le=1)
+    """Refuse a BUY when the listing already trades this far above its previous
+    regular close (0.02 = 2%); zero disables it."""
     risk_sizing_mode: Literal["cap", "conviction"] = "cap"
     """``cap``: size each buy as the smallest cap times the confidence factor.
     ``conviction``: size each buy toward a target holding that scales with the

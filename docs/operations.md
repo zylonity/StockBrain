@@ -848,6 +848,24 @@ top-ups in existing holdings and all exits; it does not liquidate positions
 that were open before the limit was lowered. Pending buys in new listings count
 toward the limit, so concurrent proposals cannot open more names than intended.
 
+Three entry-quality guards refuse a new BUY before any order is built. All are
+off by default, never affect exits, and record an audited terminal BLOCK:
+
+- `RISK_BLOCK_REACTION_HEADLINES` (default `false`) refuses a BUY triggered by
+  a headline that reports a move that has already happened ("Why is X stock
+  rising?", "shares are trading higher after…", "hits record high"), or by a
+  recap, call transcript or comparison piece.
+- `RISK_SAME_STORY_REBUY_DAYS` (default `0`, disabled) refuses buying a listing
+  again on the same event or identical headline within that many days.
+- `RISK_MAX_BUY_DAY_MOVE_PCT` (default `0`, disabled) refuses a BUY once the
+  quote is more than this fraction above the previous regular close
+  (`0.02` = 2%). If the previous close can't be read, the guard is skipped
+  (fail-open).
+
+The evidence behind them is in `reports/short-term-2026-10-01/`. In offline tests,
+buying after a move had already happened, or after a gap-up with no news, lost
+money. In the live record, BUYs on these headlines trailed the market.
+
 | Variable | Default | What it means |
 |---|---|---|
 | `RISK_EXIT_HARD_STOP_PCT` | `0.08` | Loss from average cost at which the whole position is proposed for exit. A floor, never widened. |

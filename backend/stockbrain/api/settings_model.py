@@ -890,6 +890,28 @@ CATALOGUE: tuple[_Group, ...] = (
                 unit="positions",
             ),
             _s(
+                "risk_block_reaction_headlines",
+                "Block reaction-headline buys",
+                RESTART,
+                "Refuse BUYs triggered by articles about a move that already happened, "
+                "recaps or call transcripts.",
+            ),
+            _s(
+                "risk_same_story_rebuy_days",
+                "Same-story rebuy window",
+                RESTART,
+                "Days during which a listing is not bought again on the same story; "
+                "zero disables it.",
+                unit="days",
+            ),
+            _s(
+                "risk_max_buy_day_move_pct",
+                "Maximum day move for a buy",
+                RESTART,
+                "Refuse a BUY once the price is this far above the previous close; "
+                "zero disables it.",
+            ),
+            _s(
                 "risk_allow_fractional_quantity",
                 "Fractional quantities",
                 RESTART,
