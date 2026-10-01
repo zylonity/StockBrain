@@ -102,3 +102,30 @@ Universe, chosen from memory and including failures:
   RIDE, BBBY, WE, FFIE, MULN
 
 Missing symbols are reported, never replaced. SPY stays the benchmark.
+
+## Addendum 3 (2026-10-01 ~03:00 UTC): post-earnings drift from headline surprises
+
+Written before any earnings data was fetched.
+
+- **Data:**
+  - Alpaca/Benzinga news headlines for the 104 large-cap symbols, 2019-01 to
+    2026-09.
+  - Only headlines of the form "… EPS $A Beats|Misses|In-Line $B Estimate"
+    (optionally with "Sales $C Beat|Miss $D Estimate") are kept.
+  - The first such headline per symbol per day is the event.
+- **Surprise:** EPS (A − B) / |B|. Sales beat or miss as stated.
+- **Entry:** the first regular-session open after publication. A pre-market
+  headline enters that day's open; an after-close headline enters the next
+  day's open.
+- **Rules, long only:**
+  - **E1:** EPS beat **and** sales beat ("double beat"); buy, hold 20 sessions,
+    exit at the close.
+  - **E2:** EPS surprise ≥ +5%; buy, hold 20 sessions.
+  - **Control E0:** EPS miss **and** sales miss; reported as a comparison, not
+    traded.
+- **Reporting:**
+  - Event level: net average, median, share of winners and SPY-relative
+    return, for both periods, at 0.20% per side.
+  - The 10-slot portfolio simulation with the same engine.
+- **Pass criterion:** the same as before. Beat SPY on Sharpe in both periods,
+  and stay positive under 0.30% per side.

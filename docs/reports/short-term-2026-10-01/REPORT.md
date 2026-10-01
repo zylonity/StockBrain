@@ -12,7 +12,8 @@ setting, live database row or order was changed, and no secrets were read.
      on to trail SPY by about 1.5% within three days (see §2).
    - Its SELL/REDUCE verdicts do point the right way. It's better at spotting
      bad news than good news.
-2. **No short-term trading rule we tested beat simply holding SPY.** We tested
+2. **No short-term trading rule we tested beat simply holding SPY.** That
+   includes post-earnings drift and news-filtered gaps. We tested
    10 common rules on 104 large US stocks and 58 volatile ones, 2019–2026, with
    every rule fixed before running. Judged by return for the risk taken, and
    checked on later data each rule hadn't seen, none beat holding SPY.
@@ -156,6 +157,27 @@ names, a 70–90% drawdown is the normal outcome, not the tail.
 4. **Store actual fill values.** `filled_value` is null for every order, so
    real profit and loss can't be measured exactly. Read Trading 212's order
    history after each fill.
+
+## 7. Post-earnings drift (`earn_*.json`, pre-registered as Addendum 3)
+
+Benzinga headlines such as "EPS $A Beats $B Estimate, Sales … Beat …" were
+parsed for the 104 large caps, 2019–2026. That gave 2,857 results; 95
+headlines didn't parse, mostly "may not compare to estimate". Each trade buys
+at the first open after the headline, holds 20 sessions, and pays 0.20% per
+side.
+
+| Rule | Per-trade net, 2019–23 / 2024–26 | Typical vs SPY | Portfolio annual return / Sharpe, 2019–23 / 2024–26 |
+|---|---|---|---|
+| E1: EPS and sales both beat | +1.04% / +1.85% | +0.15% / −0.30% | 7.3% / 0.50 · 6.7% / 0.56 |
+| E2: EPS surprise ≥ +5% | +1.09% / +2.34% | −0.08% / −0.02% | 4.8% / 0.37 · 11.9% / 0.98 |
+| E0 control: EPS and sales both miss | +0.81% / +2.64% | −0.30% / +2.07% | (not traded) |
+| SPY | | | 16.0% / 0.81 · 20.5% / 1.29 |
+
+There is no tradable earnings drift in these large caps. Beats did no better
+than the market, and the control group of misses did as well or better. This
+fits the published finding that the effect has faded and survives mainly in
+small, thinly covered stocks, which Trading 212's fees and spreads make costly
+to trade at £250.
 
 ## Independent audit
 
