@@ -1,0 +1,92 @@
+BUY
+   d0_close  n= 512 mean -0.59% med -0.21% beat SPY  46%
+   d1_close  n= 432 mean -0.86% med -0.47% beat SPY  45%
+   d3_close  n= 298 mean -2.12% med -1.55% beat SPY  37%
+BUY|conf<0.75
+   d0_close  n= 480 mean -0.51% med -0.20% beat SPY  47%
+   d1_close  n= 409 mean -0.77% med -0.42% beat SPY  45%
+   d3_close  n= 285 mean -2.09% med -1.58% beat SPY  36%
+BUY|conf>=0.75
+   d0_close  n=  32 mean -1.70% med -0.69% beat SPY  41%
+   d1_close  n=  23 mean -2.46% med -0.57% beat SPY  39%
+   d3_close  n=  13 mean -2.77% med -1.04% beat SPY  46%
+BUY|executed
+   d0_close  n=  38 mean -0.74% med +0.17% beat SPY  58%
+   d1_close  n=  35 mean -0.01% med +0.16% beat SPY  60%
+   d3_close  n=  29 mean -1.35% med -1.10% beat SPY  38%
+BUY|not_executed
+   d0_close  n= 474 mean -0.58% med -0.29% beat SPY  45%
+   d1_close  n= 397 mean -0.93% med -0.52% beat SPY  43%
+   d3_close  n= 269 mean -2.20% med -1.58% beat SPY  37%
+BUY|other
+   d0_close  n= 410 mean -0.57% med -0.24% beat SPY  46%
+   d1_close  n= 340 mean -0.86% med -0.47% beat SPY  44%
+   d3_close  n= 227 mean -2.15% med -1.52% beat SPY  36%
+BUY|reaction_to_move
+   d0_close  n=  59 mean -1.06% med -0.36% beat SPY  46%
+   d1_close  n=  55 mean -1.34% med -0.36% beat SPY  45%
+   d3_close  n=  47 mean -2.02% med -1.24% beat SPY  47%
+BUY|stale_or_opinion
+   d0_close  n=  43 mean -0.10% med -0.02% beat SPY  49%
+   d1_close  n=  37 mean -0.17% med -0.24% beat SPY  46%
+   d3_close  n=  24 mean -2.03% med -1.58% beat SPY  29%
+HOLD/NO_ACTION
+   d0_close  n= 305 mean +0.05% med -0.03% beat SPY  49%
+   d1_close  n= 276 mean +0.34% med -0.32% beat SPY  45%
+   d3_close  n= 232 mean +0.41% med -0.82% beat SPY  41%
+HOLD/NO_ACTION|conf<0.75
+   d0_close  n= 169 mean -0.13% med +0.03% beat SPY  51%
+   d1_close  n= 142 mean +0.34% med -0.22% beat SPY  48%
+   d3_close  n= 110 mean -0.23% med -0.47% beat SPY  45%
+HOLD/NO_ACTION|conf>=0.75
+   d0_close  n= 136 mean +0.27% med -0.18% beat SPY  46%
+   d1_close  n= 134 mean +0.35% med -0.39% beat SPY  43%
+   d3_close  n= 122 mean +0.98% med -1.04% beat SPY  38%
+HOLD/NO_ACTION|not_executed
+   d0_close  n= 305 mean +0.05% med -0.03% beat SPY  49%
+   d1_close  n= 276 mean +0.34% med -0.32% beat SPY  45%
+   d3_close  n= 232 mean +0.41% med -0.82% beat SPY  41%
+HOLD/NO_ACTION|other
+   d0_close  n= 241 mean +0.08% med +0.03% beat SPY  51%
+   d1_close  n= 215 mean -0.18% med -0.22% beat SPY  47%
+   d3_close  n= 176 mean -1.34% med -0.87% beat SPY  39%
+HOLD/NO_ACTION|reaction_to_move
+   d0_close  n=  47 mean +0.22% med -0.20% beat SPY  47%
+   d1_close  n=  45 mean +3.46% med -0.22% beat SPY  47%
+   d3_close  n=  42 mean +8.22% med +0.47% beat SPY  52%
+HOLD/NO_ACTION|stale_or_opinion
+   d0_close  n=  17 mean -0.86% med -0.46% beat SPY  29%
+   d1_close  n=  16 mean -1.38% med -0.93% beat SPY  25%
+   d3_close  n=  14 mean -1.16% med -1.23% beat SPY  43%
+SELL/REDUCE
+   d0_close  n= 279 mean -0.50% med -0.18% beat SPY  48%
+   d1_close  n= 239 mean -1.81% med -0.75% beat SPY  40%
+   d3_close  n= 164 mean -3.02% med -1.91% beat SPY  34%
+SELL/REDUCE|conf<0.75
+   d0_close  n= 250 mean -0.36% med -0.09% beat SPY  49%
+   d1_close  n= 217 mean -1.62% med -0.54% beat SPY  42%
+   d3_close  n= 149 mean -2.65% med -1.78% beat SPY  34%
+SELL/REDUCE|conf>=0.75
+   d0_close  n=  29 mean -1.68% med -1.40% beat SPY  34%
+   d1_close  n=  22 mean -3.76% med -3.39% beat SPY  23%
+   d3_close  n=  15 mean -6.71% med -8.09% beat SPY  27%
+SELL/REDUCE|executed
+   d0_close  n=   9 mean +1.74% med +0.79% beat SPY  78%
+   d1_close  n=   8 mean +1.48% med +1.35% beat SPY  75%
+   d3_close  n=   6 mean +2.57% med +3.12% beat SPY  83%
+SELL/REDUCE|not_executed
+   d0_close  n= 270 mean -0.57% med -0.20% beat SPY  47%
+   d1_close  n= 231 mean -1.93% med -0.90% beat SPY  39%
+   d3_close  n= 158 mean -3.23% med -2.21% beat SPY  32%
+SELL/REDUCE|other
+   d0_close  n= 227 mean -0.76% med -0.19% beat SPY  47%
+   d1_close  n= 191 mean -1.93% med -0.90% beat SPY  39%
+   d3_close  n= 125 mean -3.77% med -2.40% beat SPY  30%
+SELL/REDUCE|reaction_to_move
+   d0_close  n=  42 mean +0.95% med +0.07% beat SPY  55%
+   d1_close  n=  40 mean -1.57% med -1.06% beat SPY  45%
+   d3_close  n=  34 mean -0.67% med -0.12% beat SPY  44%
+SELL/REDUCE|stale_or_opinion
+   d0_close  n=  10 mean -0.61% med -0.41% beat SPY  30%
+   d1_close  n=   8 mean -0.12% med -0.16% beat SPY  38%
+   d3_close  n=   5 mean -0.36% med +0.58% beat SPY  60%
